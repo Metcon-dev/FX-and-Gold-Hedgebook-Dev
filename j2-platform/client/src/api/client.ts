@@ -1,4 +1,20 @@
-const BASE = '/api';
+function resolveApiBase(): string {
+    const envBaseRaw = String(import.meta.env?.VITE_API_BASE_URL || '').trim();
+    if (envBaseRaw) return envBaseRaw.replace(/\/+$/, '');
+
+    if (typeof window !== 'undefined') {
+        const { protocol, hostname, port } = window.location;
+        // In local Vite dev, call Flask directly to avoid proxy drift/misconfig.
+        if (port === '5173') {
+            return `${protocol}//${hostname}:5001/api`;
+        }
+    }
+
+    // Default for same-origin deployments (frontend and backend under one host).
+    return '/api';
+}
+
+const BASE = resolveApiBase();
 
 type PmxAuthHeaders = {
     x_auth?: string;
