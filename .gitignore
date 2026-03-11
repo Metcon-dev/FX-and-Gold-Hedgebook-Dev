@@ -1,0 +1,55 @@
+# Environment variables (contains secrets)
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv*/
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+*.out.log
+*.err.log
+
+# Build and dependency outputs
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+build/
+coverage/
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Runtime/data artifacts (local only)
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*.tmp
+*.temp
+tmp_*/
+
+# Flat data exports and office files (do not version)
+*.csv
+*.xlsx
+*.xlsm
+*.xls
+*.zip
+*.docx

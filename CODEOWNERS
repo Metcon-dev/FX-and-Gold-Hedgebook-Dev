@@ -1,0 +1,10 @@
+# Default ownership
+* @joshua-kress
+
+# Backend
+/j2-platform/server/ @joshua-kress
+/services/ @joshua-kress
+/models/ @joshua-kress
+
+# Frontend
+/j2-platform/client/ @joshua-kress
