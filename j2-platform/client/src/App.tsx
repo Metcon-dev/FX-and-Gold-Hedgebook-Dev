@@ -519,7 +519,9 @@ function EditableTradeNum({ value, rowId, onSaved, onError, saveTradeNumber, lab
 
     const save = async () => {
         const trimmed = draft.trim();
-        if (trimmed === value) { setEditing(false); return; }
+        const normalizedDraft = normalizeTradeNumberValue(trimmed);
+        const normalizedValue = normalizeTradeNumberValue(value);
+        if (normalizedDraft === normalizedValue) { setEditing(false); return; }
         setSaving(true);
         try {
             const saveFn: (id: number, tradeNumber: string) => Promise<{ ok: boolean; savedValue?: string; message?: string }> =
@@ -528,11 +530,11 @@ function EditableTradeNum({ value, rowId, onSaved, onError, saveTradeNumber, lab
                     const base = await api.updateTradeNumber(id, tradeNumber);
                     return { ok: Boolean((base as Row).ok) };
                 });
-            const result = await saveFn(rowId, trimmed);
+            const result = await saveFn(rowId, normalizedDraft);
             if (!result?.ok) {
                 throw new Error(asText(result?.message, `${cellLabel} update failed`));
             }
-            onSaved(asText(result?.savedValue, trimmed));
+            onSaved(normalizeTradeNumberValue(asText(result?.savedValue, normalizedDraft)));
             setEditing(false);
         } catch (e: unknown) {
             onError(String(e));
@@ -550,7 +552,7 @@ function EditableTradeNum({ value, rowId, onSaved, onError, saveTradeNumber, lab
                 title={`Click to edit ${cellLabel}`}
                 style={{ display: 'inline-block', minWidth: '60px', padding: '2px 6px', cursor: 'pointer' }}
             >
-                {value || <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>--</span>}
+                {normalizeTradeNumberValue(value) || <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>--</span>}
             </span>
         );
     }
@@ -620,7 +622,12 @@ function PMXLedger() {
 
             const rows = await api.getPmxLedger(Object.keys(params).length ? params : undefined);
             if (requestId !== latestLoadRequestRef.current) return;
-            setData(rows);
+            setData(
+                rows.map((row) => ({
+                    ...row,
+                    'Trade #': normalizeTradeNumberValue((row as Row)['Trade #']),
+                }))
+            );
             setPageError('');
         } catch (e: unknown) {
             if (requestId !== latestLoadRequestRef.current) return;
@@ -863,8 +870,9 @@ function PMXLedger() {
                                                 value={String(val ?? '')}
                                                 rowId={editRowId}
                                                 onSaved={(newVal) => {
+                                                    const normalizedNewVal = normalizeTradeNumberValue(newVal);
                                                     setData(prev => prev.map(r =>
-                                                        r['id'] === row['id'] ? { ...r, 'Trade #': newVal } : r
+                                                        r['id'] === row['id'] ? { ...r, 'Trade #': normalizedNewVal } : r
                                                     ));
                                                 }}
                                                 onError={(msg) => show(msg, 'center-error')}
@@ -1047,8 +1055,23 @@ function OpenPositionsReval() {
     const [tradeMCLoadError, setTradeMCLoadError] = useState('');
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
+    const [downloadingReport, setDownloadingReport] = useState(false);
     const [loadError, setLoadError] = useState('');
     const { show, Toast } = useToast();
+
+    // Account recon state
+    const today = new Date();
+    const defaultReconStart = '2026-03-02';
+    const defaultReconEnd = today.toISOString().slice(0, 10);
+    const [reconStartDate, setReconStartDate] = usePersistentState('open-reval-recon:start_date', defaultReconStart);
+    const [reconEndDate, setReconEndDate] = usePersistentState('open-reval-recon:end_date', defaultReconEnd);
+    // Manual opening balance inputs — simple local state, not persisted to DB
+    const [openingUSD, setOpeningUSD] = usePersistentState('open-reval-recon:opening_usd', '');
+    const [openingXAU, setOpeningXAU] = usePersistentState('open-reval-recon:opening_xau', '');
+    const [openingZAR, setOpeningZAR] = usePersistentState('open-reval-recon:opening_zar', '');
+    const [recon, setRecon] = useState<ReconData | null>(null);
+    const [reconLoading, setReconLoading] = useState(false);
+    const [reconError, setReconError] = useState('');
 
     const load = useCallback(async (isRefresh = false) => {
         if (isRefresh) setRefreshing(true);
@@ -1083,7 +1106,23 @@ function OpenPositionsReval() {
         }
     }, [show]);
 
+    // Fetch only transaction totals + actual balances from server — no opening balance in params
+    // so the 20s server-side cache is always hit after the first load for a given date range.
+    const loadRecon = useCallback(async (sd: string, ed: string) => {
+        setReconLoading(true);
+        setReconError('');
+        try {
+            const res = await api.getAccountRecon({ start_date: sd, end_date: ed });
+            setRecon(res as unknown as ReconData);
+        } catch (e: unknown) {
+            setReconError(String(e));
+        } finally {
+            setReconLoading(false);
+        }
+    }, []);
+
     useEffect(() => { void load(false); }, [load]);
+    useEffect(() => { void loadRecon(reconStartDate, reconEndDate); }, [loadRecon, reconStartDate, reconEndDate]);
 
     const totalPnlZar = toNullableNumber(summary.total_pnl_zar);
     const marketXau = toNullableNumber(market.xau_usd);
@@ -1137,6 +1176,34 @@ function OpenPositionsReval() {
         window.addEventListener(PMX_AUTO_SYNC_EVENT, onAutoSync);
         return () => window.removeEventListener(PMX_AUTO_SYNC_EVENT, onAutoSync);
     }, [load]);
+
+    const downloadReport = async () => {
+        if (downloadingReport) return;
+        setDownloadingReport(true);
+        try {
+            const params: Record<string, string> = {
+                start_date: reconStartDate,
+                end_date: reconEndDate,
+            };
+            if (openingUSD.trim()) params.opening_usd = openingUSD.trim();
+            if (openingXAU.trim()) params.opening_xau = openingXAU.trim();
+            if (openingZAR.trim()) params.opening_zar = openingZAR.trim();
+
+            const res = await api.getPmxOpenPositionsRevalPdf(params);
+            if (!res.ok) {
+                const msg = await parsePmxDownloadError(res);
+                throw new Error(msg || 'Failed to download report');
+            }
+            const blob = await res.blob();
+            const fallbackName = `open_positions_reval_report_${new Date().toISOString().slice(0, 10)}.pdf`;
+            const filename = parseFilenameFromDisposition(res.headers.get('content-disposition') || '', fallbackName);
+            triggerBlobDownload(blob, filename);
+        } catch (e: unknown) {
+            show(String(e), 'error');
+        } finally {
+            setDownloadingReport(false);
+        }
+    };
 
     const openNetRows = useMemo(() => {
         const toLongShort = (sideRaw: unknown, qtyRaw: unknown): string => {
@@ -1203,6 +1270,9 @@ function OpenPositionsReval() {
                     <button className="btn btn-sm" onClick={() => { void load(true); }} disabled={refreshing}>
                         {refreshing ? 'Refreshing...' : 'Refresh'}
                     </button>
+                    <button className="btn btn-sm btn-primary" onClick={() => { void downloadReport(); }} disabled={downloadingReport}>
+                        {downloadingReport ? 'Downloading...' : 'Download Report'}
+                    </button>
                 </div>
             </div>
 
@@ -1225,29 +1295,6 @@ function OpenPositionsReval() {
                         {totalPnlZar !== null ? `R${fmt(totalPnlZar, 2)}` : '--'}
                     </div>
                 </div>
-            </div>
-
-            <div className="section">
-                <div className="section-title">TradeMC Daily Totals ({tradeMCSummary.todayKey})</div>
-                <div className="stat-grid">
-                    <div className="stat-card">
-                        <div className="stat-label">Daily Buys (Positive)</div>
-                        <div className={`stat-value ${numClass(tradeMCSummary.buyTotalG).replace('num ', '')}`}>
-                            {fmt(tradeMCSummary.buyTotalG, 2)}
-                        </div>
-                    </div>
-                    <div className="stat-card">
-                        <div className="stat-label">Daily Sells (Negative)</div>
-                        <div className={`stat-value ${numClass(tradeMCSummary.sellTotalG).replace('num ', '')}`}>
-                            {fmt(tradeMCSummary.sellTotalG, 2)}
-                        </div>
-                    </div>
-                    <div className="stat-card">
-                        <div className="stat-label">Daily Trades Counted</div>
-                        <div className="stat-value">{fmt(tradeMCSummary.countedTrades, 0)}</div>
-                    </div>
-                </div>
-                {tradeMCLoadError && <div className="stat-sub" style={{ color: 'var(--danger)' }}>{tradeMCLoadError}</div>}
             </div>
 
             {openNetRows.length === 0 ? (
@@ -1302,6 +1349,161 @@ function OpenPositionsReval() {
                     }}
                 />
             )}
+            <div className="section open-reval-daily-totals">
+                <div className="section-title">TradeMC Daily Totals ({tradeMCSummary.todayKey})</div>
+                <div className="stat-grid">
+                    <div className="stat-card">
+                        <div className="stat-label">Daily Buys</div>
+                        <div className={`stat-value ${numClass(tradeMCSummary.buyTotalG).replace('num ', '')}`}>
+                            {fmt(tradeMCSummary.buyTotalG, 2)}
+                        </div>
+                    </div>
+                    <div className="stat-card">
+                        <div className="stat-label">Daily Sells</div>
+                        <div className={`stat-value ${numClass(tradeMCSummary.sellTotalG).replace('num ', '')}`}>
+                            {fmt(tradeMCSummary.sellTotalG, 2)}
+                        </div>
+                    </div>
+                    <div className="stat-card">
+                        <div className="stat-label">Daily Trades Counted</div>
+                        <div className="stat-value">{fmt(tradeMCSummary.countedTrades, 0)}</div>
+                    </div>
+                </div>
+                {tradeMCLoadError && <div className="stat-sub" style={{ color: 'var(--danger)' }}>{tradeMCLoadError}</div>}
+            </div>
+
+            <div className="section reval-account-section">
+                <div className="section-title">Account Balance Recon</div>
+                <div className="filter-bar">
+                    <div className="filter-group">
+                        <label>From</label>
+                        <input
+                            type="date"
+                            value={reconStartDate}
+                            onChange={e => setReconStartDate(e.target.value)}
+                        />
+                    </div>
+                    <div className="filter-group">
+                        <label>To</label>
+                        <input
+                            type="date"
+                            value={reconEndDate}
+                            onChange={e => setReconEndDate(e.target.value)}
+                        />
+                    </div>
+                    {reconLoading && <div className="stat-sub">Loading...</div>}
+                </div>
+                <div className="filter-bar">
+                    <div className="filter-group">
+                        <label>Opening USD (LC)</label>
+                        <input
+                            type="text"
+                            placeholder="0.00"
+                            value={openingUSD}
+                            onChange={e => setOpeningUSD(e.target.value)}
+                        />
+                    </div>
+                    <div className="filter-group">
+                        <label>Opening XAU (oz)</label>
+                        <input
+                            type="text"
+                            placeholder="0.0000"
+                            value={openingXAU}
+                            onChange={e => setOpeningXAU(e.target.value)}
+                        />
+                    </div>
+                    <div className="filter-group">
+                        <label>Opening ZAR</label>
+                        <input
+                            type="text"
+                            placeholder="0.00"
+                            value={openingZAR}
+                            onChange={e => setOpeningZAR(e.target.value)}
+                        />
+                    </div>
+                    <button
+                        className="btn btn-sm btn-primary"
+                        onClick={() => void loadRecon(reconStartDate, reconEndDate)}
+                        disabled={reconLoading}
+                    >
+                        {reconLoading ? 'Running...' : 'Run Recon'}
+                    </button>
+                </div>
+
+                {reconError && (
+                    <div className="stat-sub" style={{ color: 'var(--danger)' }}>{reconError}</div>
+                )}
+                {recon?.error && (
+                    <div className="stat-sub" style={{ color: 'var(--warning, orange)' }}>{recon.error}</div>
+                )}
+
+                {(() => {
+                    const DELTA_THRESH: Record<string, number> = { XAU: 0.0001, USD: 0.01, ZAR: 0.01 };
+                    const reconCurrencies: { ccy: string; label: string; dp: number }[] = [
+                        { ccy: 'USD', label: 'USD (LC)', dp: 2 },
+                        { ccy: 'XAU', label: 'XAU (oz)', dp: 4 },
+                        { ccy: 'ZAR', label: 'ZAR', dp: 2 },
+                    ];
+                    return (
+                        <div className="table-container">
+                            <table className="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>Currency</th>
+                                        <th className="num">Opening Balance</th>
+                                        <th className="num">Net Transactions</th>
+                                        <th className="num">Expected Balance</th>
+                                        <th className="num">Actual Balance</th>
+                                        <th className="num">Delta</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {reconCurrencies.map(({ ccy, label, dp }) => {
+                                        const ccyData = recon?.currencies?.[ccy];
+                                        // Opening balance comes from user-entered input fields (frontend only, no server round-trip)
+                                        const openingRaw = ccy === 'USD' ? openingUSD : ccy === 'XAU' ? openingXAU : openingZAR;
+                                        const openingVal = openingRaw.trim() === '' ? 0 : toNullableNumber(openingRaw.replace(/,/g, ''));
+                                        const txTotal = ccyData?.transaction_total ?? null;
+                                        const actualBal = ccyData?.actual_balance ?? null;
+                                        // Compute expected and delta locally
+                                        const expectedBal = openingVal !== null && txTotal !== null ? openingVal + txTotal : null;
+                                        const delta = actualBal !== null && expectedBal !== null ? actualBal - expectedBal : null;
+                                        const thresh = DELTA_THRESH[ccy] ?? 0.01;
+                                        const hasDelta = delta !== null && Math.abs(delta) > thresh;
+                                        const deltaClass = delta === null ? '' : (hasDelta ? 'negative' : 'positive');
+                                        return (
+                                            <tr key={ccy} className={hasDelta ? 'recon-row-alert' : ''}>
+                                                <td><strong>{label}</strong></td>
+                                                <td className={`num ${numClass(openingVal).replace('num ', '')}`}>
+                                                    {openingVal !== null ? fmt(openingVal, dp) : '--'}
+                                                </td>
+                                                <td className={`num ${numClass(txTotal).replace('num ', '')}`}>
+                                                    {txTotal !== null ? fmt(txTotal, dp) : '--'}
+                                                </td>
+                                                <td className={`num ${numClass(expectedBal).replace('num ', '')}`}>
+                                                    {expectedBal !== null ? fmt(expectedBal, dp) : '--'}
+                                                </td>
+                                                <td className={`num ${numClass(actualBal).replace('num ', '')}`}>
+                                                    {actualBal !== null ? fmt(actualBal, dp) : '--'}
+                                                </td>
+                                                <td className={`num ${deltaClass} ${hasDelta ? 'recon-delta-alert' : ''}`}>
+                                                    {delta !== null ? fmt(delta, dp) : '--'}
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                    );
+                })()}
+
+                <div className="stat-sub">
+                    Enter opening balances above. Net transactions = sum of credits minus debits from the PMX statement.
+                    Delta = Actual − Expected. Red rows indicate a balance discrepancy.
+                    {recon && ` Statement period: ${recon.start_date} → ${recon.end_date}.`}
+                </div>
+            </div>
 
             {Toast}
         </div>
@@ -2539,33 +2741,26 @@ function GoldHedging() {
                                                     )}
 
                                                     {!details?.loading && !details?.error && (() => {
-                                                        const pmxRows = Array.isArray(details?.trades) ? details.trades : [];
-                                                        const normalizeSymbol = (value: unknown): string =>
-                                                            String(value ?? '').toUpperCase().replace(/[\/\-\s]/g, '');
-                                                        const summarizeSymbol = (symbol: 'XAUUSD' | 'USDZAR') => {
-                                                            let amount = 0;
-                                                            let total = 0;
-                                                            let has = false;
-                                                            for (const tradeRow of pmxRows) {
-                                                                if (normalizeSymbol(tradeRow['Symbol']) !== symbol) continue;
-                                                                const qty = toNullableNumber(tradeRow['Quantity']);
-                                                                const price = toNullableNumber(tradeRow['Price']);
-                                                                if (qty === null || price === null) continue;
-                                                                const absQty = Math.abs(qty);
-                                                                amount += absQty;
-                                                                total += absQty * price;
-                                                                has = true;
-                                                            }
-                                                            const rate = has && Math.abs(amount) > 1e-12 ? (total / amount) : null;
-                                                            return {
-                                                                amount: has ? amount : null,
-                                                                rate,
-                                                                total: has ? total : null,
-                                                            };
-                                                        };
+                                                        // Use the authoritative WA values from build_weighted_average
+                                                        // (signed net quantities, correct WA formula matching the WA tab).
+                                                        const wa = details?.wa as Row | null | undefined;
+                                                        const waGoldQty   = toNullableNumber(wa?.xau_usd_total_qty);
+                                                        const waGoldPrice = toNullableNumber(wa?.xau_usd_wa_price);
+                                                        const waGoldVal   = toNullableNumber(wa?.xau_usd_total_val);
+                                                        const waFxQty     = toNullableNumber(wa?.usd_zar_total_qty);
+                                                        const waFxPrice   = toNullableNumber(wa?.usd_zar_wa_price);
+                                                        const waFxVal     = toNullableNumber(wa?.usd_zar_total_val);
 
-                                                        const gold = summarizeSymbol('XAUUSD');
-                                                        const usd = summarizeSymbol('USDZAR');
+                                                        const gold = {
+                                                            amount: waGoldQty !== null ? Math.abs(waGoldQty) : null,
+                                                            rate:   waGoldPrice,
+                                                            total:  waGoldVal  !== null ? Math.abs(waGoldVal)  : null,
+                                                        };
+                                                        const usd = {
+                                                            amount: waFxQty !== null ? Math.abs(waFxQty) : null,
+                                                            rate:   waFxPrice,
+                                                            total:  waFxVal !== null ? Math.abs(waFxVal) : null,
+                                                        };
                                                         const quickRows = [
                                                             {
                                                                 leg: 'Gold (XAU/USD)',
@@ -3902,6 +4097,17 @@ function ProfitTab() {
                                 const monthKey = monthKeyOf(month, monthIdx);
                                 const expandedMonth = Boolean(expandedMonths[monthKey]);
                                 const trades = Array.isArray(month.trades) ? (month.trades as Row[]) : [];
+                                const tradesSorted = [...trades].sort((a, b) => {
+                                    const aTs = toTimestampMs(a.trade_date);
+                                    const bTs = toTimestampMs(b.trade_date);
+                                    const aValid = Number.isFinite(aTs);
+                                    const bValid = Number.isFinite(bTs);
+                                    if (aValid && bValid && Math.abs(bTs - aTs) > 1e-9) return bTs - aTs;
+                                    if (aValid !== bValid) return aValid ? -1 : 1;
+                                    const ta = normalizeTradeNumberValue(a.trade_num);
+                                    const tb = normalizeTradeNumberValue(b.trade_num);
+                                    return ta.localeCompare(tb, undefined, { numeric: true, sensitivity: 'base' });
+                                });
                                 const pctWeightedAvg = monthProfitPctWeightedAvg(trades);
                                 const netTradedG = monthNetTradedG(trades);
                                 return (
@@ -3940,10 +4146,10 @@ function ProfitTab() {
                                                                 </tr>
                                                             </thead>
                                                             <tbody>
-                                                                {trades.length === 0 && (
+                                                                {tradesSorted.length === 0 && (
                                                                     <tr><td colSpan={10} style={{ textAlign: 'left', padding: '1rem', color: 'var(--text-muted)' }}>No trades for this month</td></tr>
                                                                 )}
-                                                                {trades.map((trade, tradeIdx) => {
+                                                                {tradesSorted.map((trade, tradeIdx) => {
                                                                     const tradeNum = asText(trade.trade_num, `trade-${tradeIdx}`);
                                                                     const tradeExpandKey = `${monthKey}::${tradeNum}`;
                                                                     const expandedTrade = Boolean(expandedTrades[tradeExpandKey]);
@@ -4214,12 +4420,16 @@ function ExportTrades() {
             const outputDir = String((result as Row).output_dir ?? targetDir);
             const errorsRaw = (result as Row).errors;
             const errors = Array.isArray(errorsRaw) ? errorsRaw.map(v => String(v)) : [];
+            const warningsRaw = (result as Row).warnings;
+            const warnings = Array.isArray(warningsRaw) ? warningsRaw.map(v => String(v)) : [];
             const firstError = errors.length > 0 ? errors[0] : '';
+            const firstWarning = warnings.length > 0 ? warnings[0] : '';
 
             if (failedTrades === 0 && errors.length === 0) {
                 show(
                     `Saved ${savedFiles.toLocaleString()} file(s) to ${outputDir}. `
-                    + `Complete trades: ${completeTrades.toLocaleString()}.`,
+                    + `Complete trades: ${completeTrades.toLocaleString()}.`
+                    + (firstWarning ? ` Note: ${firstWarning}` : ''),
                     'success'
                 );
             } else {
@@ -5787,7 +5997,7 @@ export default function App() {
                                         </svg>
                                     </span>
                                     <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem' }}>
-                                        <span>{item.label}</span>
+                                        <span style={item.id === 'open_positions_reval' && reconDeltaAlert ? { color: '#dc3545' } : {}}>{item.label}</span>
                                         {item.id === 'open_positions_reval' && reconDeltaAlert && (
                                             <span
                                                 aria-label="recon-delta-alert"

@@ -181,6 +181,10 @@ export const api = {
             summary: Record<string, unknown>;
             market: Record<string, unknown>;
         }>('/pmx/open-positions-reval'),
+    getPmxOpenPositionsRevalPdf: (params?: Record<string, string>) => {
+        const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+        return fetch(`${BASE}/pmx/open-positions-reval/pdf${qs}`, { credentials: 'include' });
+    },
 
     getAccountBalances: () =>
         request<{
