@@ -6,7 +6,8 @@
       "Bash(mkdir -p ~/.claude/skills && cp -r /tmp/skills/skills/frontend-design ~/.claude/skills/)",
       "Bash(\"C:/Users/Joshua.Kress/AppData/Local/Programs/Python/Python310/python.exe\" \"C:/Users/Joshua.Kress/Desktop/Temp/pmx_investigate.py\")",
       "Bash(cd \"C:/Users/Joshua.Kress/Desktop/JupyterProject2/j2-platform/client\" && npx tsc --noEmit 2>&1 | tail -30)",
-      "Bash(echo \"\" | npx skills add https://github.com/anthropics/skills --skill pdf --yes 2>&1 | tail -20)"
+      "Bash(echo \"\" | npx skills add https://github.com/anthropics/skills --skill pdf --yes 2>&1 | tail -20)",
+      "Bash(npx skills:*)"
     ]
   }
 }

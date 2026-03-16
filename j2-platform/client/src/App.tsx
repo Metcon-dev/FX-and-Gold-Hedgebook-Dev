@@ -583,7 +583,6 @@ function PMXLedger() {
     const [loading, setLoading] = useState(true);
     const [syncing, setSyncing] = useState(false);
     const [livePrices, setLivePrices] = useState<Row | null>(null);
-    const [livePricesLoading, setLivePricesLoading] = useState(true);
     const [priceFlash, setPriceFlash] = useState<{ xau: '' | 'up' | 'down'; fx: '' | 'up' | 'down' }>({ xau: '', fx: '' });
     const prevLiveRef = useRef<{ xau: number | null; fx: number | null }>({ xau: null, fx: null });
     const flashTimeoutRef = useRef<{ xau: number | null; fx: number | null }>({ xau: null, fx: null });
@@ -653,8 +652,12 @@ function PMXLedger() {
     const loadLivePrices = useCallback(async () => {
         try {
             const res = await api.getTradeMCLivePrices();
-            const nextXau = toNullableNumber((res as Row).xau_usd);
             const nextFx = toNullableNumber((res as Row).usd_zar);
+            const xauUsd = toNullableNumber((res as Row).xau_usd ?? (res as Row).gold_usd);
+            const nextXau = (
+                toNullableNumber((res as Row).xau_zar_g)
+                ?? ((xauUsd !== null && nextFx !== null) ? ((xauUsd * nextFx) / 31.1035) : null)
+            );
 
             const prevXau = prevLiveRef.current.xau;
             if (nextXau !== null) {
@@ -677,7 +680,6 @@ function PMXLedger() {
             setLivePrices(res);
         } catch (_e: unknown) {
         } finally {
-            setLivePricesLoading(false);
         }
     }, [triggerPriceFlash]);
 
@@ -740,9 +742,12 @@ function PMXLedger() {
         setFilters({ ...PMX_LEDGER_DEFAULT_FILTERS });
     };
 
-    const liveXauUsd = toNullableNumber(livePrices?.xau_usd);
     const liveUsdZar = toNullableNumber(livePrices?.usd_zar);
-    const liveFetchedAt = String(livePrices?.fetched_at || '').trim();
+    const liveXauUsd = toNullableNumber(livePrices?.xau_usd ?? livePrices?.gold_usd);
+    const liveStripItems: { key: 'xau' | 'fx'; label: string; value: number | null; decimals: number }[] = [
+        { key: 'xau', label: 'Gold Spot (XAU/USD)', value: liveXauUsd, decimals: 2 },
+        { key: 'fx', label: 'USD/ZAR', value: liveUsdZar, decimals: 4 },
+    ];
 
     const cols = [
         { key: 'Trade #', label: 'Trade #' },
@@ -952,22 +957,21 @@ function PMXLedger() {
                 </div>
             </div>
 
-            <div className="stat-grid pmx-live-stats">
-                <div className="stat-card">
-                    <div className="stat-label">Live XAU/USD</div>
-                    <div className={`stat-value ${priceFlash.xau === 'up' ? 'price-flash-up' : priceFlash.xau === 'down' ? 'price-flash-down' : ''}`}>
-                        {Number.isFinite(liveXauUsd) ? `$${fmt(liveXauUsd, 2)}` : '--'}
-                    </div>
-                </div>
-                <div className="stat-card">
-                    <div className="stat-label">Live USD/ZAR</div>
-                    <div className={`stat-value ${priceFlash.fx === 'up' ? 'price-flash-up' : priceFlash.fx === 'down' ? 'price-flash-down' : ''}`}>
-                        {Number.isFinite(liveUsdZar) ? `R${fmt(liveUsdZar, 2)}` : '--'}
-                    </div>
-                    <div className="stat-sub">
-                        {liveFetchedAt ? `Fetched: ${fmtDateTime(liveFetchedAt)}` : (livePricesLoading ? 'Loading...' : '--')}
-                    </div>
-                </div>
+            <div className="pmx-live-strip" role="status" aria-live="polite">
+                {liveStripItems.map((item, idx) => {
+                    const trend = priceFlash[item.key];
+                    const trendClass = trend === 'up' ? 'positive' : trend === 'down' ? 'negative' : '';
+                    const arrow = trend === 'up' ? '▲' : trend === 'down' ? '▼' : '•';
+                    return (
+                        <div key={item.key} className={`pmx-live-strip-item ${idx < liveStripItems.length - 1 ? 'with-divider' : ''}`}>
+                            <span className="pmx-live-strip-label">{item.label}:</span>
+                            <span className={`pmx-live-strip-value ${trendClass} ${trend === 'up' ? 'price-flash-up' : trend === 'down' ? 'price-flash-down' : ''}`}>
+                                {item.value !== null ? fmt(item.value, item.decimals ?? 2) : '--'}
+                            </span>
+                            <span className={`pmx-live-strip-arrow ${trendClass}`}>{arrow}</span>
+                        </div>
+                    );
+                })}
             </div>
 
             <div className="filter-bar">
@@ -1270,9 +1274,6 @@ function OpenPositionsReval() {
                     <button className="btn btn-sm" onClick={() => { void load(true); }} disabled={refreshing}>
                         {refreshing ? 'Refreshing...' : 'Refresh'}
                     </button>
-                    <button className="btn btn-sm btn-primary" onClick={() => { void downloadReport(); }} disabled={downloadingReport}>
-                        {downloadingReport ? 'Downloading...' : 'Download Report'}
-                    </button>
                 </div>
             </div>
 
@@ -1295,6 +1296,13 @@ function OpenPositionsReval() {
                         {totalPnlZar !== null ? `R${fmt(totalPnlZar, 2)}` : '--'}
                     </div>
                 </div>
+            </div>
+
+            <div className="section mt-3">
+                <div className="section-title">Download Report</div>
+                <button className="btn btn-sm btn-primary" onClick={() => { void downloadReport(); }} disabled={downloadingReport}>
+                    {downloadingReport ? 'Generating PDF...' : 'Download Open Positions Reval (PDF)'}
+                </button>
             </div>
 
             {openNetRows.length === 0 ? (

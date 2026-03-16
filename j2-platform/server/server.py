@@ -2249,7 +2249,7 @@ def _validate_integer_trade_number_recent_trademc(
     """
     Validation rules:
     - Only validate pure-integer trade refs.
-    - Skip validation for excluded symbols (XAGUSD, XPTUSD).
+    - Skip validation for excluded symbols (XAGUSD, XPTUSD, XPDUSD).
     - For validated refs, require a confirmed TradeMC booking in the last N days.
     """
     normalized_trade = normalize_trade_number(trade_number)
@@ -2262,7 +2262,7 @@ def _validate_integer_trade_number_recent_trademc(
 
     # Rule: skip excluded symbols.
     symbol_key = _normalize_symbol_for_validation(trade_symbol)
-    if symbol_key in {"XAGUSD", "XPTUSD"}:
+    if symbol_key in {"XAGUSD", "XPTUSD", "XPDUSD"}:
         return True, ""
 
     conn = None
@@ -5727,7 +5727,8 @@ def build_trading_ticket_pdf(trade_num_value: str,
         from reportlab.lib.units import mm
         from reportlab.lib.styles import ParagraphStyle
         from reportlab.platypus import (
-            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable,
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+            HRFlowable, Image as RLImage,
         )
         from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
         from reportlab.pdfbase import pdfmetrics
@@ -5738,309 +5739,335 @@ def build_trading_ticket_pdf(trade_num_value: str,
     except Exception:
         return None
 
-    def _esc(text: str) -> str:
-        """Escape XML/HTML special characters so ReportLab Paragraph markup is valid."""
-        return _html.escape(str(text), quote=False)
+    def _esc(v: str) -> str:
+        return _html.escape(str(v), quote=False)
 
-    # ─── Font registration (Calibri → Helvetica fallback) ────────────
+    # ── Font (Calibri → Helvetica fallback) ──────────────────────────
     FONT_REG  = "Helvetica"
     FONT_BOLD = "Helvetica-Bold"
-    _font_dir = r"C:\Windows\Fonts"
     try:
-        _reg_path  = _os.path.join(_font_dir, "calibri.ttf")
-        _bold_path = _os.path.join(_font_dir, "calibrib.ttf")
-        if _os.path.isfile(_reg_path) and _os.path.isfile(_bold_path):
-            pdfmetrics.registerFont(TTFont("Calibri",      _reg_path))
-            pdfmetrics.registerFont(TTFont("Calibri-Bold", _bold_path))
+        _rp = r"C:\Windows\Fonts\calibri.ttf"
+        _bp = r"C:\Windows\Fonts\calibrib.ttf"
+        if _os.path.isfile(_rp) and _os.path.isfile(_bp):
+            pdfmetrics.registerFont(TTFont("Calibri",      _rp))
+            pdfmetrics.registerFont(TTFont("Calibri-Bold", _bp))
             FONT_REG  = "Calibri"
             FONT_BOLD = "Calibri-Bold"
     except Exception:
-        pass  # stay with Helvetica
+        pass
 
-    # ─── Palette ────────────────────────────────────────────────────
-    NAVY     = colors.HexColor("#0D1B2A")
-    GOLD     = colors.HexColor("#C9A84C")
-    GOLD_LT  = colors.HexColor("#F5E6BB")
-    SLATE    = colors.HexColor("#1E2D3D")
-    MID_GREY = colors.HexColor("#8899AA")
-    LIGHT_BG = colors.HexColor("#F7F9FB")
-    ROW_ALT  = colors.HexColor("#EEF2F7")
-    GREEN_HI = colors.HexColor("#1A6B3C")
-    BLUE_HI  = colors.HexColor("#0F4C81")
-    PROFIT_P = colors.HexColor("#1A6B3C")
-    PROFIT_N = colors.HexColor("#8B1A1A")
-    WHITE    = colors.white
-    BLACK    = colors.HexColor("#0D1B2A")
+    # ── Brand colours ────────────────────────────────────────────────
+    CHARCOAL  = colors.HexColor("#1C1C1C")
+    COPPER    = colors.HexColor("#B07840")
+    COPPER_LT = colors.HexColor("#FBF5EC")
+    COPPER_MD = colors.HexColor("#E8D5B7")
+    TBL_HDR   = colors.HexColor("#2A2A2A")
+    ROW_ALT   = colors.HexColor("#F6F6F6")
+    BORDER    = colors.HexColor("#E2E2E2")
+    GREY_RULE = colors.HexColor("#D0D0D0")
+    MID_GREY  = colors.HexColor("#888888")
+    DARK_GREY = colors.HexColor("#555555")
+    GREEN     = colors.HexColor("#2D7A4F")
+    RED_C     = colors.HexColor("#C0392B")
+    WHITE     = colors.white
 
-    # ─── Helpers ────────────────────────────────────────────────────
-    def _s(value) -> str:
-        if value is None or (isinstance(value, float) and pd.isna(value)):
+    # ── Numeric helpers ──────────────────────────────────────────────
+    def _s(v) -> str:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
             return ""
-        return str(value).strip()
+        return str(v).strip()
 
-    def _n(value) -> Optional[float]:
+    def _n(v) -> Optional[float]:
         try:
-            v = float(value)
-            return None if pd.isna(v) else v
+            f = float(v)
+            return None if pd.isna(f) else f
         except Exception:
             return None
 
-    def _f(value, dp=2, prefix="") -> str:
-        n = _n(value)
-        if n is None:
-            return "\u2014"
-        return f"{prefix}{n:,.{dp}f}"
+    def _f(v, dp=2, prefix="") -> str:
+        n = _n(v)
+        return "\u2014" if n is None else f"{prefix}{n:,.{dp}f}"
 
-    def _truncate(text: str, mx: int) -> str:
-        return text if len(text) <= mx else text[:mx - 1] + "\u2026"
+    def _tr(t: str, mx: int) -> str:
+        return t if len(t) <= mx else t[:mx - 1] + "\u2026"
 
-    # ─── Styles ─────────────────────────────────────────────────────
-    _h = ParagraphStyle
-    body_style = _h("body", fontName=FONT_REG,  fontSize=8,   leading=10,  textColor=BLACK)
-    th_style   = _h("th",   fontName=FONT_BOLD, fontSize=7,   leading=9,   textColor=WHITE, alignment=TA_CENTER)
-    td_style   = _h("td",   fontName=FONT_REG,  fontSize=7.5, leading=9.5, textColor=BLACK)
-    td_r_style = _h("td_r", fontName=FONT_REG,  fontSize=7.5, leading=9.5, textColor=BLACK, alignment=TA_RIGHT)
-    sec_style  = _h("sec",  fontName=FONT_BOLD, fontSize=8,   leading=10,  textColor=WHITE)
-    pos_style  = _h("pos",  fontName=FONT_BOLD, fontSize=7.5, leading=9.5, textColor=PROFIT_P, alignment=TA_RIGHT)
-    neg_style  = _h("neg",  fontName=FONT_BOLD, fontSize=7.5, leading=9.5, textColor=PROFIT_N, alignment=TA_RIGHT)
-
-    # ─── Document ───────────────────────────────────────────────────
-    buf = BytesIO()
+    # ── Document ─────────────────────────────────────────────────────
+    buf  = BytesIO()
     PAGE = landscape(A4)
-    doc = SimpleDocTemplate(
-        buf,
-        pagesize=PAGE,
-        leftMargin=12*mm, rightMargin=12*mm,
-        topMargin=10*mm, bottomMargin=10*mm,
-    )
-    PW = PAGE[0] - 24*mm   # usable width
+    LM = RM = 14 * mm
+    TM = BM = 12 * mm
+    doc  = SimpleDocTemplate(buf, pagesize=PAGE,
+                             leftMargin=LM, rightMargin=RM,
+                             topMargin=TM, bottomMargin=BM)
+    PW = PAGE[0] - LM - RM    # usable width ≈ 269 mm
 
+    # ── Style factory ────────────────────────────────────────────────
+    def _ps(name, **kw) -> ParagraphStyle:
+        return ParagraphStyle(
+            name,
+            fontName=kw.pop("fontName", FONT_REG),
+            fontSize=kw.pop("fontSize", 8),
+            leading=kw.pop("leading", 11),
+            textColor=kw.pop("textColor", CHARCOAL),
+            **kw,
+        )
+
+    generated_at = datetime.now().strftime("%d %b %Y  %H:%M")
     story = []
 
-    # ── Header banner ──────────────────────────────────────────────
-    generated_at = datetime.now().strftime("%d %b %Y  %H:%M")
-    header_data = [[
-        Paragraph(f"<b>METAL CONCENTRATORS SA</b>",
-                  _h("hc", fontName=FONT_BOLD, fontSize=12, textColor=WHITE)),
-        Paragraph(
-            f"<font size='9' color='#C9A84C'><b>TRADING TICKET</b></font>  "
-            f"<font size='8' color='#8899AA'>Trade #</font>  "
-            f"<font size='10' color='white'><b>{_esc(_s(trade_num_value))}</b></font>",
-            _h("ht", fontName=FONT_REG, fontSize=9, textColor=WHITE, alignment=TA_CENTER)
-        ),
-        Paragraph(
-            f"<font size='7' color='#8899AA'>Generated</font><br/>"
-            f"<font size='7.5' color='white'>{_esc(generated_at)}</font>",
-            _h("hr", fontName=FONT_REG, fontSize=7, textColor=WHITE, alignment=TA_RIGHT)
-        ),
-    ]]
-    header_tbl = Table(header_data, colWidths=[PW*0.32, PW*0.40, PW*0.28])
-    header_tbl.setStyle(TableStyle([
-        ("BACKGROUND",   (0,0), (-1,-1), NAVY),
-        ("LEFTPADDING",  (0,0), (-1,-1), 10),
-        ("RIGHTPADDING", (0,0), (-1,-1), 10),
-        ("TOPPADDING",   (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING",(0,0), (-1,-1), 8),
-        ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
-        ("LINEBELOW",    (0,0), (-1,-1), 2, GOLD),
+    # ── Logo ─────────────────────────────────────────────────────────
+    _logo_path = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+        "MetCon Logo.png",
+    )
+    _logo_cell: object = Spacer(48 * mm, 13 * mm)
+    try:
+        if _os.path.isfile(_logo_path):
+            from PIL import Image as _PILImage
+            with _PILImage.open(_logo_path) as _pimg:
+                _pimg.load()
+            _logo_cell = RLImage(_logo_path, width=52 * mm, height=13 * mm)
+    except Exception:
+        pass
+
+    # ════════════════════════════════════════════════════════════════
+    # HEADER — logo left | title block right
+    # ════════════════════════════════════════════════════════════════
+    title_para = Paragraph(
+        f"<font name='{FONT_BOLD}' size='6.5' color='#B07840'>METAL CONCENTRATORS SA</font><br/>"
+        f"<font name='{FONT_BOLD}' size='17' color='#1C1C1C'>TRADING TICKET</font><br/>"
+        f"<font name='{FONT_BOLD}' size='9.5' color='#B07840'>{_esc(_s(trade_num_value))}</font>"
+        f"<font size='6.5' color='#888888'>    Generated  {_esc(generated_at)}</font>",
+        _ps("_hdr", leading=22, alignment=TA_RIGHT),
+    )
+    hdr = Table([[_logo_cell, title_para]], colWidths=[PW * 0.38, PW * 0.62])
+    hdr.setStyle(TableStyle([
+        ("VALIGN",        (0, 0), (-1, -1), "BOTTOM"),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+        ("TOPPADDING",    (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]))
-    story.append(header_tbl)
-    story.append(Spacer(1, 3*mm))
+    story.append(hdr)
+    story.append(HRFlowable(width=PW, thickness=2.5, color=COPPER,
+                            spaceBefore=1 * mm, spaceAfter=5 * mm))
 
-    # ─── Generic section renderer ───────────────────────────────────
-    def _section(title: str, accent: colors.Color, data_rows, col_names, col_widths_pct,
-                 right_cols=None, profit_col=None, totals_row=None):
-        right_cols = right_cols or []
-
-        label_tbl = Table([[Paragraph(title.upper(), sec_style)]], colWidths=[PW])
-        label_tbl.setStyle(TableStyle([
-            ("BACKGROUND",   (0,0), (-1,-1), accent),
-            ("LEFTPADDING",  (0,0), (-1,-1), 8),
-            ("TOPPADDING",   (0,0), (-1,-1), 3),
-            ("BOTTOMPADDING",(0,0), (-1,-1), 3),
+    # ════════════════════════════════════════════════════════════════
+    # HELPERS
+    # ════════════════════════════════════════════════════════════════
+    def _sec_lbl(title: str):
+        """Copper left-bar section label."""
+        lbl = Table([[
+            Spacer(1, 1),
+            Paragraph(
+                f"<font name='{FONT_BOLD}' size='7.5' color='#B07840'>{_esc(title.upper())}</font>",
+                _ps("_sl", fontName=FONT_BOLD, fontSize=7.5, textColor=COPPER),
+            ),
+        ]], colWidths=[3, PW - 3])
+        lbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (0, 0), COPPER),
+            ("BACKGROUND",    (1, 0), (1, 0), COPPER_LT),
+            ("LEFTPADDING",   (0, 0), (0, 0), 0),
+            ("RIGHTPADDING",  (0, 0), (0, 0), 0),
+            ("LEFTPADDING",   (1, 0), (-1, -1), 6),
+            ("RIGHTPADDING",  (1, 0), (-1, -1), 6),
+            ("TOPPADDING",    (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
         ]))
-        story.append(label_tbl)
+        story.append(lbl)
+        story.append(Spacer(1, 1.5 * mm))
 
-        if not data_rows:
-            story.append(Spacer(1, 1*mm))
-            story.append(Paragraph("  No data available.", body_style))
-            story.append(Spacer(1, 2*mm))
+    _pos_st = _ps("_pos", fontName=FONT_BOLD, fontSize=7.5, textColor=GREEN,  alignment=TA_RIGHT)
+    _neg_st = _ps("_neg", fontName=FONT_BOLD, fontSize=7.5, textColor=RED_C,  alignment=TA_RIGHT)
+
+    def _data_tbl(col_names, col_pcts, rows, right_cols=None, profit_col=None, totals=None):
+        """Clean striped data table with dark header and optional totals row."""
+        right_cols = right_cols or []
+        if not rows:
+            story.append(Paragraph(
+                "<font color='#888888'>  No data available.</font>",
+                _ps("_nd", textColor=MID_GREY),
+            ))
+            story.append(Spacer(1, 3 * mm))
             return
 
-        cw = [PW * p for p in col_widths_pct]
+        cw = [PW * p for p in col_pcts]
 
-        header_row = [Paragraph(_esc(c), th_style) for c in col_names]
-        table_data = [header_row]
-        for i, row in enumerate(data_rows):
+        hdr_row = [
+            Paragraph(
+                _esc(col),
+                _ps(f"_th{ci}", fontName=FONT_BOLD, fontSize=6.5, leading=8.5,
+                    textColor=WHITE, alignment=TA_RIGHT if ci in right_cols else TA_CENTER),
+            )
+            for ci, col in enumerate(col_names)
+        ]
+        tdata = [hdr_row]
+
+        for row in rows:
             cells = []
             for ci, col in enumerate(col_names):
                 raw = row.get(col, "")
                 txt = _esc(_s(raw)) if raw != "" else "\u2014"
-                if ci in right_cols:
-                    cells.append(Paragraph(txt, td_r_style))
-                elif col == profit_col:
+                if col == profit_col:
                     n = _n(raw)
-                    style = pos_style if (n is not None and n >= 0) else neg_style
-                    cells.append(Paragraph(txt if txt != "\u2014" else "", style))
+                    cells.append(Paragraph(
+                        txt if txt != "\u2014" else "",
+                        _pos_st if (n is not None and n >= 0) else _neg_st,
+                    ))
+                elif ci in right_cols:
+                    cells.append(Paragraph(txt, _ps(f"_tdr{ci}", fontSize=7.5, alignment=TA_RIGHT)))
                 else:
-                    cells.append(Paragraph(_esc(_truncate(_s(raw), 40)), td_style))
-            table_data.append(cells)
+                    cells.append(Paragraph(_esc(_tr(_s(raw), 38)), _ps(f"_td{ci}", fontSize=7.5)))
+            tdata.append(cells)
 
-        if totals_row:
-            cells = []
+        if totals:
+            tot_cells = []
             for ci, col in enumerate(col_names):
-                raw = totals_row.get(col, "")
+                raw = totals.get(col, "")
                 txt = _esc(_s(raw)) if raw != "" else ""
-                st = _h("tot", fontName=FONT_BOLD, fontSize=7.5, leading=9.5,
-                        textColor=BLACK, alignment=TA_RIGHT if ci in right_cols else TA_LEFT)
-                cells.append(Paragraph(txt, st))
-            table_data.append(cells)
+                tot_cells.append(Paragraph(txt, _ps(
+                    f"_tot{ci}", fontName=FONT_BOLD, fontSize=7.5,
+                    alignment=TA_RIGHT if ci in right_cols else TA_LEFT,
+                )))
+            tdata.append(tot_cells)
 
-        tbl = Table(table_data, colWidths=cw, repeatRows=1)
-
+        tbl = Table(tdata, colWidths=cw, repeatRows=1)
         ts = TableStyle([
-            ("BACKGROUND",   (0,0), (-1,0), SLATE),
-            ("FONTNAME",     (0,0), (-1,0), FONT_BOLD),
-            ("FONTSIZE",     (0,0), (-1,0), 7),
-            ("TEXTCOLOR",    (0,0), (-1,0), WHITE),
-            ("ALIGN",        (0,0), (-1,0), "CENTER"),
-            ("TOPPADDING",   (0,0), (-1,0), 3),
-            ("BOTTOMPADDING",(0,0), (-1,0), 3),
-            ("FONTNAME",     (0,1), (-1,-1), FONT_REG),
-            ("FONTSIZE",     (0,1), (-1,-1), 7.5),
-            ("TOPPADDING",   (0,1), (-1,-1), 2),
-            ("BOTTOMPADDING",(0,1), (-1,-1), 2),
-            ("LEFTPADDING",  (0,0), (-1,-1), 5),
-            ("RIGHTPADDING", (0,0), (-1,-1), 5),
-            ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
-            ("LINEBELOW",    (0,0), (-1,0), 0.5, GOLD),
-            ("LINEBELOW",    (0,1), (-1,-1), 0.3, colors.HexColor("#D8E0EA")),
-            ("GRID",         (0,0), (-1,-1), 0, colors.transparent),
+            ("BACKGROUND",    (0, 0), (-1, 0), TBL_HDR),
+            ("LINEBELOW",     (0, 0), (-1, 0), 1.5, COPPER),
+            ("TOPPADDING",    (0, 0), (-1, 0), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+            ("TOPPADDING",    (0, 1), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 3),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 5),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("LINEBELOW",     (0, 1), (-1, -1), 0.3, BORDER),
         ])
-        for ri in range(1, len(table_data)):
-            bg = ROW_ALT if ri % 2 == 0 else WHITE
-            ts.add("BACKGROUND", (0, ri), (-1, ri), bg)
-        if totals_row:
-            ts.add("BACKGROUND",    (0, -1), (-1, -1), GOLD_LT)
-            ts.add("LINEABOVE",     (0, -1), (-1, -1), 1, GOLD)
-            ts.add("FONTNAME",      (0, -1), (-1, -1), FONT_BOLD)
-
+        for ri in range(1, len(tdata)):
+            if totals and ri == len(tdata) - 1:
+                ts.add("BACKGROUND", (0, ri), (-1, ri), COPPER_LT)
+                ts.add("LINEABOVE",  (0, ri), (-1, ri), 1.0, COPPER_MD)
+            else:
+                ts.add("BACKGROUND", (0, ri), (-1, ri), ROW_ALT if ri % 2 == 0 else WHITE)
         tbl.setStyle(ts)
         story.append(tbl)
-        story.append(Spacer(1, 2*mm))
+        story.append(Spacer(1, 4 * mm))
 
-    # ─── Prepare DataFrames ─────────────────────────────────────────
-    tm_pdf  = trademc_rows.copy() if trademc_rows is not None else pd.DataFrame()
-    stx_pdf = stonex_rows.copy()  if stonex_rows  is not None else pd.DataFrame()
-    sum_pdf = summary_rows.copy() if summary_rows  is not None else pd.DataFrame()
+    # ════════════════════════════════════════════════════════════════
+    # SECTION 1 — TradeMC Client Bookings
+    # ════════════════════════════════════════════════════════════════
+    _sec_lbl("TradeMC \u2014 Client Bookings")
 
-    # ─── TradeMC Booking ───────────────────────────────────────────
-    tm_cols      = ["Company", "Weight (g)", "Weight (oz)", "$/oz Booked", "FX Rate", "USD Value", "ZAR Value"]
-    tm_available = [c for c in tm_cols if c in tm_pdf.columns]
-    tm_col_w     = {"Company": 0.28, "Weight (g)": 0.12, "Weight (oz)": 0.12,
-                    "$/oz Booked": 0.13, "FX Rate": 0.10, "USD Value": 0.12, "ZAR Value": 0.13}
-    total_w   = sum(tm_col_w[c] for c in tm_available) or 1
-    tm_widths = [tm_col_w.get(c, 0.12) / total_w for c in tm_available]
-    tm_right  = [i for i, c in enumerate(tm_available) if c != "Company"]
+    tm_pdf   = trademc_rows.copy() if trademc_rows is not None else pd.DataFrame()
+    TM_COLS  = ["Company", "Weight (g)", "Weight (oz)", "$/oz Booked", "FX Rate", "USD Value", "ZAR Value"]
+    tm_avail = [c for c in TM_COLS if c in tm_pdf.columns]
+    _TM_W    = {"Company": 0.26, "Weight (g)": 0.12, "Weight (oz)": 0.12,
+                "$/oz Booked": 0.13, "FX Rate": 0.10, "USD Value": 0.13, "ZAR Value": 0.14}
+    _tw      = sum(_TM_W[c] for c in tm_avail) or 1
+    tm_wids  = [_TM_W.get(c, 0.12) / _tw for c in tm_avail]
+    tm_right = [i for i, c in enumerate(tm_avail) if c != "Company"]
 
-    # Build TradeMC totals and inline summary
     tm_totals: Dict[str, str] = {}
-    total_weight_g = 0.0; total_usd_val = 0.0; total_zar_val = 0.0
-    hw, hu, hz = False, False, False
+    total_g = total_usd = total_zar = 0.0
+    hw = hu = hz = False
     if not tm_pdf.empty:
-        totals_num_cols = ["Weight (g)", "Weight (oz)", "USD Value", "ZAR Value"]
-        col_sums: Dict[str, float] = {c: 0.0 for c in totals_num_cols}
-        has_col: Dict[str, bool]   = {c: False for c in totals_num_cols}
+        _num_cols = ["Weight (g)", "Weight (oz)", "USD Value", "ZAR Value"]
+        col_sums: Dict[str, float] = {c: 0.0 for c in _num_cols}
+        has_c: Dict[str, bool]     = {c: False for c in _num_cols}
         for _, row in tm_pdf.iterrows():
-            company = _s(row.get("Company", "")).lower()
-            is_ctrl = company == "trading control account"
-            for col in totals_num_cols:
+            is_ctrl = _s(row.get("Company", "")).lower() == "trading control account"
+            for col in _num_cols:
                 v = _n(row.get(col))
                 if v is not None:
                     col_sums[col] += v
-                    has_col[col] = True
+                    has_c[col] = True
             if not is_ctrl:
-                wg = _n(row.get("Weight (g)")); wu = _n(row.get("USD Value")); wz = _n(row.get("ZAR Value"))
-                if wg is not None: total_weight_g += wg; hw = True
-                if wu is not None: total_usd_val  += wu; hu = True
-                if wz is not None: total_zar_val  += wz; hz = True
-        for col in totals_num_cols:
-            if has_col[col]:
+                wg = _n(row.get("Weight (g)"))
+                wu = _n(row.get("USD Value"))
+                wz = _n(row.get("ZAR Value"))
+                if wg is not None: total_g   += wg; hw = True
+                if wu is not None: total_usd += wu; hu = True
+                if wz is not None: total_zar += wz; hz = True
+        for col in _num_cols:
+            if has_c[col]:
                 dp = 4 if col in ("$/oz Booked", "FX Rate") else 2
                 tm_totals[col] = f"{col_sums[col]:,.{dp}f}"
         tm_totals["Company"] = "TOTAL"
 
-    tm_rows_data = [
-        {c: (_f(r.get(c), 2 if c in ("Weight (g)","Weight (oz)","USD Value","ZAR Value") else 4)
-             if c in ("Weight (g)","Weight (oz)","$/oz Booked","FX Rate","USD Value","ZAR Value")
+    tm_rows = [
+        {c: (_f(r.get(c), 4 if c in ("$/oz Booked", "FX Rate") else 2)
+             if c in ("Weight (g)", "Weight (oz)", "$/oz Booked", "FX Rate", "USD Value", "ZAR Value")
              else _s(r.get(c)))
-         for c in tm_available}
+         for c in tm_avail}
         for _, r in tm_pdf.iterrows()
     ] if not tm_pdf.empty else []
 
-    # Append a compact WA summary row directly inside the TradeMC table
+    _data_tbl(tm_avail, tm_wids, tm_rows,
+              right_cols=tm_right, totals=tm_totals if tm_totals else None)
+
+    # Booking summary note bar
     if hw or hu or hz:
-        oz = total_weight_g / 31.1035 if hw else None
-        wa_usd = (total_usd_val / oz) if (hu and oz and abs(oz) > 1e-12) else None
-        wa_fx  = (total_zar_val / total_usd_val) if (hz and hu and abs(total_usd_val) > 1e-12) else None
-        parts = []
-        if hw and oz:  parts.append(f"{total_weight_g:,.2f} g ({oz:,.4f} oz)")
-        if wa_usd:     parts.append(f"WA ${wa_usd:,.4f}/oz")
-        if wa_fx:      parts.append(f"WA FX R {wa_fx:,.4f}")
-        if hz:         parts.append(f"Total R {abs(total_zar_val):,.2f}")
-        summary_note = "  \u2022  ".join(parts)
-        # Add as a spanning note row below the table via a separate small table
-        _section("TradeMC \u2014 Client Bookings", GREEN_HI,
-                 tm_rows_data, tm_available, tm_widths,
-                 right_cols=tm_right, totals_row=tm_totals if tm_totals else None)
-        if summary_note:
-            note_tbl = Table([[Paragraph(f"<font size='6.5' color='#1A6B3C'>{_esc(summary_note)}</font>",
-                                         _h("sn", fontName=FONT_REG, fontSize=6.5, leading=9, textColor=GREEN_HI))]],
-                             colWidths=[PW])
-            note_tbl.setStyle(TableStyle([
-                ("BACKGROUND",   (0,0), (-1,-1), colors.HexColor("#EAF5EE")),
-                ("LEFTPADDING",  (0,0), (-1,-1), 8),
-                ("TOPPADDING",   (0,0), (-1,-1), 2),
-                ("BOTTOMPADDING",(0,0), (-1,-1), 2),
+        oz = total_g / 31.1035 if hw else None
+        wa_usd = (total_usd / oz) if (hu and oz and abs(oz) > 1e-12) else None
+        wa_fx  = (total_zar / total_usd) if (hz and hu and abs(total_usd) > 1e-12) else None
+        parts: list = []
+        if hw and oz:  parts.append(f"{total_g:,.2f}\u202fg  ({oz:,.4f}\u202foz)")
+        if wa_usd:     parts.append(f"WA Gold  ${wa_usd:,.4f}/oz")
+        if wa_fx:      parts.append(f"WA FX  R\u00a0{wa_fx:,.4f}")
+        if hz:         parts.append(f"Total ZAR  R\u00a0{abs(total_zar):,.2f}")
+        if parts:
+            story.pop()   # remove trailing Spacer from _data_tbl
+            _bullet_sep = " | "
+            nt = Table([[Paragraph(
+                f"<font name='{FONT_BOLD}' size='6' color='#B07840'>BOOKING SUMMARY  </font>"
+                f"<font size='6.5' color='#555555'>{_esc(_bullet_sep.join(parts))}</font>",
+                _ps("_sn", fontSize=6.5, leading=9),
+            )]], colWidths=[PW])
+            nt.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, -1), COPPER_LT),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+                ("TOPPADDING",    (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LINEABOVE",     (0, 0), (-1, -1), 0.5, COPPER_MD),
             ]))
-            # Remove the spacer added by _section, add note, then re-add spacer
-            story.pop()   # remove the trailing Spacer(1, 2mm)
-            story.append(note_tbl)
-            story.append(Spacer(1, 2*mm))
-    else:
-        _section("TradeMC \u2014 Client Bookings", GREEN_HI,
-                 tm_rows_data, tm_available, tm_widths,
-                 right_cols=tm_right, totals_row=tm_totals if tm_totals else None)
+            story.append(nt)
+            story.append(Spacer(1, 5 * mm))
 
-    # ─── PMX / StoneX Trades ───────────────────────────────────────
-    stx_cols      = ["FNC #", "Trade Date", "Value Date", "Symbol", "Side", "Narration", "Quantity", "Price"]
-    stx_available = [c for c in stx_cols if c in stx_pdf.columns]
-    stx_col_w     = {"FNC #": 0.13, "Trade Date": 0.10, "Value Date": 0.10, "Symbol": 0.08,
-                     "Side": 0.07, "Narration": 0.22, "Quantity": 0.14, "Price": 0.13}
-    total_stx  = sum(stx_col_w.get(c, 0.10) for c in stx_available) or 1
-    stx_widths = [stx_col_w.get(c, 0.10) / total_stx for c in stx_available]
-    stx_right  = [i for i, c in enumerate(stx_available) if c in ("Quantity", "Price")]
+    # ════════════════════════════════════════════════════════════════
+    # SECTION 2 — PMX / StoneX Trades
+    # ════════════════════════════════════════════════════════════════
+    _sec_lbl("PMX / StoneX Trades")
 
-    stx_rows_data = []
+    stx_pdf   = stonex_rows.copy() if stonex_rows is not None else pd.DataFrame()
+    STX_COLS  = ["FNC #", "Trade Date", "Value Date", "Symbol", "Side", "Narration", "Quantity", "Price"]
+    stx_avail = [c for c in STX_COLS if c in stx_pdf.columns]
+    _STX_W    = {"FNC #": 0.13, "Trade Date": 0.09, "Value Date": 0.09, "Symbol": 0.07,
+                 "Side": 0.06, "Narration": 0.24, "Quantity": 0.14, "Price": 0.12}
+    _sw       = sum(_STX_W.get(c, 0.10) for c in stx_avail) or 1
+    stx_wids  = [_STX_W.get(c, 0.10) / _sw for c in stx_avail]
+    stx_right = [i for i, c in enumerate(stx_avail) if c in ("Quantity", "Price")]
+
+    stx_rows: list = []
     for _, r in stx_pdf.iterrows():
-        row_dict = {}
-        for c in stx_available:
-            if c == "Quantity":
-                row_dict[c] = _f(r.get(c), 2)
-            elif c == "Price":
-                row_dict[c] = _f(r.get(c), 4)
-            else:
-                row_dict[c] = _s(r.get(c))
-        stx_rows_data.append(row_dict)
+        rd: Dict[str, str] = {}
+        for c in stx_avail:
+            if c == "Quantity":   rd[c] = _f(r.get(c), 2)
+            elif c == "Price":    rd[c] = _f(r.get(c), 4)
+            else:                 rd[c] = _s(r.get(c))
+        stx_rows.append(rd)
 
-    _section("PMX / StoneX Trades", BLUE_HI,
-             stx_rows_data, stx_available, stx_widths, right_cols=stx_right)
+    _data_tbl(stx_avail, stx_wids, stx_rows, right_cols=stx_right)
 
-    # ─── Ticket Summary ─────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
+    # SECTION 3 — Ticket Summary (KPI cards)
+    # ════════════════════════════════════════════════════════════════
+    sum_pdf = summary_rows.copy() if summary_rows is not None else pd.DataFrame()
     if not sum_pdf.empty:
         base = sum_pdf.iloc[0].to_dict()
 
-        def _fn(v, pat):
+        def _fn(v, pat: str) -> str:
             n = _n(v)
             return pat.format(n) if n is not None else "\u2014"
 
@@ -6050,9 +6077,11 @@ def build_trading_ticket_pdf(trade_num_value: str,
         stx_zar_flow = _n(base.get("StoneX ZAR Flow"))
         sell_zar     = _n(base.get("Sell Side (ZAR)"))
         buy_zar      = _n(base.get("Buy Side (ZAR)"))
+        sell_usd     = _n(base.get("Sell Side (USD)"))
+        buy_usd      = _n(base.get("Buy Side (USD)"))
         profit_zar   = _n(base.get("Profit (ZAR)"))
         profit_pct   = _n(base.get("Profit % (ZAR Spot Cost)"))
-        total_oz_s   = _n(base.get("Total Traded (oz)"))
+        total_oz     = _n(base.get("Total Traded (oz)"))
         total_g_s    = _n(base.get("Total Traded (g)"))
         ctrl_g       = _n(base.get("Control Account (g)"))
         ctrl_zar     = _n(base.get("Control Account (ZAR)"))
@@ -6063,46 +6092,96 @@ def build_trading_ticket_pdf(trade_num_value: str,
             profit_pct = (profit_zar / buy_zar) * 100.0
 
         stonex_zar = stx_zar_flow if stx_zar_flow is not None else sell_zar
-        stonex_g   = total_g_s if total_g_s is not None else (total_oz_s * 31.1035 if total_oz_s is not None else None)
+        stonex_g   = total_g_s if total_g_s is not None else (
+            total_oz * 31.1035 if total_oz is not None else None)
 
-        sum_kv_cols  = ["ENTITY", "WEIGHT", "GOLD $/oz", "FX RATE", "SPOT ZAR/g", "ZAR VALUE", "PROFIT ZAR", "PROFIT %"]
-        sum_kv_w     = [0.22, 0.13, 0.10, 0.10, 0.10, 0.13, 0.13, 0.09]
-        sum_kv_right = [1, 2, 3, 4, 5, 6, 7]
+        _sec_lbl("Ticket Summary")
 
-        sum_rows_data = []
-        if any(v is not None for v in [stonex_g, gold_wa, fx_wa, spot_zar_g, stonex_zar]):
-            wt = f"{stonex_g:,.2f} g" if stonex_g is not None else "\u2014"
-            sum_rows_data.append({
-                "ENTITY":     "StoneX Group Inc.",
-                "WEIGHT":     wt,
-                "GOLD $/oz":  _fn(gold_wa,    "${:,.3f}"),
-                "FX RATE":    _fn(fx_wa,      "R {:,.4f}"),
-                "SPOT ZAR/g": _fn(spot_zar_g, "R {:,.4f}"),
-                "ZAR VALUE":  _fn(stonex_zar,  "R {:,.2f}"),
-                "PROFIT ZAR": _fn(profit_zar,  "R {:,.2f}"),
-                "PROFIT %":   _fn(profit_pct,  "{:,.3f}%"),
-            })
-        if ctrl_g is not None or ctrl_zar is not None:
-            sum_rows_data.append({
-                "ENTITY":     "Trading Control Account",
-                "WEIGHT":     _fn(ctrl_g,   "{:,.4f} g"),
-                "GOLD $/oz":  "\u2014", "FX RATE": "\u2014", "SPOT ZAR/g": "\u2014",
-                "ZAR VALUE":  _fn(ctrl_zar, "R {:,.2f}"),
-                "PROFIT ZAR": "\u2014", "PROFIT %": "\u2014",
-            })
+        # KPI data: list of (label, value, highlight_as_profit|bool)
+        kpis: list = [
+            ("Weight Traded", f"{stonex_g:,.2f} g"      if stonex_g    is not None else "\u2014", False),
+            ("Gold WA $/oz",  f"${gold_wa:,.3f}/oz"     if gold_wa     is not None else "\u2014", False),
+            ("WA FX Rate",    f"R\u00a0{fx_wa:,.4f}"    if fx_wa       is not None else "\u2014", False),
+            ("Spot ZAR/g",    f"R\u00a0{spot_zar_g:,.4f}" if spot_zar_g is not None else "\u2014", False),
+            ("StoneX ZAR",    f"R\u00a0{stonex_zar:,.2f}" if stonex_zar is not None else "\u2014", False),
+        ]
+        if profit_zar is not None:
+            kpis.append(("Profit ZAR", f"R\u00a0{profit_zar:,.2f}", True))
+        if profit_pct is not None:
+            kpis.append(("Profit %", f"{profit_pct:,.3f}%", True))
 
-        if sum_rows_data:
-            _section("Ticket Summary", NAVY,
-                     sum_rows_data, sum_kv_cols, sum_kv_w,
-                     right_cols=sum_kv_right, profit_col="PROFIT ZAR")
+        def _kpi_tbl(kpi_list: list) -> Table:
+            n     = len(kpi_list)
+            cw_k  = PW / n
+            lbl_r = []
+            val_r = []
+            for lbl, val, hl in kpi_list:
+                lbl_r.append(Paragraph(
+                    f"<font size='6' color='#888888'>{_esc(lbl.upper())}</font>",
+                    _ps(f"_kl_{lbl}", fontSize=6, textColor=MID_GREY, alignment=TA_CENTER),
+                ))
+                if hl and lbl == "Profit ZAR":
+                    vc = GREEN if (profit_zar is not None and profit_zar >= 0) else RED_C
+                elif hl:
+                    vc = COPPER
+                else:
+                    vc = CHARCOAL
+                val_r.append(Paragraph(
+                    f"<font name='{FONT_BOLD}' size='9.5'>{_esc(val)}</font>",
+                    _ps(f"_kv_{lbl}", fontName=FONT_BOLD, fontSize=9.5,
+                        leading=12, textColor=vc, alignment=TA_CENTER),
+                ))
+            kt = Table([lbl_r, val_r], colWidths=[cw_k] * n)
+            kts = TableStyle([
+                ("TOPPADDING",    (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+                ("BOX",           (0, 0), (-1, -1), 0.5, BORDER),
+                ("LINEBELOW",     (0, 0), (-1, 0),  0.3, BORDER),
+                ("LINEBEFORE",    (1, 0), (-1, -1), 0.3, BORDER),
+                ("BACKGROUND",    (0, 0), (-1, -1), WHITE),
+            ])
+            for ci, (_, __, hl) in enumerate(kpi_list):
+                if hl:
+                    kts.add("BACKGROUND", (ci, 0), (ci, -1), COPPER_LT)
+            kt.setStyle(kts)
+            return kt
 
-    # ─── Footer ─────────────────────────────────────────────────────
-    story.append(HRFlowable(width=PW, thickness=0.5, color=MID_GREY))
-    story.append(Spacer(1, 1.5*mm))
+        story.append(_kpi_tbl(kpis))
+
+        # Control account + flow detail row
+        ctrl_kpis: list = []
+        if ctrl_g is not None:
+            ctrl_kpis.append(("Ctrl Acct Weight", f"{ctrl_g:,.4f} g", False))
+        if ctrl_zar is not None:
+            ctrl_kpis.append(("Ctrl Acct ZAR", f"R\u00a0{ctrl_zar:,.2f}", False))
+        if sell_usd is not None:
+            ctrl_kpis.append(("Sell Side USD", f"${sell_usd:,.2f}", False))
+        if buy_usd is not None:
+            ctrl_kpis.append(("Buy Side USD", f"${buy_usd:,.2f}", False))
+        if sell_zar is not None:
+            ctrl_kpis.append(("Sell Side ZAR", f"R\u00a0{sell_zar:,.2f}", False))
+        if buy_zar is not None:
+            ctrl_kpis.append(("Buy Side ZAR", f"R\u00a0{buy_zar:,.2f}", False))
+        if ctrl_kpis:
+            story.append(Spacer(1, 2 * mm))
+            story.append(_kpi_tbl(ctrl_kpis))
+
+        story.append(Spacer(1, 5 * mm))
+
+    # ════════════════════════════════════════════════════════════════
+    # FOOTER
+    # ════════════════════════════════════════════════════════════════
+    story.append(HRFlowable(width=PW, thickness=0.5, color=GREY_RULE,
+                            spaceBefore=2 * mm, spaceAfter=2 * mm))
     story.append(Paragraph(
-        f"<font size='6' color='#8899AA'>Metal Concentrators SA  \u2022  Confidential  \u2022  "
-        f"Trading Ticket #{_esc(_s(trade_num_value))}  \u2022  {_esc(generated_at)}</font>",
-        _h("ft", fontName=FONT_REG, fontSize=6, textColor=MID_GREY, alignment=TA_CENTER)
+        f"<font size='6' color='#888888'>"
+        f"Metal Concentrators SA  \u2022  Confidential  \u2022  "
+        f"Trading Ticket\u00a0#{_esc(_s(trade_num_value))}  \u2022  {_esc(generated_at)}"
+        f"</font>",
+        _ps("_ft", fontSize=6, textColor=MID_GREY, alignment=TA_CENTER),
     ))
 
     doc.build(story)
@@ -6111,9 +6190,55 @@ def build_trading_ticket_pdf(trade_num_value: str,
 
 def build_open_positions_reval_pdf(args_dict: Dict[str, Any], req_headers: Any = None):
     try:
-        from fpdf import FPDF
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib import colors
+        from reportlab.lib.units import mm
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+            HRFlowable, Image as RLImage,
+        )
+        from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from io import BytesIO
+        import html as _html
+        import os as _os
     except Exception:
-        return None
+        return _build_open_positions_reval_pdf_fpdf(args_dict, req_headers)
+
+    def _esc(v: Any) -> str:
+        return _html.escape(str(v), quote=False)
+
+    FONT_REG = "Helvetica"
+    FONT_BOLD = "Helvetica-Bold"
+    try:
+        _rp = r"C:\Windows\Fonts\calibri.ttf"
+        _bp = r"C:\Windows\Fonts\calibrib.ttf"
+        if _os.path.isfile(_rp) and _os.path.isfile(_bp):
+            pdfmetrics.registerFont(TTFont("Calibri", _rp))
+            pdfmetrics.registerFont(TTFont("Calibri-Bold", _bp))
+            FONT_REG = "Calibri"
+            FONT_BOLD = "Calibri-Bold"
+    except Exception:
+        pass
+
+    CHARCOAL = colors.HexColor("#1C1C1C")
+    COPPER = colors.HexColor("#B07840")
+    COPPER_LT = colors.HexColor("#FBF5EC")
+    COPPER_MD = colors.HexColor("#E8D5B7")
+    TBL_HDR = colors.HexColor("#2A2A2A")
+    ROW_ALT = colors.HexColor("#F6F6F6")
+    BORDER = colors.HexColor("#E2E2E2")
+    MID_GREY = colors.HexColor("#888888")
+    GREEN = colors.HexColor("#2D7A4F")
+    RED_C = colors.HexColor("#C0392B")
+    WHITE = colors.white
+
+    def _s(v: Any) -> str:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        return str(v).strip()
 
     def _to_num(value: Any) -> Optional[float]:
         try:
@@ -6124,14 +6249,302 @@ def build_open_positions_reval_pdf(args_dict: Dict[str, Any], req_headers: Any =
         except Exception:
             return None
 
-    def _txt(value: Any) -> str:
-        if value is None:
-            return "--"
-        text = str(value)
+    def _fmt(value: Any, dp: int = 2) -> str:
+        n = _to_num(value)
+        if n is None:
+            return "—"
+        return f"{n:,.{dp}f}"
+
+    def _ps(name: str, **kw) -> ParagraphStyle:
+        return ParagraphStyle(
+            name,
+            fontName=kw.pop("fontName", FONT_REG),
+            fontSize=kw.pop("fontSize", 8),
+            leading=kw.pop("leading", 10),
+            textColor=kw.pop("textColor", CHARCOAL),
+            **kw,
+        )
+
+    reval = build_open_positions_reval(args_dict, req_headers)
+    rows = reval.get("rows", []) if isinstance(reval, dict) else []
+    summary = reval.get("summary", {}) if isinstance(reval, dict) else {}
+    market = reval.get("market", {}) if isinstance(reval, dict) else {}
+    recon = build_account_recon(args_dict, req_headers)
+    tm_df = load_trademc_trades_with_companies()
+    if not isinstance(tm_df, pd.DataFrame):
+        tm_df = pd.DataFrame()
+
+    today_key = datetime.now().strftime("%Y-%m-%d")
+    buy_g = 0.0
+    sell_g = 0.0
+    counted = 0
+    if not tm_df.empty:
+        ts_src = (
+            tm_df["trade_timestamp"] if "trade_timestamp" in tm_df.columns else
+            (tm_df["trade_date"] if "trade_date" in tm_df.columns else
+             (tm_df["created_at"] if "created_at" in tm_df.columns else pd.Series([None] * len(tm_df))))
+        )
+        side_src = (
+            tm_df["side"] if "side" in tm_df.columns else
+            (tm_df["trade_side"] if "trade_side" in tm_df.columns else pd.Series([""] * len(tm_df)))
+        )
+        wt_src = (
+            tm_df["weight"] if "weight" in tm_df.columns else
+            (tm_df["Weight"] if "Weight" in tm_df.columns else
+             (tm_df["quantity"] if "quantity" in tm_df.columns else
+              (tm_df["qty"] if "qty" in tm_df.columns else pd.Series([None] * len(tm_df)))))
+        )
+        ts = pd.to_datetime(ts_src, errors="coerce").dt.strftime("%Y-%m-%d")
+        side = side_src.fillna("").astype(str).str.upper().str.strip()
+        wt = pd.to_numeric(wt_src, errors="coerce")
+        for i in range(len(tm_df)):
+            if str(ts.iloc[i] or "") != today_key:
+                continue
+            w = wt.iloc[i]
+            if pd.isna(w):
+                continue
+            w = float(w)
+            s = str(side.iloc[i] or "")
+            if s == "BUY":
+                buy_g += abs(w)
+            elif s == "SELL":
+                sell_g -= abs(w)
+            else:
+                if w >= 0:
+                    buy_g += w
+                else:
+                    sell_g += w
+            counted += 1
+
+    buf = BytesIO()
+    PAGE = landscape(A4)
+    LM = RM = 14 * mm
+    TM = BM = 12 * mm
+    doc = SimpleDocTemplate(buf, pagesize=PAGE, leftMargin=LM, rightMargin=RM, topMargin=TM, bottomMargin=BM)
+    PW = PAGE[0] - LM - RM
+    generated_at = datetime.now().strftime("%d %b %Y  %H:%M")
+    story: List[Any] = []
+
+    _logo_path = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+        "MetCon Logo.png",
+    )
+    _logo_cell: object = Spacer(48 * mm, 13 * mm)
+    try:
+        if _os.path.isfile(_logo_path):
+            from PIL import Image as _PILImage
+            with _PILImage.open(_logo_path) as _img:
+                _img.load()
+            _logo_cell = RLImage(_logo_path, width=52 * mm, height=13 * mm)
+    except Exception:
+        pass
+
+    title_para = Paragraph(
+        f"<font name='{FONT_BOLD}' size='6.5' color='#B07840'>METAL CONCENTRATORS SA</font><br/>"
+        f"<font name='{FONT_BOLD}' size='17' color='#1C1C1C'>OPEN POSITIONS REVAL REPORT</font><br/>"
+        f"<font size='6.5' color='#888888'>Generated  {_esc(generated_at)}</font>",
+        _ps("_hdr", leading=22, alignment=TA_RIGHT),
+    )
+    hdr = Table([[_logo_cell, title_para]], colWidths=[PW * 0.38, PW * 0.62])
+    hdr.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "BOTTOM"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(hdr)
+    story.append(HRFlowable(width=PW, thickness=2.5, color=COPPER, spaceBefore=1 * mm, spaceAfter=5 * mm))
+
+    def _sec_lbl(title: str):
+        lbl = Table([[
+            Spacer(1, 1),
+            Paragraph(
+                f"<font name='{FONT_BOLD}' size='7.5' color='#B07840'>{_esc(title.upper())}</font>",
+                _ps("_sl", fontName=FONT_BOLD, fontSize=7.5, textColor=COPPER),
+            ),
+        ]], colWidths=[3, PW - 3])
+        lbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, 0), COPPER),
+            ("BACKGROUND", (1, 0), (1, 0), COPPER_LT),
+            ("LEFTPADDING", (0, 0), (0, 0), 0),
+            ("RIGHTPADDING", (0, 0), (0, 0), 0),
+            ("LEFTPADDING", (1, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (1, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(lbl)
+        story.append(Spacer(1, 1.5 * mm))
+
+    _pos_st = _ps("_pos", fontName=FONT_BOLD, fontSize=7.5, textColor=GREEN, alignment=TA_RIGHT)
+    _neg_st = _ps("_neg", fontName=FONT_BOLD, fontSize=7.5, textColor=RED_C, alignment=TA_RIGHT)
+
+    def _data_tbl(col_names: List[str], col_pcts: List[float], data_rows: List[Dict[str, Any]],
+                  right_cols: Optional[List[int]] = None, profit_col: Optional[str] = None):
+        right_cols = right_cols or []
+        if not data_rows:
+            story.append(Paragraph("<font color='#888888'>  No data available.</font>", _ps("_nd", textColor=MID_GREY)))
+            story.append(Spacer(1, 3 * mm))
+            return
+        cw = [PW * p for p in col_pcts]
+        header = [
+            Paragraph(_esc(col), _ps(f"_th{idx}", fontName=FONT_BOLD, fontSize=6.5, leading=8.5,
+                                     textColor=WHITE, alignment=TA_RIGHT if idx in right_cols else TA_CENTER))
+            for idx, col in enumerate(col_names)
+        ]
+        table_data: List[List[Any]] = [header]
+        for row in data_rows:
+            cells: List[Any] = []
+            for idx, col in enumerate(col_names):
+                raw = row.get(col, "")
+                txt = _esc(_s(raw)) if _s(raw) else "—"
+                if col == profit_col:
+                    n = _to_num(raw)
+                    cells.append(Paragraph(txt, _pos_st if (n is not None and n >= 0) else _neg_st))
+                elif idx in right_cols:
+                    cells.append(Paragraph(txt, _ps(f"_r{idx}", fontSize=7.5, alignment=TA_RIGHT)))
+                else:
+                    cells.append(Paragraph(txt, _ps(f"_l{idx}", fontSize=7.5)))
+            table_data.append(cells)
+        tbl = Table(table_data, colWidths=cw, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), TBL_HDR),
+            ("LINEBELOW", (0, 0), (-1, 0), 1.5, COPPER),
+            ("TEXTCOLOR", (0, 0), (-1, 0), WHITE),
+            ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [WHITE, ROW_ALT]),
+            ("GRID", (0, 1), (-1, -1), 0.35, BORDER),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 2.8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.8),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 3.5 * mm))
+
+    _sec_lbl("Open Unallocated Positions and Revaluated PnL")
+    kpi_cols = ["Open Pairs", "Current Gold ($/oz)", "Current FX (USD/ZAR)", "Total PnL (ZAR)"]
+    kpi_vals = [[
+        _fmt(summary.get("open_trades"), 0),
+        _fmt(market.get("xau_usd"), 4),
+        _fmt(market.get("usd_zar"), 5),
+        _fmt(summary.get("total_pnl_zar"), 2),
+    ]]
+    kpi_tbl = Table([kpi_cols] + kpi_vals, colWidths=[PW * 0.19, PW * 0.27, PW * 0.27, PW * 0.27])
+    kpi_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), COPPER_LT),
+        ("TEXTCOLOR", (0, 0), (-1, 0), COPPER),
+        ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
+        ("FONTSIZE", (0, 0), (-1, 0), 7),
+        ("TEXTCOLOR", (0, 1), (-1, 1), CHARCOAL),
+        ("FONTNAME", (0, 1), (-1, 1), FONT_BOLD),
+        ("FONTSIZE", (0, 1), (-1, 1), 9.2),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("GRID", (0, 0), (-1, -1), 0.4, COPPER_MD),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(kpi_tbl)
+    story.append(Spacer(1, 3 * mm))
+
+    table_rows: List[Dict[str, Any]] = []
+    for raw in rows if isinstance(rows, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        pair = str(raw.get("pair") or raw.get("trade_num") or raw.get("pair_symbol") or "").upper().replace("-", "/")
+        if pair in {"USD/ZAR", "USDZAR"}:
+            qty = _to_num(raw.get("fx_qty_usd"))
+            if qty is None or abs(qty) <= 1e-9:
+                continue
+            table_rows.append({
+                "pair": "USD/ZAR",
+                "side": "LONG" if qty > 0 else "SHORT",
+                "net": f"{_fmt(abs(qty), 2)} USD",
+                "wa": f"R{_fmt(raw.get('fx_wa_rate'), 5)}",
+                "cur": f"R{_fmt(raw.get('market_usd_zar') if raw.get('market_usd_zar') is not None else market.get('usd_zar'), 5)}",
+                "pnl": f"R{_fmt(raw.get('fx_pnl_zar'), 2)}",
+            })
+        elif pair in {"XAU/USD", "XAUUSD"}:
+            qty = _to_num(raw.get("gold_qty_oz"))
+            if qty is None or abs(qty) <= 1e-9:
+                continue
+            table_rows.append({
+                "pair": "XAU/USD",
+                "side": "LONG" if qty > 0 else "SHORT",
+                "net": f"{_fmt(abs(qty), 4)} oz",
+                "wa": f"${_fmt(raw.get('gold_wa_price'), 4)}/oz",
+                "cur": f"${_fmt(raw.get('market_xau_usd') if raw.get('market_xau_usd') is not None else market.get('xau_usd'), 4)}/oz",
+                "pnl": f"R{_fmt(raw.get('gold_pnl_zar'), 2)}",
+            })
+
+    open_cols = ["Pair", "Net Side", "Net Value", "Weighted Avg Rate", "Current Rate", "Current PnL (ZAR)"]
+    open_rows = [
+        {
+            "Pair": r.get("pair", "--"),
+            "Net Side": r.get("side", "--"),
+            "Net Value": r.get("net", "--"),
+            "Weighted Avg Rate": r.get("wa", "--"),
+            "Current Rate": r.get("cur", "--"),
+            "Current PnL (ZAR)": r.get("pnl", "--"),
+        }
+        for r in (table_rows if table_rows else [{"pair": "--", "side": "--", "net": "--", "wa": "--", "cur": "--", "pnl": "--"}])
+    ]
+    _data_tbl(open_cols, [0.13, 0.12, 0.16, 0.2, 0.18, 0.21], open_rows, right_cols=[2, 3, 4, 5], profit_col="Current PnL (ZAR)")
+
+    _sec_lbl(f"TradeMC Daily Buys and Sells ({today_key})")
+    tm_cols = ["Daily Buys (g)", "Daily Sells (g)", "Daily Trades Counted"]
+    tm_rows = [{
+        "Daily Buys (g)": _fmt(buy_g, 2),
+        "Daily Sells (g)": _fmt(sell_g, 2),
+        "Daily Trades Counted": _fmt(counted, 0),
+    }]
+    _data_tbl(tm_cols, [0.33, 0.33, 0.34], tm_rows, right_cols=[0, 1, 2])
+
+    _sec_lbl("Account Balances Recon Table")
+    recon_cols = ["Currency", "Opening Balance", "Net Transactions", "Expected Balance", "Actual Balance", "Delta"]
+    c_map = recon.get("currencies", {}) if isinstance(recon, dict) else {}
+    recon_rows: List[Dict[str, Any]] = []
+    for ccy, label, dp in [("USD", "USD (LC)", 2), ("XAU", "XAU (oz)", 4), ("ZAR", "ZAR", 2)]:
+        c = c_map.get(ccy, {}) if isinstance(c_map, dict) else {}
+        recon_rows.append({
+            "Currency": label,
+            "Opening Balance": _fmt(c.get("opening_balance"), dp),
+            "Net Transactions": _fmt(c.get("transaction_total"), dp),
+            "Expected Balance": _fmt(c.get("expected_balance"), dp),
+            "Actual Balance": _fmt(c.get("actual_balance"), dp),
+            "Delta": _fmt(c.get("delta"), dp),
+        })
+    _data_tbl(recon_cols, [0.13, 0.17, 0.18, 0.18, 0.18, 0.16], recon_rows, right_cols=[1, 2, 3, 4, 5], profit_col="Delta")
+
+    doc.build(story)
+    raw_pdf = buf.getvalue()
+    if isinstance(raw_pdf, (bytes, bytearray)):
+        return bytes(raw_pdf)
+    try:
+        return bytes(raw_pdf)
+    except Exception:
+        return None
+
+
+def _build_open_positions_reval_pdf_fpdf(args_dict: Dict[str, Any], req_headers: Any = None):
+    try:
+        from fpdf import FPDF
+    except Exception:
+        return None
+    import os as _os
+    from io import BytesIO
+
+    def _to_num(value: Any) -> Optional[float]:
         try:
-            return text.encode("latin-1", "replace").decode("latin-1")
+            n = float(value)
+            if math.isnan(n) or math.isinf(n):
+                return None
+            return n
         except Exception:
-            return text
+            return None
 
     def _fmt(value: Any, dp: int = 2) -> str:
         n = _to_num(value)
@@ -6190,25 +6603,7 @@ def build_open_positions_reval_pdf(args_dict: Dict[str, Any], req_headers: Any =
                     sell_g += w
             counted += 1
 
-    pdf = FPDF(orientation="L", unit="mm", format="A4")
-    pdf.set_auto_page_break(auto=True, margin=12)
-    pdf.add_page()
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 8, _txt("Open Positions Reval Report"), ln=1)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 6, _txt(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"), ln=1)
-    pdf.ln(2)
-
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 7, _txt("Open Unallocated Positions and Revaluated PnL"), ln=1)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 6, _txt(f"Open Pairs: {_fmt(summary.get('open_trades'), 0)}"), ln=1)
-    pdf.cell(0, 6, _txt(f"Current Gold ($/oz): {_fmt(market.get('xau_usd'), 4)}"), ln=1)
-    pdf.cell(0, 6, _txt(f"Current FX (USD/ZAR): {_fmt(market.get('usd_zar'), 5)}"), ln=1)
-    pdf.cell(0, 6, _txt(f"Total PnL (ZAR): {_fmt(summary.get('total_pnl_zar'), 2)}"), ln=1)
-    pdf.ln(1)
-
-    table_rows: List[Dict[str, Any]] = []
+    open_rows: List[List[str]] = []
     for raw in rows if isinstance(rows, list) else []:
         if not isinstance(raw, dict):
             continue
@@ -6217,81 +6612,168 @@ def build_open_positions_reval_pdf(args_dict: Dict[str, Any], req_headers: Any =
             qty = _to_num(raw.get("fx_qty_usd"))
             if qty is None or abs(qty) <= 1e-9:
                 continue
-            table_rows.append({
-                "pair": "USD/ZAR",
-                "side": "LONG" if qty > 0 else "SHORT",
-                "net": f"{_fmt(abs(qty), 2)} USD",
-                "wa": f"R{_fmt(raw.get('fx_wa_rate'), 5)}",
-                "cur": f"R{_fmt(raw.get('market_usd_zar') if raw.get('market_usd_zar') is not None else market.get('usd_zar'), 5)}",
-                "pnl": f"R{_fmt(raw.get('fx_pnl_zar'), 2)}",
-            })
+            open_rows.append([
+                "USD/ZAR",
+                "LONG" if qty > 0 else "SHORT",
+                f"{_fmt(abs(qty), 2)} USD",
+                f"R{_fmt(raw.get('fx_wa_rate'), 5)}",
+                f"R{_fmt(raw.get('market_usd_zar') if raw.get('market_usd_zar') is not None else market.get('usd_zar'), 5)}",
+                f"R{_fmt(raw.get('fx_pnl_zar'), 2)}",
+            ])
         elif pair in {"XAU/USD", "XAUUSD"}:
             qty = _to_num(raw.get("gold_qty_oz"))
             if qty is None or abs(qty) <= 1e-9:
                 continue
-            table_rows.append({
-                "pair": "XAU/USD",
-                "side": "LONG" if qty > 0 else "SHORT",
-                "net": f"{_fmt(abs(qty), 4)} oz",
-                "wa": f"${_fmt(raw.get('gold_wa_price'), 4)}/oz",
-                "cur": f"${_fmt(raw.get('market_xau_usd') if raw.get('market_xau_usd') is not None else market.get('xau_usd'), 4)}/oz",
-                "pnl": f"R{_fmt(raw.get('gold_pnl_zar'), 2)}",
-            })
+            open_rows.append([
+                "XAU/USD",
+                "LONG" if qty > 0 else "SHORT",
+                f"{_fmt(abs(qty), 4)} oz",
+                f"${_fmt(raw.get('gold_wa_price'), 4)}/oz",
+                f"${_fmt(raw.get('market_xau_usd') if raw.get('market_xau_usd') is not None else market.get('xau_usd'), 4)}/oz",
+                f"R{_fmt(raw.get('gold_pnl_zar'), 2)}",
+            ])
+    if not open_rows:
+        open_rows = [["--", "--", "--", "--", "--", "--"]]
 
-    headers = ["Pair", "Net Side", "Net Value", "Weighted Avg Rate", "Current Rate", "Current PnL (ZAR)"]
-    widths = [34, 30, 44, 52, 46, 52]
-    pdf.set_font("Helvetica", "B", 9)
-    for i, h in enumerate(headers):
-        pdf.cell(widths[i], 6, _txt(h), border=1)
-    pdf.ln()
-    pdf.set_font("Helvetica", "", 9)
-    for row in (table_rows or [{"pair": "--", "side": "--", "net": "--", "wa": "--", "cur": "--", "pnl": "--"}]):
-        pdf.cell(widths[0], 6, _txt(row.get("pair")), border=1)
-        pdf.cell(widths[1], 6, _txt(row.get("side")), border=1)
-        pdf.cell(widths[2], 6, _txt(row.get("net")), border=1, align="R")
-        pdf.cell(widths[3], 6, _txt(row.get("wa")), border=1, align="R")
-        pdf.cell(widths[4], 6, _txt(row.get("cur")), border=1, align="R")
-        pdf.cell(widths[5], 6, _txt(row.get("pnl")), border=1, align="R")
-        pdf.ln()
-    pdf.ln(3)
-
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 7, _txt(f"TradeMC Daily Buys and Sells ({today_key})"), ln=1)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 6, _txt(f"Daily Buys: {_fmt(buy_g, 2)} g"), ln=1)
-    pdf.cell(0, 6, _txt(f"Daily Sells: {_fmt(sell_g, 2)} g"), ln=1)
-    pdf.cell(0, 6, _txt(f"Daily Trades Counted: {_fmt(counted, 0)}"), ln=1)
-    pdf.ln(3)
-
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 7, _txt("Account Balances Recon Table"), ln=1)
-    pdf.set_font("Helvetica", "B", 9)
-    r_headers = ["Currency", "Opening Balance", "Net Transactions", "Expected Balance", "Actual Balance", "Delta"]
-    r_widths = [32, 44, 46, 46, 46, 42]
-    for i, h in enumerate(r_headers):
-        pdf.cell(r_widths[i], 6, _txt(h), border=1)
-    pdf.ln()
-    pdf.set_font("Helvetica", "", 9)
+    recon_rows: List[List[str]] = []
     c_map = recon.get("currencies", {}) if isinstance(recon, dict) else {}
     for ccy, label, dp in [("USD", "USD (LC)", 2), ("XAU", "XAU (oz)", 4), ("ZAR", "ZAR", 2)]:
         c = c_map.get(ccy, {}) if isinstance(c_map, dict) else {}
-        pdf.cell(r_widths[0], 6, _txt(label), border=1)
-        pdf.cell(r_widths[1], 6, _txt(_fmt(c.get("opening_balance"), dp)), border=1, align="R")
-        pdf.cell(r_widths[2], 6, _txt(_fmt(c.get("transaction_total"), dp)), border=1, align="R")
-        pdf.cell(r_widths[3], 6, _txt(_fmt(c.get("expected_balance"), dp)), border=1, align="R")
-        pdf.cell(r_widths[4], 6, _txt(_fmt(c.get("actual_balance"), dp)), border=1, align="R")
-        pdf.cell(r_widths[5], 6, _txt(_fmt(c.get("delta"), dp)), border=1, align="R")
-        pdf.ln()
+        recon_rows.append([
+            label,
+            _fmt(c.get("opening_balance"), dp),
+            _fmt(c.get("transaction_total"), dp),
+            _fmt(c.get("expected_balance"), dp),
+            _fmt(c.get("actual_balance"), dp),
+            _fmt(c.get("delta"), dp),
+        ])
 
-    raw_pdf = pdf.output(dest="S")
-    if isinstance(raw_pdf, (bytes, bytearray)):
-        return bytes(raw_pdf)
-    if isinstance(raw_pdf, str):
-        return raw_pdf.encode("latin-1")
-    try:
-        return bytes(raw_pdf)
-    except Exception:
-        return None
+    pdf = FPDF("L", "mm", "A4")
+    pdf.set_auto_page_break(True, margin=10)
+    pdf.add_page()
+
+    # MetCon palette and numeric colors.
+    C_CHARCOAL = (28, 28, 28)
+    C_COPPER = (176, 120, 64)
+    C_COPPER_LT = (251, 245, 236)
+    C_HDR = (42, 42, 42)
+    C_STRIPE = (246, 246, 246)
+    C_GREEN = (0, 166, 81)
+    C_RED = (224, 49, 49)
+
+    page_w = 297.0
+    lm = 10.0
+    usable_w = page_w - (lm * 2)
+
+    logo_path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "MetCon Logo.png")
+    if _os.path.isfile(logo_path):
+        try:
+            pdf.image(logo_path, x=lm, y=8, w=52, h=13)
+        except Exception:
+            pass
+
+    pdf.set_xy(130, 8)
+    pdf.set_text_color(*C_COPPER)
+    pdf.set_font("Arial", "B", 9)
+    pdf.cell(157, 5, "METAL CONCENTRATORS SA", 0, 2, "R")
+    pdf.set_text_color(*C_CHARCOAL)
+    pdf.set_font("Arial", "B", 18)
+    pdf.cell(157, 8, "OPEN POSITIONS REVAL REPORT", 0, 2, "R")
+    pdf.set_text_color(120, 120, 120)
+    pdf.set_font("Arial", "", 8)
+    pdf.cell(157, 5, f"Generated {datetime.now().strftime('%d %b %Y  %H:%M')}", 0, 1, "R")
+    pdf.set_draw_color(*C_COPPER)
+    pdf.set_line_width(0.8)
+    pdf.line(lm, 24, lm + usable_w, 24)
+    pdf.ln(5)
+
+    def _section_title(title: str):
+        y = pdf.get_y()
+        pdf.set_fill_color(*C_COPPER)
+        pdf.rect(lm, y, 2, 6, style="F")
+        pdf.set_fill_color(*C_COPPER_LT)
+        pdf.rect(lm + 2, y, usable_w - 2, 6, style="F")
+        pdf.set_xy(lm + 4, y + 1.2)
+        pdf.set_text_color(*C_COPPER)
+        pdf.set_font("Arial", "B", 9)
+        pdf.cell(usable_w - 6, 3.6, title.upper(), 0, 1, "L")
+        pdf.ln(1.5)
+
+    def _table(headers: List[str], rows_data: List[List[str]], col_widths: List[float], right_cols: Optional[List[int]] = None,
+               color_col: Optional[int] = None):
+        right_cols = right_cols or []
+        widths = [usable_w * w for w in col_widths]
+        pdf.set_fill_color(*C_HDR)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Arial", "B", 8)
+        for i, h in enumerate(headers):
+            align = "R" if i in right_cols else "C"
+            pdf.cell(widths[i], 7, h, 0, 0, align, True)
+        pdf.ln()
+        alt = False
+        pdf.set_font("Arial", "", 8)
+        for row in rows_data:
+            pdf.set_fill_color(*(C_STRIPE if alt else (255, 255, 255)))
+            for i, v in enumerate(row):
+                align = "R" if i in right_cols else "L"
+                text = str(v or "--")
+                if color_col is not None and i == color_col:
+                    n = _to_num(str(text).replace("R", "").replace(",", "").strip())
+                    if n is not None:
+                        pdf.set_text_color(*(C_GREEN if n >= 0 else C_RED))
+                    else:
+                        pdf.set_text_color(*C_CHARCOAL)
+                else:
+                    pdf.set_text_color(*C_CHARCOAL)
+                pdf.cell(widths[i], 6.4, text, 1, 0, align, True)
+            pdf.ln()
+            alt = not alt
+        pdf.ln(2.5)
+
+    _section_title("Open Unallocated Positions and Revaluated PnL")
+    _table(
+        ["Open Pairs", "Current Gold ($/oz)", "Current FX (USD/ZAR)", "Total PnL (ZAR)"],
+        [[
+            _fmt(summary.get("open_trades"), 0),
+            _fmt(market.get("xau_usd"), 4),
+            _fmt(market.get("usd_zar"), 5),
+            _fmt(summary.get("total_pnl_zar"), 2),
+        ]],
+        [0.19, 0.27, 0.27, 0.27],
+        right_cols=[0, 1, 2, 3],
+        color_col=3,
+    )
+    _table(
+        ["Pair", "Net Side", "Net Value", "Weighted Avg Rate", "Current Rate", "Current PnL (ZAR)"],
+        open_rows,
+        [0.13, 0.12, 0.16, 0.20, 0.18, 0.21],
+        right_cols=[2, 3, 4, 5],
+        color_col=5,
+    )
+
+    _section_title(f"TradeMC Daily Buys and Sells ({today_key})")
+    _table(
+        ["Daily Buys (g)", "Daily Sells (g)", "Daily Trades Counted"],
+        [[_fmt(buy_g, 2), _fmt(sell_g, 2), _fmt(counted, 0)]],
+        [0.33, 0.33, 0.34],
+        right_cols=[0, 1, 2],
+    )
+
+    _section_title("Account Balances Recon Table")
+    _table(
+        ["Currency", "Opening Balance", "Net Transactions", "Expected Balance", "Actual Balance", "Delta"],
+        recon_rows,
+        [0.13, 0.17, 0.18, 0.18, 0.18, 0.16],
+        right_cols=[1, 2, 3, 4, 5],
+        color_col=5,
+    )
+
+    out = pdf.output(dest="S")
+    if isinstance(out, str):
+        return out.encode("latin-1", errors="ignore")
+    if isinstance(out, (bytes, bytearray)):
+        return bytes(out)
+    return None
 
 
 # FLASK APP
@@ -9406,6 +9888,8 @@ def get_ticket_pdf(trade_num):
             frames["summary"],
         )
     except Exception as exc:
+        import traceback as _tb
+        _tb.print_exc()
         return jsonify({"error": f"PDF generation failed: {exc}"}), 500
     if not pdf_bytes:
         return jsonify({"error": "PDF export requires the `fpdf` package."}), 400
