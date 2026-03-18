@@ -4,7 +4,9 @@ import sqlite3
 import time
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DB_PATH = os.path.join(PROJECT_ROOT, "fx_trading_ledger.db")
+SHARED_DB_ROOT = r"T:\Trading Platform - db"
+DB_PATH = os.path.join(SHARED_DB_ROOT, "fx_trading_ledger.db")
+os.environ["LEDGER_DB_PATH"] = DB_PATH
 
 
 def get_db_connection():

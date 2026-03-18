@@ -5,8 +5,9 @@ function resolveApiBase(): string {
     if (typeof window !== 'undefined') {
         const { protocol, hostname, port } = window.location;
         // In local Vite dev, call Flask directly to avoid proxy drift/misconfig.
-        if (port === '5173') {
-            return `${protocol}//${hostname}:5001/api`;
+        const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1';
+        if (isLocalHost && /^517\d+$/.test(String(port))) {
+            return `${protocol}//${hostname}:5002/api`;
         }
     }
 

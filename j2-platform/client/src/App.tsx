@@ -1,5 +1,6 @@
 ﻿import { Fragment, useState, useEffect, useCallback, useMemo, useRef, Component, type ErrorInfo, type FormEvent, type ReactNode } from 'react'
 import { api, type AppUser, type AdminUser } from './api/client'
+import { ResponsiveContainer, ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, Scatter } from 'recharts'
 
 // ===================================================================
 // SHARED HELPERS
@@ -1277,7 +1278,7 @@ function OpenPositionsReval() {
                 </div>
             </div>
 
-            <div className="stat-grid">
+            <div className="stat-grid dashboard-stat-grid">
                 <div className="stat-card">
                     <div className="stat-label">Open Pairs</div>
                     <div className="stat-value">{fmt(summary.open_trades, 0)}</div>
@@ -1674,19 +1675,8 @@ function ForwardExposure() {
         setExpandedValueDates(prev => ({ ...prev, [valueDate]: !prev[valueDate] }));
     };
 
-    const computeDaysFromSpot = (calendarRow: Row, detailRows: Row[]): number | null => {
-        const direct = toNullableNumber(calendarRow.days_from_spot);
-        if (direct !== null) return direct;
-        const addBusinessDays = (date: Date, days: number): Date => {
-            const d = new Date(date.getTime());
-            let remaining = Math.max(0, days);
-            while (remaining > 0) {
-                d.setDate(d.getDate() + 1);
-                const dow = d.getDay();
-                if (dow !== 0 && dow !== 6) remaining -= 1;
-            }
-            return d;
-        };
+    const computeDaysToMaturity = (calendarRow: Row, detailRows: Row[]): number | null => {
+        // Days to maturity = business days from TODAY to value_date
         const businessDaysBetween = (start: Date, end: Date): number => {
             const s = new Date(start.getFullYear(), start.getMonth(), start.getDate());
             const e = new Date(end.getFullYear(), end.getMonth(), end.getDate());
@@ -1702,16 +1692,19 @@ function ForwardExposure() {
             }
             return forward ? count : -count;
         };
-        // Fallback for stale payloads: derive from first valid detail row using business days.
-        for (const d of detailRows) {
-            const td = asText(d.trade_date, '');
-            const vd = asText(d.value_date, '');
-            if (!td || !vd) continue;
-            const trade = new Date(`${td}T00:00:00`);
+        const today = new Date();
+        // Try value_date from the calendar row first
+        const vd = asText(calendarRow.value_date, '');
+        if (vd) {
             const value = new Date(`${vd}T00:00:00`);
-            if (Number.isNaN(trade.getTime()) || Number.isNaN(value.getTime())) continue;
-            const spot = addBusinessDays(trade, 2);
-            return businessDaysBetween(spot, value);
+            if (!Number.isNaN(value.getTime())) return businessDaysBetween(today, value);
+        }
+        // Fallback: use first valid detail row's value_date
+        for (const d of detailRows) {
+            const dvd = asText(d.value_date, '');
+            if (!dvd) continue;
+            const value = new Date(`${dvd}T00:00:00`);
+            if (!Number.isNaN(value.getTime())) return businessDaysBetween(today, value);
         }
         return null;
     };
@@ -1767,7 +1760,7 @@ function ForwardExposure() {
                         <thead>
                             <tr>
                                 <th>Value Date</th>
-                                <th>Days From Spot</th>
+                                <th>Days to Maturity</th>
                                 <th>Trades</th>
                                 <th>Rows</th>
                                 <th>USD</th>
@@ -1788,12 +1781,12 @@ function ForwardExposure() {
                                 const valueDate = asText(row.value_date, '');
                                 const detailRows = pmxRowsByValueDate[valueDate] || [];
                                 const expanded = valueDate ? Boolean(expandedValueDates[valueDate]) : false;
-                                const daysFromSpot = computeDaysFromSpot(row, detailRows);
+                                const daysToMaturity = computeDaysToMaturity(row, detailRows);
                                 return (
                                     <Fragment key={`${valueDate || 'row'}-${idx}`}>
                                         <tr>
                                             <td>{fmtDate(valueDate)}</td>
-                                            <td className="num">{daysFromSpot !== null ? fmt(daysFromSpot, 0) : '--'}</td>
+                                            <td className="num">{daysToMaturity !== null ? fmt(daysToMaturity, 0) : '--'}</td>
                                             <td className="num">{fmt(row.trade_numbers, 0)}</td>
                                             <td className="num">{fmt(row.trade_count, 0)}</td>
                                             <td className={numClass(row.usd_net)}>{fmt(row.usd_net, 2)}</td>
@@ -1823,7 +1816,7 @@ function ForwardExposure() {
                                                             { key: 'trade_num', label: 'Trade #' },
                                                             { key: 'trade_date', label: 'Trade Date' },
                                                             { key: 'value_date', label: 'Value Date' },
-                                                            { key: 'days_from_spot', label: 'Days From Spot' },
+                                                            { key: 'days_from_spot', label: 'Days to Maturity' },
                                                             { key: 'symbol', label: 'Symbol' },
                                                             { key: 'side', label: 'Side' },
                                                             { key: 'quantity', label: 'Quantity' },
@@ -3932,6 +3925,537 @@ function TradingTicket() {
 }
 
 // ===================================================================
+// TAB: TRADE BREAKDOWN
+// ===================================================================
+function TradeBreakdownTab() {
+    const [tradeNum, setTradeNum] = usePersistentState('filters:trade_breakdown:trade_num', '');
+    const [ticket, setTicket] = useState<Record<string, unknown> | null>(null);
+    const [loading, setLoading] = useState(false);
+    const [downloadingPdf, setDownloadingPdf] = useState(false);
+    const [downloadingCsv, setDownloadingCsv] = useState(false);
+    const { show, Toast } = useToast();
+
+    const search = async () => {
+        if (!tradeNum.trim()) return;
+        setLoading(true);
+        try {
+            const res = await api.getTicket(tradeNum.trim());
+            setTicket(res);
+        } catch (e: unknown) {
+            show(String(e), 'error');
+            setTicket(null);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const tmData = (ticket?.trademc as Row[]) || [];
+    const stData = (ticket?.stonex as Row[]) || [];
+    const summaryData = (ticket?.summary as Row[]) || [];
+    const summaryRow = summaryData[0] || {};
+    const ticketTradeNum = ticket?.trade_num ? String(ticket.trade_num) : '';
+
+    const asPair = (value: unknown): string => {
+        const text = String(value ?? '').toUpperCase().replace(/\s+/g, '').replace('-', '');
+        if (!text) return '';
+        if (text.includes('/')) return text;
+        if (text.length === 6) return `${text.slice(0, 3)}/${text.slice(3)}`;
+        return text;
+    };
+    const n = (value: unknown): number | null => toNullableNumber(value);
+    const money = (value: number | null, prefix: string, decimals = 2): string =>
+        value === null ? '--' : `${prefix}${fmt(value, decimals)}`;
+    const grams = (value: number | null): string => value === null ? '--' : `${fmt(value, 2)} g`;
+    const ounces = (value: number | null, decimals = 4): string => value === null ? '--' : `${fmt(value, decimals)} oz`;
+    const pct = (value: number | null, decimals = 2): string => value === null ? '--' : `${fmt(value, decimals)}%`;
+    const numText = (value: number | null, decimals = 2): string => value === null ? '--' : fmt(value, decimals);
+
+    const tmBookings = useMemo(() => {
+        return tmData.map((row) => {
+            const weightG = n(row['Weight (g)']) ?? 0;
+            const weightOz = n(row['Weight (oz)']) ?? (weightG / 31.1035);
+            const bookedPrice = n(row['$/oz Booked']);
+            const fxRate = n(row['FX Rate']);
+            const usdValueRaw = n(row['USD Value']);
+            const usdValue = usdValueRaw ?? ((bookedPrice !== null) ? weightOz * bookedPrice : null);
+            const zarGrossRaw = n(row['ZAR Value']);
+            const zarGross = zarGrossRaw ?? ((usdValue !== null && fxRate !== null) ? usdValue * fxRate : null);
+            const refiningRate = n(row['company_refining_rate']) ?? 0;
+            const refiningDeduction = zarGross !== null ? zarGross * (refiningRate / 100) : null;
+            const zarNetRaw = n(row['zar_value_less_refining']);
+            const zarNet = zarNetRaw ?? (zarGross !== null ? zarGross * (1 - (refiningRate / 100)) : null);
+            return {
+                company: asText(row.Company || row.company_name || 'Unknown Company'),
+                weightG,
+                weightOz,
+                bookedPrice,
+                fxRate,
+                usdValue,
+                zarGross,
+                refiningRate,
+                refiningDeduction,
+                zarNet,
+            };
+        });
+    }, [tmData]);
+
+    const tmTotals = useMemo(() => {
+        const totals = {
+            weightG: 0,
+            weightOz: 0,
+            usdValue: 0,
+            zarGross: 0,
+            zarNet: 0,
+            count: tmBookings.length,
+        };
+        for (const booking of tmBookings) {
+            totals.weightG += booking.weightG;
+            totals.weightOz += booking.weightOz;
+            totals.usdValue += booking.usdValue ?? 0;
+            totals.zarGross += booking.zarGross ?? 0;
+            totals.zarNet += booking.zarNet ?? 0;
+        }
+        return totals;
+    }, [tmBookings]);
+
+    const pmxTrades = useMemo(() => {
+        return stData.map((row) => {
+            const symbol = asPair(row.Symbol);
+            const side = String(row.Side ?? '').toUpperCase().trim();
+            const qty = Math.abs(n(row.Quantity) ?? 0);
+            const price = n(row.Price);
+            const notional = (price !== null) ? qty * price : null;
+            return {
+                tradeDate: asText(row['Trade Date']),
+                valueDate: asText(row['Value Date']),
+                symbol,
+                side,
+                qty,
+                price,
+                notional,
+            };
+        }).filter(row => row.qty > 0);
+    }, [stData]);
+
+    const xauTrades = useMemo(
+        () => pmxTrades.filter(row => row.symbol === 'XAU/USD' && row.price !== null),
+        [pmxTrades]
+    );
+    const fxTrades = useMemo(
+        () => pmxTrades.filter(row => row.symbol === 'USD/ZAR' && row.price !== null),
+        [pmxTrades]
+    );
+
+    const goldWaCalc = useMemo(() => {
+        const rows = xauTrades.map((trade) => ({
+            ...trade,
+            qty: Math.abs(trade.qty),
+            notional: trade.notional ?? ((trade.price !== null) ? Math.abs(trade.qty) * trade.price : null),
+        }));
+        const totalQty = rows.reduce((sum, row) => sum + row.qty, 0);
+        const totalNotional = rows.reduce((sum, row) => sum + (row.notional ?? 0), 0);
+        const value = totalQty > 1e-9 ? (totalNotional / totalQty) : null;
+        return { rows, totalQty, totalNotional, value };
+    }, [xauTrades]);
+
+    const fxWaCalc = useMemo(() => {
+        const rows = fxTrades.map((trade) => ({
+            ...trade,
+            qty: Math.abs(trade.qty),
+            notional: trade.notional ?? ((trade.price !== null) ? Math.abs(trade.qty) * trade.price : null),
+        }));
+        const totalQty = rows.reduce((sum, row) => sum + row.qty, 0);
+        const totalNotional = rows.reduce((sum, row) => sum + (row.notional ?? 0), 0);
+        const value = totalQty > 1e-9 ? (totalNotional / totalQty) : null;
+        return { rows, totalQty, totalNotional, value };
+    }, [fxTrades]);
+
+    const goldWa = goldWaCalc.value;
+    const fxWa = fxWaCalc.value;
+
+    const spotZarPerG = useMemo(() => {
+        if (goldWa === null || fxWa === null) return null;
+        return (goldWa * fxWa) / 31.1035;
+    }, [goldWa, fxWa]);
+
+    const xauCashFlowRows = useMemo(() => {
+        return xauTrades.map((trade) => {
+            const signed = trade.notional === null
+                ? null
+                : (trade.side === 'SELL' ? trade.notional : trade.side === 'BUY' ? -trade.notional : null);
+            return { ...trade, signed };
+        });
+    }, [xauTrades]);
+
+    const netStoneXUsdFlow = useMemo(
+        () => xauCashFlowRows.reduce((sum, row) => sum + (row.signed ?? 0), 0),
+        [xauCashFlowRows]
+    );
+
+    const summaryMetrics = useMemo(() => {
+        const sellSideUsd = n(summaryRow['Sell Side (USD)']) ?? Math.abs(netStoneXUsdFlow);
+        const buySideUsd = n(summaryRow['Buy Side (USD)']) ?? Math.abs(tmTotals.usdValue);
+        const profitUsd = n(summaryRow['Profit (USD)']) ?? ((sellSideUsd !== null && buySideUsd !== null) ? sellSideUsd - buySideUsd : null);
+
+        const sellSideZar = n(summaryRow['Sell Side (ZAR)']) ?? n(summaryRow['StoneX ZAR Flow']);
+        const buySideZar = n(summaryRow['Buy Side (ZAR)']) ?? Math.abs(tmTotals.zarNet);
+        const profitZar = n(summaryRow['Profit (ZAR)']) ?? ((sellSideZar !== null && buySideZar !== null) ? sellSideZar - buySideZar : null);
+        const profitMargin = n(summaryRow['Profit % (ZAR Spot Cost)'])
+            ?? ((profitZar !== null && buySideZar !== null && Math.abs(buySideZar) > 1e-9) ? (profitZar / Math.abs(buySideZar)) * 100 : null);
+
+        const controlG = n(summaryRow['Control Account (g)']);
+        const controlOz = n(summaryRow['Control Account (oz)']) ?? (controlG !== null ? controlG / 31.1035 : null);
+        const controlZar = n(summaryRow['Control Account (ZAR)']);
+
+        const totalTradedG = n(summaryRow['Total Traded (g)']) ?? (Math.abs(tmTotals.weightG) > 1e-9 ? Math.abs(tmTotals.weightG) : null);
+        const totalTradedOz = n(summaryRow['Total Traded (oz)']) ?? (totalTradedG !== null ? totalTradedG / 31.1035 : null);
+        const stonexZarFlow = n(summaryRow['StoneX ZAR Flow']);
+
+        return {
+            sellSideUsd,
+            buySideUsd,
+            profitUsd,
+            sellSideZar,
+            buySideZar,
+            profitZar,
+            controlG,
+            controlOz,
+            controlZar,
+            totalTradedG,
+            totalTradedOz,
+            stonexZarFlow,
+            profitMargin,
+        };
+    }, [summaryRow, netStoneXUsdFlow, tmTotals]);
+
+    const downloadPdf = async () => {
+        if (!ticketTradeNum) return;
+        setDownloadingPdf(true);
+        try {
+            const res = await api.getTicketPdf(ticketTradeNum);
+            if (!res.ok) {
+                const ct = res.headers.get('content-type') || '';
+                if (ct.includes('application/json')) {
+                    const err = await res.json().catch(() => ({}));
+                    show(String((err as { error?: string }).error || 'Failed to generate PDF'), 'error');
+                } else {
+                    show(`Failed to generate PDF (HTTP ${res.status})`, 'error');
+                }
+                return;
+            }
+            const blob = await res.blob();
+            triggerBlobDownload(blob, `trade_breakdown_${ticketTradeNum}.pdf`);
+        } catch (e: unknown) {
+            show(String(e), 'error');
+        } finally {
+            setDownloadingPdf(false);
+        }
+    };
+
+    const downloadAuditCsv = async () => {
+        if (!ticketTradeNum) return;
+        setDownloadingCsv(true);
+        try {
+            const rows: string[][] = [];
+            rows.push(['Section', 'Item', 'Formula', 'Value']);
+
+            rows.push(['Profit Summary', 'Sell Side (StoneX) USD', '', money(summaryMetrics.sellSideUsd, '$')]);
+            rows.push(['Profit Summary', 'Buy Side (TradeMC) USD', '', money(summaryMetrics.buySideUsd, '$')]);
+            rows.push(['Profit Summary', 'Profit (USD)', '', money(summaryMetrics.profitUsd, '$')]);
+            rows.push(['Profit Summary', 'Sell Side (StoneX) ZAR', '', money(summaryMetrics.sellSideZar, 'R ')]);
+            rows.push(['Profit Summary', 'Buy Side (TradeMC) ZAR', '', money(summaryMetrics.buySideZar, 'R ')]);
+            rows.push(['Profit Summary', 'Profit (ZAR)', '', money(summaryMetrics.profitZar, 'R ')]);
+            rows.push(['Profit Summary', 'Control Account (g)', '', grams(summaryMetrics.controlG)]);
+            rows.push(['Profit Summary', 'Control Account (oz)', '', ounces(summaryMetrics.controlOz)]);
+            rows.push(['Profit Summary', 'Control Account (ZAR)', '', money(summaryMetrics.controlZar, 'R ')]);
+            rows.push(['Profit Summary', 'Total Traded (g)', '', grams(summaryMetrics.totalTradedG)]);
+            rows.push(['Profit Summary', 'Total Traded (oz)', '', ounces(summaryMetrics.totalTradedOz)]);
+            rows.push(['Profit Summary', 'StoneX ZAR Flow', '', money(summaryMetrics.stonexZarFlow, 'R ')]);
+            rows.push(['Profit Summary', 'Profit Margin', '', pct(summaryMetrics.profitMargin)]);
+
+            rows.push(['Input Data Summary', 'TradeMC bookings (buy side)', '', String(tmBookings.length)]);
+            rows.push(['Input Data Summary', 'StoneX/PMX trades (sell side)', '', String(pmxTrades.length)]);
+            rows.push(['Input Data Summary', 'XAU/USD trades', '', String(xauTrades.length)]);
+            rows.push(['Input Data Summary', 'USD/ZAR trades', '', String(fxTrades.length)]);
+
+            tmBookings.forEach((booking, idx) => {
+                const pfx = `TradeMC Booking ${idx + 1} (${booking.company})`;
+                rows.push([pfx, 'Weight in troy ounces', `${fmt(booking.weightG, 2)} / 31.1035`, ounces(booking.weightOz, 6)]);
+                rows.push([pfx, 'USD value', `${ounces(booking.weightOz, 6)} x ${money(booking.bookedPrice, '$', 2)}/oz`, money(booking.usdValue, '$')]);
+                rows.push([pfx, 'ZAR gross value', `${money(booking.usdValue, '$')} x ${numText(booking.fxRate, 4)}`, money(booking.zarGross, 'R ')]);
+                rows.push([pfx, 'Refining deduction', `${money(booking.zarGross, 'R ')} x ${numText(booking.refiningRate, 2)}%`, money(booking.refiningDeduction, 'R ')]);
+                rows.push([pfx, 'ZAR net of refining', `${money(booking.zarGross, 'R ')} x (1 - ${numText(booking.refiningRate, 2)}%)`, money(booking.zarNet, 'R ')]);
+            });
+
+            xauTrades.forEach((trade, idx) => {
+                rows.push(['StoneX Gold Trades', `Trade ${idx + 1} ${trade.side}`, `${ounces(trade.qty, 4)} x ${money(trade.price, '$', 4)}`, money(trade.notional, '$')]);
+            });
+            fxTrades.forEach((trade, idx) => {
+                rows.push(['StoneX FX Trades', `Trade ${idx + 1} ${trade.side}`, `${money(trade.qty, '$', 2)} x ${money(trade.price, 'R ', 4)}`, money(trade.notional, 'R ')]);
+            });
+
+            rows.push(['Weighted Averages', 'Gold WA ($/oz)', `${money(goldWaCalc.totalNotional, '$')} / ${ounces(goldWaCalc.totalQty, 4)}`, money(goldWa, '$', 4)]);
+            rows.push(['Weighted Averages', 'FX WA (ZAR/USD)', `${money(fxWaCalc.totalNotional, 'R ')} / ${money(fxWaCalc.totalQty, '$')}`, money(fxWa, 'R ', 4)]);
+            rows.push(['Spot Derivation', 'Spot ZAR/g', `(${money(goldWa, '$', 4)} x ${money(fxWa, 'R ', 4)}) / 31.1035`, money(spotZarPerG, 'R ', 4)]);
+
+            rows.push(['Profit/Loss', 'Profit (USD)', `${money(summaryMetrics.sellSideUsd, '$')} - ${money(summaryMetrics.buySideUsd, '$')}`, money(summaryMetrics.profitUsd, '$')]);
+            rows.push(['Profit/Loss', 'Profit (ZAR)', `${money(summaryMetrics.sellSideZar, 'R ')} - ${money(summaryMetrics.buySideZar, 'R ')}`, money(summaryMetrics.profitZar, 'R ')]);
+            rows.push(['Profit/Loss', 'Profit Margin', `(${money(summaryMetrics.profitZar, 'R ')} / ${money(summaryMetrics.buySideZar, 'R ')}) x 100`, pct(summaryMetrics.profitMargin)]);
+
+            const csvEscape = (text: string) => `"${String(text ?? '').replace(/"/g, '""')}"`;
+            const csv = rows.map(row => row.map(csvEscape).join(',')).join('\r\n');
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            triggerBlobDownload(blob, `ticket_audit_trail_${ticketTradeNum}.csv`);
+        } catch (e: unknown) {
+            show(String(e), 'error');
+        } finally {
+            setDownloadingCsv(false);
+        }
+    };
+
+    return (
+        <div>
+            <div className="page-header"><h2>Trade Breakdown</h2></div>
+
+            <div className="filter-bar">
+                <div className="filter-group">
+                    <label>Trade #</label>
+                    <input
+                        placeholder="e.g. 9885"
+                        value={tradeNum}
+                        onChange={e => setTradeNum(e.target.value)}
+                        onKeyDown={e => e.key === 'Enter' && search()}
+                    />
+                </div>
+                <button className="btn btn-primary btn-sm" onClick={search} style={{ alignSelf: 'flex-end' }}>
+                    Load Trade Breakdown
+                </button>
+            </div>
+
+            {loading && <Loading />}
+
+            {ticket && (
+                <>
+                    <div className="section">
+                        <div className="section-title">Trading Ticket</div>
+                        <div className="table-container">
+                            <DataTable
+                                columns={[
+                                    { key: 'Company', label: 'Company' },
+                                    { key: 'Weight (g)', label: 'Weight (g)' },
+                                    { key: 'Weight (oz)', label: 'Weight (oz)' },
+                                    { key: '$/oz Booked', label: '$/oz Booked' },
+                                    { key: 'FX Rate', label: 'FX Rate' },
+                                    { key: 'USD Value', label: 'USD Value' },
+                                    { key: 'ZAR Value', label: 'ZAR Value' },
+                                ]}
+                                data={tmData}
+                                numericCols={['Weight (g)', 'Weight (oz)', '$/oz Booked', 'FX Rate', 'USD Value', 'ZAR Value']}
+                                formatters={{
+                                    'Weight (g)': { decimals: 2 },
+                                    'Weight (oz)': { decimals: 6 },
+                                    '$/oz Booked': { decimals: 2 },
+                                    'FX Rate': { decimals: 4 },
+                                    'USD Value': { decimals: 2 },
+                                    'ZAR Value': { decimals: 2 },
+                                }}
+                            />
+                        </div>
+                    </div>
+
+                    <div className="section mt-3">
+                        <div className="section-title">PMX Trades</div>
+                        <DataTable
+                            columns={[
+                                { key: 'Trade Date', label: 'Trade Date' },
+                                { key: 'Value Date', label: 'Value Date' },
+                                { key: 'Symbol', label: 'Symbol' },
+                                { key: 'Side', label: 'Side' },
+                                { key: 'Narration', label: 'Narration' },
+                                { key: 'Quantity', label: 'Quantity' },
+                                { key: 'Price', label: 'Price' },
+                            ]}
+                            data={stData}
+                            numericCols={['Quantity', 'Price']}
+                            dateCols={['Trade Date', 'Value Date']}
+                            formatters={{ Quantity: { decimals: 4 }, Price: { decimals: 4 } }}
+                        />
+                    </div>
+
+                    <div className="section mt-3">
+                        <div className="section-title">Calculation Audit Trail</div>
+                        <div className="audit-toolbar">
+                            <div className="audit-toolbar-title">Trade Breakdown Exports</div>
+                            <div className="audit-toolbar-actions">
+                                <button className="btn btn-sm" onClick={downloadAuditCsv} disabled={downloadingCsv}>
+                                    {downloadingCsv ? 'Building CSV...' : 'CSV'}
+                                </button>
+                                <button className="btn btn-sm btn-primary" onClick={downloadPdf} disabled={downloadingPdf}>
+                                    {downloadingPdf ? 'Generating PDF...' : 'PDF'}
+                                </button>
+                            </div>
+                        </div>
+                        <div className="audit-blurb">
+                            Step-by-step calculation trace for Trade {ticketTradeNum || '--'}. Each section shows source values, formulas, and outputs for reconciliation.
+                        </div>
+                        <div className="audit-legend">
+                            <strong>Format:</strong> Input x Rate = Result. Monetary values are shown as `$` (USD) and `R` (ZAR).
+                        </div>
+
+                        <div className="audit-step">
+                            <div className="audit-step-num">0. Outcome Snapshot</div>
+                            <div className="audit-summary-grid">
+                                <div className="audit-summary-card">
+                                    <div className="audit-summary-title">USD Position</div>
+                                    <div className="audit-summary-row"><span>Sell Side (USD)</span><span className="audit-summary-value">{money(summaryMetrics.sellSideUsd, '$')}</span></div>
+                                    <div className="audit-summary-row"><span>Buy Side (USD)</span><span className="audit-summary-value">{money(summaryMetrics.buySideUsd, '$')}</span></div>
+                                    <div className="audit-summary-row"><span>Profit (USD)</span><span className="audit-summary-value audit-summary-value-key">{money(summaryMetrics.profitUsd, '$')}</span></div>
+                                </div>
+                                <div className="audit-summary-card">
+                                    <div className="audit-summary-title">ZAR Position</div>
+                                    <div className="audit-summary-row"><span>Sell Side (ZAR)</span><span className="audit-summary-value">{money(summaryMetrics.sellSideZar, 'R ')}</span></div>
+                                    <div className="audit-summary-row"><span>Buy Side (ZAR)</span><span className="audit-summary-value">{money(summaryMetrics.buySideZar, 'R ')}</span></div>
+                                    <div className="audit-summary-row"><span>Profit (ZAR)</span><span className="audit-summary-value audit-summary-value-key">{money(summaryMetrics.profitZar, 'R ')}</span></div>
+                                </div>
+                                <div className="audit-summary-card">
+                                    <div className="audit-summary-title">Control Account</div>
+                                    <div className="audit-summary-row"><span>Control Account (g)</span><span className="audit-summary-value">{grams(summaryMetrics.controlG)}</span></div>
+                                    <div className="audit-summary-row"><span>Control Account (oz)</span><span className="audit-summary-value">{ounces(summaryMetrics.controlOz, 4)}</span></div>
+                                    <div className="audit-summary-row"><span>Control Account (ZAR)</span><span className="audit-summary-value audit-summary-value-key">{money(summaryMetrics.controlZar, 'R ')}</span></div>
+                                </div>
+                                <div className="audit-summary-card">
+                                    <div className="audit-summary-title">Trade Totals</div>
+                                    <div className="audit-summary-row"><span>Total Traded (g / oz)</span><span className="audit-summary-value">{grams(summaryMetrics.totalTradedG)} / {ounces(summaryMetrics.totalTradedOz, 4)}</span></div>
+                                    <div className="audit-summary-row"><span>StoneX ZAR Flow</span><span className="audit-summary-value">{money(summaryMetrics.stonexZarFlow, 'R ')}</span></div>
+                                    <div className="audit-summary-row"><span>Profit Margin (%)</span><span className="audit-summary-value audit-summary-value-key">{pct(summaryMetrics.profitMargin, 2)}</span></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="audit-step">
+                            <div className="audit-step-num">1. Input Data Summary</div>
+                            <div className="audit-step-sub">Raw data loaded from the database for this ticket.</div>
+                            <div className="audit-summary-row"><span>TradeMC bookings (buy side)</span><strong>{tmBookings.length}</strong></div>
+                            <div className="audit-summary-row"><span>StoneX/PMX trades (sell side)</span><strong>{pmxTrades.length}</strong></div>
+                            <div className="audit-summary-row"><span>XAU/USD trades</span><strong>{xauTrades.length}</strong></div>
+                            <div className="audit-summary-row"><span>USD/ZAR trades</span><strong>{fxTrades.length}</strong></div>
+                            <div className="audit-summary-row"><span>Conversion constant</span><strong>31.1035 g/troy oz</strong></div>
+                        </div>
+
+                        <div className="audit-step">
+                            <div className="audit-step-num">2. TradeMC Buy-Side Valuation</div>
+                            <div className="audit-step-sub">Each booking is valued from grams to ounces, priced in USD, converted to ZAR, then reduced by refining rate.</div>
+                            {tmBookings.map((booking, idx) => (
+                                <div className="audit-booking" key={`audit-booking-${idx}`}>
+                                    <div className="audit-booking-title">Booking {idx + 1}: {booking.company}</div>
+                                    <div className="audit-summary-row"><span>Weight</span><strong>{grams(booking.weightG)}</strong></div>
+                                    <div className="audit-summary-row"><span>Weight in troy ounces</span><strong>{numText(booking.weightG, 2)} / 31.1035 = {ounces(booking.weightOz, 6)}</strong></div>
+                                    <div className="audit-summary-row"><span>Booked gold price</span><strong>{money(booking.bookedPrice, '$')} /oz</strong></div>
+                                    <div className="audit-summary-row"><span>USD value</span><strong>{ounces(booking.weightOz, 6)} x {money(booking.bookedPrice, '$')} = {money(booking.usdValue, '$')}</strong></div>
+                                    <div className="audit-summary-row"><span>FX rate (ZAR/USD)</span><strong>{numText(booking.fxRate, 4)}</strong></div>
+                                    <div className="audit-summary-row"><span>ZAR value (gross)</span><strong>{money(booking.usdValue, '$')} x {numText(booking.fxRate, 4)} = {money(booking.zarGross, 'R ')}</strong></div>
+                                    <div className="audit-summary-row"><span>Refining rate</span><strong>{pct(booking.refiningRate, 2)}</strong></div>
+                                    <div className="audit-summary-row"><span>Refining deduction</span><strong>{money(booking.zarGross, 'R ')} x {pct(booking.refiningRate, 2)} = {money(booking.refiningDeduction, 'R ')}</strong></div>
+                                    <div className="audit-summary-row"><span>ZAR value (net of refining)</span><strong>{money(booking.zarNet, 'R ')}</strong></div>
+                                </div>
+                            ))}
+                            <div className="audit-summary-row"><span>Total weight</span><strong>{grams(tmTotals.weightG)} ({ounces(tmTotals.weightOz, 6)})</strong></div>
+                            <div className="audit-summary-row"><span>Total USD value</span><strong>{money(tmTotals.usdValue, '$')}</strong></div>
+                            <div className="audit-summary-row"><span>Total ZAR (gross)</span><strong>{money(tmTotals.zarGross, 'R ')}</strong></div>
+                            <div className="audit-summary-row"><span>Total ZAR (net of refining)</span><strong>{money(tmTotals.zarNet, 'R ')}</strong></div>
+                        </div>
+
+                        <div className="audit-step">
+                            <div className="audit-step-num">3. StoneX Weighted Average Rates</div>
+                            <div className="audit-step-sub">Weighted average = Sum(qty x price) / Sum(qty).</div>
+                            <div className="audit-booking">
+                                <div className="audit-booking-title">Gold Weighted Average ($/oz)</div>
+                                {goldWaCalc.rows.length === 0 ? (
+                                    <div className="audit-summary-row"><span>XAU/USD trades</span><strong>--</strong></div>
+                                ) : (
+                                    <>
+                                        {goldWaCalc.rows.map((trade, idx) => (
+                                            <div className="audit-summary-row" key={`gold-wa-row-${idx}`}>
+                                                <span>{trade.side || 'TRADE'} {ounces(trade.qty, 4)} @ {money(trade.price, '$', 4)}</span>
+                                                <strong>{ounces(trade.qty, 4)} x {money(trade.price, '$', 4)} = {money(trade.notional, '$')}</strong>
+                                            </div>
+                                        ))}
+                                        <div className="audit-summary-row"><span>Sum of notional values</span><strong>{money(goldWaCalc.totalNotional, '$')}</strong></div>
+                                        <div className="audit-summary-row"><span>Sum of quantities</span><strong>{ounces(goldWaCalc.totalQty, 4)}</strong></div>
+                                        <div className="audit-summary-row"><span>Gold Weighted Average</span><strong>{money(goldWaCalc.totalNotional, '$')} / {ounces(goldWaCalc.totalQty, 4)} = {money(goldWa, '$', 4)}</strong></div>
+                                    </>
+                                )}
+                            </div>
+                            <div className="audit-booking">
+                                <div className="audit-booking-title">FX Weighted Average (ZAR/USD)</div>
+                                {fxWaCalc.rows.length === 0 ? (
+                                    <div className="audit-summary-row"><span>USD/ZAR trades</span><strong>--</strong></div>
+                                ) : (
+                                    <>
+                                        {fxWaCalc.rows.map((trade, idx) => (
+                                            <div className="audit-summary-row" key={`fx-wa-row-${idx}`}>
+                                                <span>{trade.side || 'TRADE'} {money(trade.qty, '$', 2)} @ {money(trade.price, 'R ', 4)}</span>
+                                                <strong>{money(trade.qty, '$', 2)} x {money(trade.price, 'R ', 4)} = {money(trade.notional, 'R ')}</strong>
+                                            </div>
+                                        ))}
+                                        <div className="audit-summary-row"><span>Sum of notional values</span><strong>{money(fxWaCalc.totalNotional, 'R ')}</strong></div>
+                                        <div className="audit-summary-row"><span>Sum of quantities</span><strong>{money(fxWaCalc.totalQty, '$', 2)}</strong></div>
+                                        <div className="audit-summary-row"><span>FX Weighted Average</span><strong>{money(fxWaCalc.totalNotional, 'R ')} / {money(fxWaCalc.totalQty, '$', 2)} = {money(fxWa, 'R ', 4)}</strong></div>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="audit-step">
+                            <div className="audit-step-num">4. Spot Rate Derivation</div>
+                            <div className="audit-summary-row">
+                                <span>Spot ZAR per gram</span>
+                                <strong>({money(goldWa, '$', 4)} x {money(fxWa, 'R ', 4)}) / 31.1035 = {money(spotZarPerG, 'R ', 4)}</strong>
+                            </div>
+                        </div>
+
+                        <div className="audit-step">
+                            <div className="audit-step-num">5. StoneX USD Cash Flow (Sell Side)</div>
+                            {xauCashFlowRows.map((row, idx) => (
+                                <div className="audit-summary-row" key={`xau-cash-${idx}`}>
+                                    <span>{row.side} {ounces(row.qty, 4)} @ {money(row.price, '$', 4)}</span>
+                                    <strong>{row.signed === null ? '--' : `${row.signed >= 0 ? '+' : '-'}${money(Math.abs(row.signed), '$')}`}</strong>
+                                </div>
+                            ))}
+                            <div className="audit-summary-row"><span>Net StoneX USD cash flow</span><strong>{money(netStoneXUsdFlow, '$')}</strong></div>
+                        </div>
+
+                        <div className="audit-step">
+                            <div className="audit-step-num">6. Control Account Check (Metal Exposure)</div>
+                            <div className="audit-summary-row"><span>Control Account (grams)</span><strong>{grams(summaryMetrics.controlG)}</strong></div>
+                            <div className="audit-summary-row"><span>Control Account (oz)</span><strong>{ounces(summaryMetrics.controlOz, 4)}</strong></div>
+                            <div className="audit-summary-row"><span>Control Account (ZAR)</span><strong>{money(summaryMetrics.controlZar, 'R ')}</strong></div>
+                        </div>
+
+                        <div className="audit-step">
+                            <div className="audit-step-num">7. ZAR Sell-Side Valuation</div>
+                            <div className="audit-summary-row"><span>StoneX ZAR flow</span><strong>{money(summaryMetrics.stonexZarFlow, 'R ')}</strong></div>
+                            <div className="audit-summary-row"><span>Sell Side ZAR</span><strong>{money(summaryMetrics.sellSideZar, 'R ')}</strong></div>
+                            <div className="audit-summary-row"><span>Buy Side ZAR (TradeMC net)</span><strong>{money(summaryMetrics.buySideZar, 'R ')}</strong></div>
+                        </div>
+
+                        <div className="audit-step">
+                            <div className="audit-step-num">8. Final Profit / Loss</div>
+                            <div className="audit-summary-row"><span>Profit (USD)</span><strong>{money(summaryMetrics.sellSideUsd, '$')} - {money(summaryMetrics.buySideUsd, '$')} = {money(summaryMetrics.profitUsd, '$')}</strong></div>
+                            <div className="audit-summary-row"><span>Profit (ZAR)</span><strong>{money(summaryMetrics.sellSideZar, 'R ')} - {money(summaryMetrics.buySideZar, 'R ')} = {money(summaryMetrics.profitZar, 'R ')}</strong></div>
+                            <div className="audit-summary-row"><span>Profit Margin</span><strong>{pct(summaryMetrics.profitMargin, 2)}</strong></div>
+                        </div>
+                    </div>
+                </>
+            )}
+
+            {!loading && !ticket && <Empty title="Enter a trade number to view trade breakdown and audit trail" />}
+            {Toast}
+        </div>
+    );
+}
+
+// ===================================================================
 // TAB: PROFIT
 // ===================================================================
 function ProfitTab() {
@@ -5576,6 +6100,858 @@ function AccountBalances() {
 }
 
 // ===================================================================
+// DASHBOARD
+// ===================================================================
+function Dashboard() {
+    const [loading, setLoading] = useState(true);
+    const [balances, setBalances] = useState<Row>({});
+    const [openPos, setOpenPos] = useState<{ summary: Row; market: Row }>({ summary: {}, market: {} });
+    const [profitSummary, setProfitSummary] = useState<Row>({});
+    const [profitMonths, setProfitMonths] = useState<Row[]>([]);
+    const [hedgingRows, setHedgingRows] = useState<Row[]>([]);
+    const [hedgePeriod, setHedgePeriod] = usePersistentState<string>('dash_hedge_period', '30');
+    const [profitPeriod, setProfitPeriod] = usePersistentState<string>('dash_profit_period', '30');
+    const { show, Toast } = useToast();
+
+    const load = useCallback(async () => {
+        setLoading(true);
+        try {
+            const [bal, opr, profit, hedging] = await Promise.all([
+                api.getAccountBalances().catch(() => ({} as Row)),
+                api.getPmxOpenPositionsReval().catch(() => ({ rows: [], summary: {}, market: {} })),
+                api.getProfitMonthly().catch(() => ({ months: [] as Row[], summary: {} as Row })),
+                api.getHedging().catch(() => [] as Row[]),
+            ]);
+            setBalances(bal as Row);
+            setOpenPos({ summary: (opr as { summary: Row }).summary || {}, market: (opr as { market: Row }).market || {} });
+            const pm = (profit as { months: Row[]; summary: Row });
+            setProfitSummary(pm.summary || {});
+            setProfitMonths(pm.months || []);
+            setHedgingRows(hedging as Row[]);
+        } catch (e) {
+            show(String(e), 'error');
+        } finally {
+            setLoading(false);
+        }
+    }, [show]);
+
+    useEffect(() => { void load(); }, [load]);
+
+    if (loading) return <><Loading text="Loading dashboard..." />{Toast}</>;
+
+    const n = (v: unknown) => typeof v === 'number' ? v : Number(v) || 0;
+    const xau = n(balances.xau);
+    const usd = n(balances.usd);
+    const zar = n(balances.zar);
+
+    const openTradeCount = n(openPos.summary.open_trades);
+    const totalProfitZar = n(profitSummary.total_profit_zar);
+    const hedgingTrades = hedgingRows.filter(r => normalizeTradeNumberValue(r.trade_num) !== '');
+    const UNHEDGED_METAL_TOL_OZ = 1.0;                        // 1 oz tolerance
+    const UNHEDGED_METAL_TOL_G = UNHEDGED_METAL_TOL_OZ * 31.1035; // ~31.1 g
+    const unhedgedTradeNums = new Set<string>();
+    for (const row of hedgingTrades) {
+        const tradeNum = normalizeTradeNumberValue(row.trade_num);
+        if (!tradeNum) continue;
+        const tmG = n(row.tm_weight_g);
+        const needG = n(row.hedge_need_g);
+        // Under-hedged = hedge_need has same sign as tm position (and exceeds tolerance).
+        // Over-hedged (opposite sign) is NOT flagged — the position is covered.
+        const isUnderHedged =
+            (tmG > 0 && needG > UNHEDGED_METAL_TOL_G) ||
+            (tmG < 0 && needG < -UNHEDGED_METAL_TOL_G);
+        if (isUnderHedged) {
+            unhedgedTradeNums.add(tradeNum);
+        }
+    }
+    // Remaining hedge: only count the shortfall on genuinely under-hedged trades.
+    const remainingHedgeG = hedgingTrades.reduce((sum, r) => {
+        const tmG = n(r.tm_weight_g);
+        const needG = n(r.hedge_need_g);
+        if (tmG > 0 && needG > UNHEDGED_METAL_TOL_G) return sum + needG;           // long, under-hedged
+        if (tmG < 0 && needG < -UNHEDGED_METAL_TOL_G) return sum + Math.abs(needG); // short, under-hedged
+        return sum; // hedged or over-hedged — no remaining need
+    }, 0);
+    const remainingHedgeOz = remainingHedgeG / 31.1035;
+
+    const GRAMS_PER_TROY_OUNCE = 31.1035;
+    const DAILY_TARGET_RATE = 0.0015;
+    const DASHBOARD_PROFIT_MIN_DATE = '2026-03-01';
+
+    // --- Daily dashboard chart data ---
+    const dailyProfitMap: Record<string, {
+        metalProfit: number;
+        exchangeProfit: number;
+        netProfit: number;
+        tmBuyAbsZar: number;
+        tmSellAbsZar: number;
+    }> = {};
+    for (const month of profitMonths) {
+        const trades = Array.isArray((month as { trades?: Row[] }).trades) ? (month as { trades: Row[] }).trades : [];
+        for (const t of trades) {
+            const date = String(t.trade_date || '').slice(0, 10);
+            if (!date) continue;
+
+            if (!dailyProfitMap[date]) {
+                dailyProfitMap[date] = { metalProfit: 0, exchangeProfit: 0, netProfit: 0, tmBuyAbsZar: 0, tmSellAbsZar: 0 };
+            }
+
+            const metalProfit = n(t.metal_profit_zar);
+            const exchangeProfit = n(t.exchange_profit_zar);
+            const netProfit = n(t.total_profit_zar);
+            const tmWeightG = n(t.client_weight_g);
+
+            let tmBuyAbsZar = 0;
+            let tmSellAbsZar = 0;
+            const tmTx = Array.isArray((t as { trademc_transactions?: Row[] }).trademc_transactions)
+                ? ((t as { trademc_transactions: Row[] }).trademc_transactions)
+                : [];
+
+            for (const tx of tmTx) {
+                const txWeightG = n(tx['Weight (g)']);
+                const txZarAbs = Math.abs(n(tx['ZAR Value']));
+                if (txZarAbs <= 1e-12) continue;
+                if (txWeightG >= 0) tmBuyAbsZar += txZarAbs;
+                else tmSellAbsZar += txZarAbs;
+            }
+
+            if (tmBuyAbsZar <= 1e-12 && tmSellAbsZar <= 1e-12) {
+                const buySideAbs = Math.abs(n(t.buy_side_zar));
+                const sellSideAbs = Math.abs(n(t.sell_side_zar));
+                if (tmWeightG >= 0) tmBuyAbsZar = buySideAbs;
+                else tmSellAbsZar = sellSideAbs;
+            }
+
+            dailyProfitMap[date].metalProfit += metalProfit;
+            dailyProfitMap[date].exchangeProfit += exchangeProfit;
+            dailyProfitMap[date].netProfit += netProfit;
+            dailyProfitMap[date].tmBuyAbsZar += tmBuyAbsZar;
+            dailyProfitMap[date].tmSellAbsZar += tmSellAbsZar;
+        }
+    }
+
+    const dailyData = Object.entries(dailyProfitMap)
+        .filter(([date]) => String(date || '') >= DASHBOARD_PROFIT_MIN_DATE)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([date, values]) => {
+            const targetBaseAbsZar = values.tmBuyAbsZar + values.tmSellAbsZar;
+            const dailyTarget = targetBaseAbsZar * DAILY_TARGET_RATE;
+            return {
+                date: date.slice(5), // MM-DD for compact x-axis labels
+                fullDate: date,
+                metalProfit: values.metalProfit,
+                exchangeProfit: values.exchangeProfit,
+                netProfit: values.netProfit,
+                tmBuyAbsZar: values.tmBuyAbsZar,
+                tmSellAbsZar: values.tmSellAbsZar,
+                targetBaseAbsZar,
+                dailyTarget,
+                targetDelta: values.netProfit - dailyTarget,
+                hitTarget: dailyTarget > 0 ? values.netProfit >= dailyTarget : false,
+            };
+        });
+
+    const profitChartData = (() => {
+        if (profitPeriod === 'all') return dailyData;
+        const days = parseInt(profitPeriod, 10) || 30;
+        const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+        return dailyData.filter(
+            row => String(row.fullDate || '') >= DASHBOARD_PROFIT_MIN_DATE && String(row.fullDate || '') >= cutoff
+        );
+    })();
+
+    const totalNetProfitDashboard = profitChartData.reduce((sum, row) => sum + row.netProfit, 0);
+    const totalTargetZar = profitChartData.reduce((sum, row) => sum + row.dailyTarget, 0);
+    const totalTargetGapZar = totalNetProfitDashboard - totalTargetZar;
+
+    // --- Build trade_num → date lookup from profit data ---
+    const tradeDateLookup = (() => {
+        const lookup = new Map<string, string>();
+        for (const month of profitMonths) {
+            const trades = Array.isArray((month as { trades?: Row[] }).trades) ? (month as { trades: Row[] }).trades : [];
+            for (const t of trades) {
+                const tradeNum = normalizeTradeNumberValue(t.trade_num);
+                const date = String(t.trade_date || '').slice(0, 10);
+                if (tradeNum && date) lookup.set(tradeNum, date);
+            }
+        }
+        return lookup;
+    })();
+
+    // --- Daily Metal Hedge chart data (aggregated by date, filtered by period) ---
+    const hedgeChartData = (() => {
+        // Determine cutoff date from hedgePeriod
+        const now = new Date();
+        let cutoffDate = '';
+        if (hedgePeriod !== 'all') {
+            const days = parseInt(hedgePeriod, 10) || 30;
+            const cutoff = new Date(now.getTime() - days * 86400000);
+            cutoffDate = cutoff.toISOString().slice(0, 10);
+        }
+
+        const makeBucket = () => ({ longTotal: 0, longHedge: 0, shortTotal: 0, shortHedge: 0, tmOz: 0, hedgeOz: 0, tradeCount: 0 });
+        const dailyMap = new Map<string, ReturnType<typeof makeBucket>>();
+        const tradeNumsByDate = new Map<string, Set<string>>();
+        const registerTrade = (dateKey: string, tradeNumRaw: unknown) => {
+            const tradeNum = normalizeTradeNumberValue(tradeNumRaw);
+            if (!tradeNum) return;
+            const set = tradeNumsByDate.get(dateKey) || new Set<string>();
+            set.add(tradeNum);
+            tradeNumsByDate.set(dateKey, set);
+        };
+        const resolveDateKey = (rawDate: string) => {
+            if (cutoffDate && rawDate && rawDate < cutoffDate) return '';
+            return rawDate || 'No Date';
+        };
+
+        const hedgingByTrade = new Map<string, { tmOz: number; sellOz: number; buyOz: number; tradeDate: string }>();
+        for (const row of hedgingRows) {
+            const tradeNum = normalizeTradeNumberValue(row.trade_num);
+            if (!tradeNum) continue;
+            const tmOz = n(row.tm_weight_oz);
+            const sellOz = Math.abs(n(row.stonex_sell_oz));
+            const buyOz = Math.abs(n(row.stonex_buy_oz));
+            const tradeDate = String(row.trade_date || '').slice(0, 10) || tradeDateLookup.get(tradeNum) || '';
+            hedgingByTrade.set(tradeNum, { tmOz, sellOz, buyOz, tradeDate });
+        }
+
+        // Preferred path: transaction-level dates from profit report so buys/sells land on exact days.
+        for (const month of profitMonths) {
+            const trades = Array.isArray((month as { trades?: Row[] }).trades) ? (month as { trades: Row[] }).trades : [];
+            for (const t of trades) {
+                const tradeNum = normalizeTradeNumberValue(t.trade_num);
+                if (!tradeNum) continue;
+
+                // Keep dashboard hedge chart aligned to /api/hedging universe (including fiscal cutoff).
+                const hedgeBase = hedgingByTrade.get(tradeNum);
+                if (!hedgeBase) continue;
+
+                const fallbackTradeDate = String(t.trade_date || '').slice(0, 10) || hedgeBase.tradeDate || tradeDateLookup.get(tradeNum) || '';
+
+                const tmTx = Array.isArray((t as { trademc_transactions?: Row[] }).trademc_transactions)
+                    ? ((t as { trademc_transactions: Row[] }).trademc_transactions)
+                    : [];
+                for (const tx of tmTx) {
+                    const tmWeightG = n(tx['Weight (g)']);
+                    if (Math.abs(tmWeightG) <= 0.001) continue;
+                    const tmOz = tmWeightG / GRAMS_PER_TROY_OUNCE;
+                    const rawDate = String((tx as { Date?: unknown }).Date || '').slice(0, 10) || fallbackTradeDate;
+                    const dateKey = resolveDateKey(rawDate);
+                    if (!dateKey) continue;
+
+                    const existing = dailyMap.get(dateKey) || makeBucket();
+                    if (tmOz > 0) existing.longTotal += tmOz;
+                    else existing.shortTotal += tmOz;
+                    existing.tmOz += tmOz;
+                    dailyMap.set(dateKey, existing);
+                    registerTrade(dateKey, tradeNum);
+                }
+
+                // Distribute hedge volume proportionally across TM transaction dates.
+                // PMX transactions may land on different dates than TM transactions,
+                // so placing hedges on PMX dates would make hedged trades look unhedged
+                // on TM days and show orphan hedge on PMX days (which gets capped to 0).
+                // Instead, use the trade-level effective hedge and spread it across the
+                // same date buckets where TM volume was placed.
+                const tmNetOz = hedgeBase.tmOz;
+                const isLongTrade = tmNetOz > 0.001;
+                const isShortTrade = tmNetOz < -0.001;
+                const hedgeCapOz = Math.abs(tmNetOz);
+                if (hedgeCapOz <= 0.001 || (!isLongTrade && !isShortTrade)) continue;
+
+                // Effective hedge for this trade = min(matching PMX side, TM volume)
+                const effectiveHedgeOz = isLongTrade
+                    ? Math.min(hedgeBase.sellOz, hedgeCapOz)
+                    : Math.min(hedgeBase.buyOz, hedgeCapOz);
+
+                if (effectiveHedgeOz <= 1e-9) continue;
+
+                // Collect the TM transaction date buckets for this trade so we can
+                // distribute the hedge proportionally by volume on each date.
+                const tmDateBuckets: { dateKey: string; absOz: number }[] = [];
+                let totalTmAbsOz = 0;
+                for (const tx of tmTx) {
+                    const tmWeightG = n(tx['Weight (g)']);
+                    if (Math.abs(tmWeightG) <= 0.001) continue;
+                    const absOz = Math.abs(tmWeightG) / GRAMS_PER_TROY_OUNCE;
+                    const rawDate = String((tx as { Date?: unknown }).Date || '').slice(0, 10) || fallbackTradeDate;
+                    const dateKey = resolveDateKey(rawDate);
+                    if (!dateKey) continue;
+                    tmDateBuckets.push({ dateKey, absOz });
+                    totalTmAbsOz += absOz;
+                }
+
+                // Fallback: if no TM transactions had usable dates, place on trade date.
+                if (tmDateBuckets.length === 0) {
+                    const dateKey = resolveDateKey(fallbackTradeDate);
+                    if (dateKey) {
+                        tmDateBuckets.push({ dateKey, absOz: hedgeCapOz });
+                        totalTmAbsOz = hedgeCapOz;
+                    }
+                }
+
+                // Distribute hedge pro-rata across TM dates
+                if (totalTmAbsOz > 1e-9) {
+                    for (const bucket of tmDateBuckets) {
+                        const proportion = bucket.absOz / totalTmAbsOz;
+                        const allocOz = effectiveHedgeOz * proportion;
+                        if (allocOz <= 1e-9) continue;
+
+                        const existing = dailyMap.get(bucket.dateKey) || makeBucket();
+                        if (isLongTrade) existing.longHedge += allocOz;
+                        else existing.shortHedge -= allocOz;
+                        existing.hedgeOz += allocOz;
+                        dailyMap.set(bucket.dateKey, existing);
+                        registerTrade(bucket.dateKey, tradeNum);
+                    }
+                }
+            }
+        }
+
+        // Fallback path: aggregated hedging rows if transaction-level data is unavailable.
+        if (dailyMap.size === 0) {
+            hedgingRows
+                .filter(r => r.trade_num && Math.abs(n(r.tm_weight_oz)) > 0.001)
+                .forEach(r => {
+                    const tmOz = n(r.tm_weight_oz);
+                    const isLong = tmOz > 0;
+                    const sellOz = Math.abs(n(r.stonex_sell_oz));
+                    const buyOz = Math.abs(n(r.stonex_buy_oz));
+                    const hedgeOz = isLong ? Math.min(sellOz, tmOz) : Math.min(buyOz, Math.abs(tmOz));
+                    const tradeNum = normalizeTradeNumberValue(r.trade_num);
+                    const rawDate = String(r.trade_date || '').slice(0, 10) || tradeDateLookup.get(tradeNum) || '';
+                    const dateKey = resolveDateKey(rawDate);
+                    if (!dateKey) return;
+
+                    const existing = dailyMap.get(dateKey) || makeBucket();
+                    existing.longTotal += isLong ? tmOz : 0;
+                    existing.longHedge += isLong ? hedgeOz : 0;
+                    existing.shortTotal += !isLong ? tmOz : 0;
+                    existing.shortHedge += !isLong ? -hedgeOz : 0;
+                    existing.tmOz += tmOz;
+                    existing.hedgeOz += hedgeOz;
+                    existing.tradeCount += 1;
+                    dailyMap.set(dateKey, existing);
+                    registerTrade(dateKey, tradeNum);
+                });
+        }
+
+        // Sort by date, put 'No Date' at the end
+        return [...dailyMap.entries()]
+            .sort(([a], [b]) => {
+                if (a === 'No Date') return 1;
+                if (b === 'No Date') return -1;
+                return a.localeCompare(b);
+            })
+            .map(([dateKey, d]) => {
+                const absLongTm = Math.abs(d.longTotal);
+                const absShortTm = Math.abs(d.shortTotal);
+                const cappedLongHedgeAbs = Math.min(Math.abs(d.longHedge), absLongTm);
+                const cappedShortHedgeAbs = Math.min(Math.abs(d.shortHedge), absShortTm);
+                const longHedge = cappedLongHedgeAbs;
+                const shortHedge = -cappedShortHedgeAbs;
+                const hedgeOz = cappedLongHedgeAbs + cappedShortHedgeAbs;
+                const tmNetOz = d.longTotal + d.shortTotal;
+                const hedgeNetOz = longHedge + shortHedge;
+                const residualAbsOz = Math.abs(tmNetOz - hedgeNetOz);
+                const requiredAbsOz = Math.abs(tmNetOz);
+                // Coverage = hedged oz / total gross position oz for this day.
+                const dayGrossOz = absLongTm + absShortTm;
+                const coveragePct = dayGrossOz > 0.001
+                    ? Math.max(0, Math.min(100, (hedgeOz / dayGrossOz) * 100))
+                    : 100;
+                return {
+                    dateLabel: dateKey === 'No Date' ? 'No Date' : fmtDate(dateKey),
+                    fullDate: dateKey,
+                    longTotal: d.longTotal,
+                    longHedge,
+                    shortTotal: d.shortTotal,
+                    shortHedge,
+                    tmOz: d.tmOz,
+                    hedgeOz,
+                    coveragePct,
+                    hasUnhedgedTrade: coveragePct < 99,
+                    tradeCount: tradeNumsByDate.get(dateKey)?.size ?? d.tradeCount,
+                };
+            });
+    })();
+
+    const totalLongOz = hedgeChartData.reduce((s, r) => s + r.longTotal, 0);
+    const totalShortOz = hedgeChartData.reduce((s, r) => s + Math.abs(r.shortTotal), 0);
+    // Coverage must be calculated on the same net-hedge basis as "Remaining to Hedge".
+    // Using gross long+short turnover understates coverage when there is offsetting flow.
+    const totalRequiredHedgeOz = hedgingTrades.reduce((s, r) => s + Math.abs(n(r.tm_weight_oz)), 0);
+    const totalHedgedOz = Math.max(0, totalRequiredHedgeOz - remainingHedgeOz);
+    const overallCoveragePct = totalRequiredHedgeOz > 0.001
+        ? Math.max(0, Math.min(100, (totalHedgedOz / totalRequiredHedgeOz) * 100))
+        : 100;
+    const hedgeAxisMax = Math.max(1, ...hedgeChartData.map(r => Math.max(Math.abs(r.longTotal), Math.abs(r.shortTotal))));
+    const hedgeChartVisualData = hedgeChartData.map((row) => {
+        const tmNetOz = row.longTotal + row.shortTotal;
+        const hedgeNetOz = row.longHedge + row.shortHedge;
+        const residualOz = tmNetOz - hedgeNetOz;
+        const dayHedged = row.coveragePct >= 99;
+        const dominantHedgeBar = Math.abs(row.longHedge) >= Math.abs(row.shortHedge) ? row.longHedge : row.shortHedge;
+        const statusDotY = Math.abs(dominantHedgeBar) > 0.001 ? (dominantHedgeBar / 2) : 0;
+        return {
+            ...row,
+            hedgeNetOz,
+            residualOz,
+            dayHedged,
+            longHedgeGood: dayHedged ? row.longHedge : 0,
+            shortHedgeGood: dayHedged ? row.shortHedge : 0,
+            longHedgeBad: dayHedged ? 0 : row.longHedge,
+            shortHedgeBad: dayHedged ? 0 : row.shortHedge,
+            statusDotY,
+        };
+    });
+
+    const formatProfitChartDate = (value: unknown): string => {
+        const raw = String(value || '').slice(0, 10);
+        if (!raw) return '--';
+        const dt = new Date(`${raw}T00:00:00`);
+        if (Number.isNaN(dt.getTime())) return raw;
+        return dt.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+    };
+
+    const renderNetDot = (props: { cx?: number; cy?: number; payload?: { netProfit?: number; dailyTarget?: number } }) => {
+        const { cx, cy, payload } = props;
+        if (cx == null || cy == null) return null;
+        const netProfit = Number(payload?.netProfit ?? 0);
+        const hurdle = Number(payload?.dailyTarget ?? 0);
+        const color = netProfit >= hurdle ? '#10b981' : '#111111';
+        return <circle cx={cx} cy={cy} r={5} fill={color} stroke="#000000" strokeWidth={1.5} />;
+    };
+
+    const renderHurdleBarShape = (props: { x?: number; y?: number; width?: number; height?: number }) => {
+        const { x, y, width, height } = props;
+        if (x == null || y == null || width == null || height == null || width <= 0 || height === 0) return null;
+        const absHeight = Math.abs(height);
+        const topY = height >= 0 ? y : y + height;
+        const widerWidth = width * 1.5;
+        const offsetX = x - ((widerWidth - width) / 2);
+        return (
+            <rect
+                x={offsetX}
+                y={topY}
+                width={widerWidth}
+                height={absHeight}
+                fill="transparent"
+                stroke="#6b7280"
+                strokeWidth={1.5}
+                strokeDasharray="4 3"
+                rx={2}
+                ry={2}
+            />
+        );
+    };
+
+    const renderProfitHurdleBarShape = (
+        props: { x?: number; y?: number; width?: number; height?: number; payload?: { netProfit?: number; dailyTarget?: number } }
+    ) => {
+        const { x, y, width, height } = props;
+        if (x == null || y == null || width == null || height == null || width <= 0 || height === 0) return null;
+        const absHeight = Math.abs(height);
+        const topY = height >= 0 ? y : y + height;
+        const widerWidth = width * 1.5;
+        const offsetX = x - ((widerWidth - width) / 2);
+        return (
+            <rect
+                x={offsetX}
+                y={topY}
+                width={widerWidth}
+                height={absHeight}
+                fill="rgba(180,114,61,0.20)"
+                stroke="#b4723d"
+                strokeWidth={1.5}
+                strokeDasharray="4 3"
+                rx={2}
+                ry={2}
+            />
+        );
+    };
+
+    const renderProfitAchievedBarShape = (
+        props: { x?: number; y?: number; width?: number; height?: number; payload?: { netProfit?: number } }
+    ) => {
+        const { x, y, width, height, payload } = props;
+        if (x == null || y == null || width == null || height == null || width <= 0 || height === 0) return null;
+        const absHeight = Math.abs(height);
+        if (absHeight <= 0.5) return null;
+        const topY = height >= 0 ? y : y + height;
+        const innerWidth = Math.max(3, width * 0.58);
+        const innerX = x + ((width - innerWidth) / 2);
+        const netProfit = Number(payload?.netProfit ?? 0);
+        const fill = netProfit >= 0 ? "#10b981" : "#ef4444";
+        return (
+            <rect
+                x={innerX}
+                y={topY}
+                width={innerWidth}
+                height={absHeight}
+                fill={fill}
+                stroke={fill}
+                strokeWidth={0}
+                rx={1.5}
+                ry={1.5}
+            />
+        );
+    };
+
+    const renderProfitTooltip = (props: any) => {
+        const active = Boolean(props?.active);
+        const payload = Array.isArray(props?.payload) ? props.payload : [];
+        if (!active || payload.length === 0) return null;
+        const row = (payload[0]?.payload || {}) as Row;
+        const fullDate = String(row.fullDate || '--');
+        const netProfit = n(row.netProfit);
+        const dailyTarget = n(row.dailyTarget);
+        return (
+            <div className="dashboard-tooltip">
+                <div className="dashboard-tooltip-title">{formatProfitChartDate(fullDate)}</div>
+                <div className="dashboard-tooltip-row"><span>Net Profit</span><strong>R{fmt(netProfit, 2)}</strong></div>
+                <div className="dashboard-tooltip-row"><span>Hurdle (0.15%)</span><strong>R{fmt(dailyTarget, 2)}</strong></div>
+            </div>
+        );
+    };
+
+    const renderHedgeTooltip = (props: any) => {
+        const active = Boolean(props?.active);
+        const payload = Array.isArray(props?.payload) ? props.payload : [];
+        if (!active || payload.length === 0) return null;
+        const row = (payload[0]?.payload || {}) as Row;
+        const dateLabel = String(row.dateLabel || '--');
+        const longTotal = n(row.longTotal);
+        const shortTotal = Math.abs(n(row.shortTotal));
+        const longHedge = n(row.longHedge);
+        const shortHedge = Math.abs(n(row.shortHedge));
+        const hedgeOz = n(row.hedgeOz);
+        const coveragePct = n(row.coveragePct);
+        const tradeCount = n(row.tradeCount);
+        return (
+            <div className="dashboard-tooltip">
+                <div className="dashboard-tooltip-title">{dateLabel}</div>
+                <div className="dashboard-tooltip-row">
+                    <span>Trades</span>
+                    <strong>{tradeCount}</strong>
+                </div>
+                <div className="dashboard-tooltip-row">
+                    <span>TradeMC Buy (Long)</span>
+                    <strong>{fmt(longTotal, 3)} oz</strong>
+                </div>
+                <div className="dashboard-tooltip-row">
+                    <span>TradeMC Sell (Short)</span>
+                    <strong>{fmt(shortTotal, 3)} oz</strong>
+                </div>
+                <div className="dashboard-tooltip-row">
+                    <span>PMX Hedged</span>
+                    <strong>{fmt(hedgeOz, 3)} oz</strong>
+                </div>
+                <div className="dashboard-tooltip-row">
+                    <span>Coverage</span>
+                    <strong>{fmt(coveragePct, 1)}%</strong>
+                </div>
+            </div>
+        );
+    };
+
+    const renderHedgeResidualDot = (props: { cx?: number; cy?: number; payload?: { dayHedged?: boolean } }) => {
+        const { cx, cy, payload } = props;
+        if (cx == null || cy == null) return null;
+        const color = Boolean(payload?.dayHedged) ? '#10b981' : '#111111';
+        return <circle cx={cx} cy={cy} r={5} fill={color} stroke="#000000" strokeWidth={1.5} />;
+    };
+
+    const renderHedgeStatusDot = (props: { cx?: number; cy?: number; payload?: { dayHedged?: boolean; statusDotY?: number } }) => {
+        const { cx, cy, payload } = props;
+        if (cx == null || cy == null) return <circle r={0} />;
+        if (Math.abs(Number(payload?.statusDotY ?? 0)) <= 0.001) return <circle r={0} />;
+        const isHedged = Boolean(payload?.dayHedged);
+        const fill = isHedged ? '#10b981' : '#ef4444';
+        return <circle cx={cx} cy={cy} r={5} fill={fill} stroke="#000000" strokeWidth={1.5} />;
+    };
+
+    return (
+        <div>
+            {Toast}
+            <div className="page-header">
+                <div>
+                    <h2>Dashboard</h2>
+                    <div className="page-subtitle">Overview of key metrics and daily performance</div>
+                </div>
+                <div className="btn-group">
+                    <button className="btn btn-sm" onClick={() => { void load(); }}>Refresh</button>
+                </div>
+            </div>
+
+            {/* StoneX Balances */}
+            <div className="section">
+                <div className="section-title">StoneX Balances</div>
+                <div className="stat-grid dashboard-stat-grid">
+                    <div className="stat-card">
+                        <div className="stat-label">Gold (XAU)</div>
+                        <div className={`stat-value ${xau > 0.001 ? 'positive' : xau < -0.001 ? 'negative' : ''}`}>
+                            {fmt(xau, 4)} oz
+                        </div>
+                    </div>
+                    <div className="stat-card">
+                        <div className="stat-label">USD Balance</div>
+                        <div className={`stat-value ${usd > 0.01 ? 'positive' : usd < -0.01 ? 'negative' : ''}`}>
+                            ${fmt(usd, 2)}
+                        </div>
+                    </div>
+                    <div className="stat-card">
+                        <div className="stat-label">ZAR Balance</div>
+                        <div className={`stat-value ${zar > 0.01 ? 'positive' : zar < -0.01 ? 'negative' : ''}`}>
+                            R{fmt(zar, 2)}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* Key Metrics */}
+            <div className="section">
+                <div className="section-title">Key Metrics</div>
+                <div className="stat-grid dashboard-stat-grid">
+                    <div className="stat-card">
+                        <div className="stat-label">Open Pairs</div>
+                        <div className="stat-value">{fmt(openTradeCount, 0)}</div>
+                    </div>
+                    <div className="stat-card">
+                        <div className="stat-label">Total Profit (ZAR)</div>
+                        <div className={`stat-value ${totalProfitZar > 0.01 ? 'positive' : totalProfitZar < -0.01 ? 'negative' : ''}`}>
+                            R{fmt(totalProfitZar, 2)}
+                        </div>
+                    </div>
+                    <div className="stat-card">
+                        <div className="stat-label">Remaining to Hedge</div>
+                        <div className={`stat-value ${remainingHedgeG <= 0.01 ? 'positive' : 'warning'}`}>
+                            {fmt(remainingHedgeG, 2)} g
+                        </div>
+                        <div className="stat-sub">{fmt(remainingHedgeOz, 3)} oz</div>
+                    </div>
+                </div>
+            </div>
+
+            <div className="section">
+                <div className="section-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <span>Daily Metal Hedge Totals</span>
+                    <select
+                        value={hedgePeriod}
+                        onChange={e => setHedgePeriod(e.target.value)}
+                        className="input"
+                        style={{ width: 'auto', minWidth: 130, fontSize: 12, padding: '4px 8px', margin: 0 }}
+                    >
+                        <option value="7">Last 7 days</option>
+                        <option value="14">Last 14 days</option>
+                        <option value="30">Last 30 days</option>
+                        <option value="60">Last 60 days</option>
+                        <option value="90">Last 90 days</option>
+                        <option value="all">All time</option>
+                    </select>
+                </div>
+                <div className="dashboard-chart dashboard-chart-elevated">
+                    <div className="dashboard-chart-head">
+                        <div>
+                            <div className="dashboard-chart-title">Daily TradeMC Positions vs PMX Hedges</div>
+                            <div className="dashboard-chart-subtitle">Outer bar = TradeMC position · Inner bar = PMX hedge coverage · Grouped by day</div>
+                        </div>
+                        <div className="dashboard-chart-kpis">
+                            <div className="dashboard-kpi">
+                                <div className="dashboard-kpi-label">Longs (Buy)</div>
+                                <div className="dashboard-kpi-value positive">{fmt(totalLongOz, 3)} oz</div>
+                            </div>
+                            <div className="dashboard-kpi">
+                                <div className="dashboard-kpi-label">Shorts (Sell)</div>
+                                <div className="dashboard-kpi-value negative">{fmt(totalShortOz, 3)} oz</div>
+                            </div>
+                            <div className="dashboard-kpi">
+                                <div className="dashboard-kpi-label">Hedged</div>
+                                <div className="dashboard-kpi-value">{fmt(totalHedgedOz, 3)} oz</div>
+                            </div>
+                            <div className="dashboard-kpi">
+                                <div className="dashboard-kpi-label">Coverage</div>
+                                <div className={`dashboard-kpi-value ${overallCoveragePct >= 95 ? 'positive' : overallCoveragePct >= 75 ? 'warning' : 'negative'}`}>
+                                    {fmt(overallCoveragePct, 1)}%
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {hedgeChartVisualData.length > 0 ? (
+                        <>
+                            <ResponsiveContainer width="100%" height={360}>
+                                <ComposedChart
+                                    data={hedgeChartVisualData}
+                                    barSize={16}
+                                    barGap={-16}
+                                    margin={{ top: 5, right: 10, left: 10, bottom: 5 }}
+                                >
+                                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(28,28,28,0.08)" />
+                                    <XAxis
+                                        dataKey="fullDate"
+                                        tickFormatter={formatProfitChartDate}
+                                        tick={{ fontSize: 10, fill: 'var(--text-muted)' }}
+                                        tickLine={false}
+                                        axisLine={{ stroke: 'rgba(28,28,28,0.2)' }}
+                                        interval="preserveStartEnd"
+                                    />
+                                    <YAxis
+                                        tickFormatter={(v: number) => `${fmt(v, 2)} oz`}
+                                        domain={[-hedgeAxisMax * 1.15, hedgeAxisMax * 1.15]}
+                                        tick={{ fontSize: 10, fill: 'var(--text-muted)' }}
+                                        tickLine={false}
+                                        axisLine={false}
+                                        width={54}
+                                    />
+                                    <Tooltip content={renderHedgeTooltip} cursor={{ fill: 'rgba(180,114,61,0.06)' }} />
+                                    <ReferenceLine y={0} stroke="rgba(28,28,28,0.28)" strokeDasharray="2 2" />
+                                    <Bar dataKey="longTotal" shape={renderHurdleBarShape} isAnimationActive={false} />
+                                    <Bar dataKey="shortTotal" shape={renderHurdleBarShape} isAnimationActive={false} />
+                                    <Bar dataKey="longHedgeGood" fill="#3b82f6" name="PMX Hedge (Hedged)" isAnimationActive={false} />
+                                    <Bar dataKey="shortHedgeGood" fill="#3b82f6" isAnimationActive={false} />
+                                    <Bar dataKey="longHedgeBad" fill="#ef4444" name="PMX Hedge (Unhedged)" isAnimationActive={false} />
+                                    <Bar dataKey="shortHedgeBad" fill="#ef4444" isAnimationActive={false} />
+                                    <Line
+                                        type="monotone"
+                                        dataKey="statusDotY"
+                                        name="Hedge Status"
+                                        stroke="#111111"
+                                        strokeWidth={2}
+                                        dot={renderHedgeStatusDot}
+                                        activeDot={false}
+                                        isAnimationActive={false}
+                                    />
+                                </ComposedChart>
+                            </ResponsiveContainer>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14, marginTop: 8, fontSize: 10, color: 'var(--text-muted)' }}>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ width: 10, height: 10, border: '1.5px dashed #6b7280', borderRadius: 2, display: 'inline-block' }} /> TradeMC Position
+                                </span>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ width: 10, height: 10, borderRadius: 2, background: '#3b82f6', display: 'inline-block' }} /> PMX Hedge (Hedged)
+                                </span>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ width: 10, height: 10, borderRadius: 2, background: '#ef4444', display: 'inline-block' }} /> PMX Hedge (Unhedged)
+                                </span>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#10b981', display: 'inline-block' }} /> Hedged Dot
+                                </span>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#ef4444', display: 'inline-block' }} /> Unhedged Dot
+                                </span>
+                            </div>
+                        </>
+                    ) : (
+                        <div style={{ textAlign: 'center', padding: '3rem', color: 'rgba(0,0,0,0.4)' }}>
+                            No hedging data available
+                        </div>
+                    )}
+                </div>
+            </div>
+
+            {/* Daily P&L Chart */}
+            <div className="section">
+                <div className="section-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <span>Daily P&L and Profit Targets</span>
+                    <select
+                        value={profitPeriod}
+                        onChange={e => setProfitPeriod(e.target.value)}
+                        className="input"
+                        style={{ width: 'auto', minWidth: 130, fontSize: 12, padding: '4px 8px', margin: 0 }}
+                    >
+                        <option value="7">Last 7 days</option>
+                        <option value="14">Last 14 days</option>
+                        <option value="30">Last 30 days</option>
+                        <option value="60">Last 60 days</option>
+                        <option value="90">Last 90 days</option>
+                        <option value="all">All time</option>
+                    </select>
+                </div>
+                <div className="dashboard-chart dashboard-chart-elevated">
+                    <div className="dashboard-chart-head">
+                        <div>
+                            <div className="dashboard-chart-title">Net Profit vs Daily Hurdle</div>
+                            <div className="dashboard-chart-subtitle">Daily target = 0.15% × (|TradeMC Buy ZAR| + |TradeMC Sell ZAR|). Achieved bar = net profit (green) / loss (red).</div>
+                        </div>
+                        <div className="dashboard-chart-kpis">
+                            <div className="dashboard-kpi">
+                                <div className="dashboard-kpi-label">Total Net Profit</div>
+                                <div className={`dashboard-kpi-value ${totalNetProfitDashboard >= 0 ? 'positive' : 'negative'}`}>R{fmt(totalNetProfitDashboard, 2)}</div>
+                            </div>
+                            <div className="dashboard-kpi">
+                                <div className="dashboard-kpi-label">Net vs Target</div>
+                                <div className={`dashboard-kpi-value ${totalTargetGapZar >= 0 ? 'positive' : 'negative'}`}>
+                                    {totalTargetGapZar >= 0 ? '+' : ''}R{fmt(totalTargetGapZar, 2)}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {profitChartData.length > 0 ? (
+                        <>
+                            <ResponsiveContainer width="100%" height={360}>
+                                <ComposedChart
+                                    data={profitChartData}
+                                    barSize={16}
+                                    barGap={-16}
+                                    margin={{ top: 5, right: 10, left: 10, bottom: 5 }}
+                                >
+                                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(28,28,28,0.08)" />
+                                    <XAxis
+                                        dataKey="fullDate"
+                                        tickFormatter={formatProfitChartDate}
+                                        tick={{ fontSize: 10, fill: 'var(--text-muted)' }}
+                                        tickLine={false}
+                                        axisLine={{ stroke: 'rgba(28,28,28,0.2)' }}
+                                        interval="preserveStartEnd"
+                                    />
+                                    <YAxis
+                                        tickFormatter={(v: number) => `R${fmt(v / 1000, 0)}k`}
+                                        tick={{ fontSize: 10, fill: 'var(--text-muted)' }}
+                                        tickLine={false}
+                                        axisLine={false}
+                                        width={54}
+                                    />
+                                    <Tooltip content={renderProfitTooltip} cursor={{ fill: 'rgba(180,114,61,0.08)' }} />
+                                    <ReferenceLine y={0} stroke="rgba(28,28,28,0.25)" strokeDasharray="2 2" />
+                                    <Bar dataKey="dailyTarget" shape={renderProfitHurdleBarShape} isAnimationActive={false} />
+                                    <Bar dataKey="netProfit" shape={renderProfitAchievedBarShape} isAnimationActive={false} />
+                                    <Line
+                                        type="monotone"
+                                        dataKey="netProfit"
+                                        name="Net Profit (ZAR)"
+                                        stroke="#111111"
+                                        strokeWidth={2}
+                                        dot={renderNetDot}
+                                        activeDot={renderNetDot}
+                                        isAnimationActive={false}
+                                    />
+                                </ComposedChart>
+                            </ResponsiveContainer>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14, marginTop: 8, fontSize: 10, color: 'var(--text-muted)' }}>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#111111', display: 'inline-block' }} /> Net Profit
+                                </span>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ width: 10, height: 10, borderRadius: 2, background: 'linear-gradient(90deg, #10b981 0%, #10b981 50%, #ef4444 50%, #ef4444 100%)', display: 'inline-block' }} /> Achieved (P/L)
+                                </span>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ width: 10, height: 10, border: '1.5px dashed #b4723d', background: 'rgba(180,114,61,0.24)', borderRadius: 2, display: 'inline-block' }} /> Hurdle (0.15%)
+                                </span>
+                            </div>
+                        </>
+                    ) : (
+                        <div style={{ textAlign: 'center', padding: '3rem', color: 'rgba(0,0,0,0.4)' }}>
+                            No daily profit data available
+                        </div>
+                    )}
+                </div>
+            </div>
+
+        </div>
+    );
+}
+
+// ===================================================================
 // SIDEBAR NAV ITEMS
 // ===================================================================
 type NavItem = {
@@ -5590,6 +6966,12 @@ type NavSection = {
 };
 
 const NAV_SECTIONS: NavSection[] = [
+    {
+        label: 'Overview',
+        items: [
+            { id: 'dashboard', label: 'Dashboard' },
+        ],
+    },
     {
         label: 'Trading',
         items: [
@@ -5612,6 +6994,7 @@ const NAV_SECTIONS: NavSection[] = [
         items: [
             { id: 'export_trades', label: 'Export Trades' },
             { id: 'ticket', label: 'Trading Ticket' },
+            { id: 'trade_breakdown', label: 'Trade Breakdown' },
         ],
     },
     {
@@ -5623,6 +7006,7 @@ const NAV_SECTIONS: NavSection[] = [
 ];
 
 const PAGE_TITLES: Record<string, string> = {
+    dashboard: 'Dashboard',
     pmx_ledger: 'PMX Ledger',
     hedging: 'Hedging',
     profit: 'Profit',
@@ -5633,6 +7017,7 @@ const PAGE_TITLES: Record<string, string> = {
     suppliers: 'Supplier Balances',
     export_trades: 'Export Trades',
     ticket: 'Trading Ticket',
+    trade_breakdown: 'Trade Breakdown',
     user_management: 'User Management',
 };
 
@@ -5645,7 +7030,7 @@ export default function App() {
         const dt = new Date();
         return dt.toISOString().slice(0, 10);
     }, []);
-    const [tab, setTab] = usePersistentState('ui:active_tab', 'pmx_ledger');
+    const [tab, setTab] = usePersistentState('ui:active_tab', 'dashboard');
     const [authLoading, setAuthLoading] = useState(true);
     const [authUser, setAuthUser] = useState<AppUser | null>(null);
     const [reconDeltaAlert, setReconDeltaAlert] = useState(false);
@@ -5906,8 +7291,9 @@ export default function App() {
                 <form className="auth-card" onSubmit={onLogin}>
                     <div className="auth-side">
                         <div className="auth-side-logo">
-                            <h2>J<sup>2</sup> Hedging Platform</h2>
-                            <p>FX &amp; Gold Hedging</p>
+                            <img src="/logo-light.png" alt="Metal Concentrators" style={{ height: '64px', marginBottom: '16px' }} />
+                            <h2>FOUNDATION</h2>
+                            <p>FX &amp; Metal Hedging Platform</p>
                         </div>
                         <div className="auth-side-note">Metal Concentrators SA</div>
                     </div>
@@ -5977,8 +7363,9 @@ export default function App() {
             {/* Sidebar */}
             <aside className="sidebar">
                 <div className="sidebar-logo">
-                    <h1>J<sup>2</sup> Hedging Platform</h1>
-                    <span>FX &amp; Gold Hedging</span>
+                    <img src="/logo-dark.png" alt="Metal Concentrators" style={{ height: '32px', marginBottom: '8px' }} />
+                    <h1>FOUNDATION</h1>
+                    <span>FX &amp; Metal Hedging</span>
                 </div>
                 <nav className="sidebar-nav">
                     {navSections.map(section => (
@@ -5992,6 +7379,7 @@ export default function App() {
                                 >
                                     <span className="nav-icon">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                            {item.id === 'dashboard' && <><path d="M3 13a9 9 0 1 1 18 0" /><line x1="12" y1="13" x2="17" y2="8" /><line x1="7" y1="13" x2="7.01" y2="13" /><line x1="17" y1="13" x2="17.01" y2="13" /></>}
                                             {item.id === 'pmx_ledger' && <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /></>}
                                             {(item.id === 'positions' || item.id === 'open_positions_reval') && <><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></>}
                                             {item.id === 'hedging' && <><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></>}
@@ -6001,6 +7389,7 @@ export default function App() {
                                             {item.id === 'suppliers' && <><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z" /><line x1="3" y1="6" x2="21" y2="6" /></>}
                                             {item.id === 'export_trades' && <><path d="M12 3v12" /><polyline points="7 10 12 15 17 10" /><path d="M5 21h14" /></>}
                                             {item.id === 'ticket' && <><polyline points="6 9 6 2 18 2 18 9" /><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" /><rect x="6" y="14" width="12" height="8" /></>}
+                                            {item.id === 'trade_breakdown' && <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="14" y2="17" /></>}
                                             {item.id === 'user_management' && <><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="8.5" cy="7" r="4" /><path d="M20 8v6" /><path d="M23 11h-6" /></>}
                                         </svg>
                                     </span>
@@ -6062,6 +7451,7 @@ export default function App() {
                 </header>
                 <main className="content-body">
                     <RenderGuard title={PAGE_TITLES[String(tab)] || 'Current Section'}>
+                        {tab === 'dashboard' && <Dashboard />}
                         {tab === 'pmx_ledger' && <PMXLedger />}
                         {tab === 'profit' && <ProfitTab />}
                         {tab === 'forward_exposure' && <ForwardExposure />}
@@ -6072,6 +7462,7 @@ export default function App() {
                         {tab === 'suppliers' && <SupplierBalances />}
                         {tab === 'export_trades' && <ExportTrades />}
                         {tab === 'ticket' && <TradingTicket />}
+                        {tab === 'trade_breakdown' && <TradeBreakdownTab />}
                         {tab === 'user_management' && isAdmin && <UserManagement currentUserId={authUser ? Number(authUser.id) : null} />}
                     </RenderGuard>
                 </main>

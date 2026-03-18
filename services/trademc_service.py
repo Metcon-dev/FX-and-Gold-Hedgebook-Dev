@@ -22,8 +22,11 @@ def _trademc_base_url() -> str:
 def _trademc_api_key() -> str:
     return TRADEMC_API_KEY.strip()
 
-# Database path (same as main trading db)
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'fx_trading_ledger.db')
+# Database path (same as main trading db / server LEDGER_DB_PATH)
+SHARED_DB_ROOT = r"T:\Trading Platform - db"
+DB_PATH = os.path.join(SHARED_DB_ROOT, "fx_trading_ledger.db")
+os.environ["LEDGER_DB_PATH"] = DB_PATH
+TRADE_DATA_START_DATE = str(os.getenv("TRADE_DATA_START_DATE", "2026-03-02") or "2026-03-02").strip() or "2026-03-02"
 
 
 def get_api_headers() -> Dict[str, str]:
@@ -80,6 +83,75 @@ def _subtract_seconds_from_iso(value: Optional[str], seconds: int) -> Optional[s
         return value
     shifted = parsed - timedelta(seconds=max(0, int(seconds)))
     return _format_utc_iso(shifted)
+
+
+def _parse_trade_date(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    parsed_iso = _parse_utc_iso(text)
+    if parsed_iso is not None:
+        return parsed_iso
+
+    for dayfirst in (False, True):
+        try:
+            parsed = pd.to_datetime(text, errors="coerce", utc=True, dayfirst=dayfirst)
+        except Exception:
+            parsed = None
+        if parsed is not None and pd.notna(parsed):
+            try:
+                return parsed.to_pydatetime()
+            except Exception:
+                return None
+    return None
+
+
+def _is_before_trade_data_start(*values: Any) -> bool:
+    start_dt = _parse_trade_date(TRADE_DATA_START_DATE)
+    if start_dt is None:
+        return False
+    floor = start_dt.date()
+    for value in values:
+        parsed = _parse_trade_date(value)
+        if parsed is not None:
+            return parsed.date() < floor
+    return False
+
+
+def _purge_local_trademc_before_start(conn: sqlite3.Connection) -> int:
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, trade_timestamp, date_created FROM trademc_trades")
+    rows = cursor.fetchall()
+    delete_ids: List[int] = []
+    for row in rows:
+        row_id, trade_timestamp, date_created = row
+        if _is_before_trade_data_start(trade_timestamp, date_created):
+            delete_ids.append(int(row_id))
+    if not delete_ids:
+        return 0
+    cursor.executemany("DELETE FROM trademc_trades WHERE id = ?", [(row_id,) for row_id in delete_ids])
+    return len(delete_ids)
+
+
+def _purge_local_weight_transactions_before_start(conn: sqlite3.Connection) -> int:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, transaction_timestamp, date_created
+        FROM trademc_weight_transactions
+        """
+    )
+    rows = cursor.fetchall()
+    delete_ids: List[int] = []
+    for row in rows:
+        row_id, transaction_timestamp, date_created = row
+        if _is_before_trade_data_start(transaction_timestamp, date_created):
+            delete_ids.append(int(row_id))
+    if not delete_ids:
+        return 0
+    cursor.executemany("DELETE FROM trademc_weight_transactions WHERE id = ?", [(row_id,) for row_id in delete_ids])
+    return len(delete_ids)
 
 
 _TRADE_COMPARE_FIELDS: List[str] = [
@@ -696,6 +768,14 @@ def update_trademc_trade_ref_number(trade_id: int, ref_number: str) -> Dict[str,
     if not remote_trade:
         remote_trade = response_data
 
+    if _is_before_trade_data_start(remote_trade.get("trade_timestamp"), remote_trade.get("date_created")):
+        return {
+            "success": False,
+            "trade_id": trade_id_int,
+            "status": 409,
+            "error": f"Trade is before enforced start date {TRADE_DATA_START_DATE}",
+        }
+
     synced_at = datetime.now().isoformat()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -1070,10 +1150,16 @@ def sync_trademc_trades(
             and remote_max_id is not None
             and int(remote_max_id) < int(local_max_before)
         ):
-            warnings.append(
-                f"Remote max TradeMC ID ({remote_max_id}) is lower than local max ({local_max_before}); "
-                "API token visibility may be restricted."
-            )
+            gap = int(local_max_before) - int(remote_max_id)
+            if gap <= 3:
+                # Small gap — likely a manual deletion on TradeMC website.
+                # Tail-prune will clean up the stale local rows automatically.
+                pass
+            else:
+                warnings.append(
+                    f"Remote max TradeMC ID ({remote_max_id}) is lower than local max ({local_max_before}); "
+                    "API token visibility may be restricted."
+                )
     
     latest_local_trade_id = get_latest_local_trademc_trade_id() if incremental else None
     latest_local_date_updated = get_latest_local_trademc_date_updated() if incremental else None
@@ -1193,12 +1279,18 @@ def sync_trademc_trades(
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
+    removed_pre_start_existing = _purge_local_trademc_before_start(conn)
     synced_at = datetime.now().isoformat()
     unique_by_id: Dict[int, Dict[str, Any]] = {}
+    filtered_before_start = 0
     for trade in trades:
         trade_id = trade.get("id")
-        if trade_id is not None:
-            unique_by_id[int(trade_id)] = trade
+        if trade_id is None:
+            continue
+        if _is_before_trade_data_start(trade.get("trade_timestamp"), trade.get("date_created")):
+            filtered_before_start += 1
+            continue
+        unique_by_id[int(trade_id)] = trade
 
     force_full_replace = bool(prune_missing and not incremental)
     existing_by_id: Dict[int, Dict[str, Any]] = {}
@@ -1294,6 +1386,9 @@ def sync_trademc_trades(
                 "inserted": len(trade_rows),
                 "updated": 0,
                 "removed": removed,
+                "removed_pre_start_existing": removed_pre_start_existing,
+                "filtered_before_start": filtered_before_start,
+                "trade_data_start_date": TRADE_DATA_START_DATE,
                 "synced_at": synced_at,
                 "mode": "full_replace",
                 "start_after_id": latest_local_trade_id,
@@ -1320,6 +1415,9 @@ def sync_trademc_trades(
             "inserted": len(trade_rows),
             "updated": 0,
             "removed": removed,
+            "removed_pre_start_existing": removed_pre_start_existing,
+            "filtered_before_start": filtered_before_start,
+            "trade_data_start_date": TRADE_DATA_START_DATE,
             "synced_at": synced_at,
             "mode": "full_replace",
             "start_after_id": latest_local_trade_id,
@@ -1374,6 +1472,35 @@ def sync_trademc_trades(
         ''', trade_rows)
 
     removed = 0
+    # Incremental tail-prune: when remote max ID dropped by a small amount (≤3),
+    # the most likely cause is a manual deletion on the TradeMC website.
+    # Safely remove the stale local rows above the remote max.
+    if incremental:
+        local_max_before = local_snapshot_before.get("max_id")
+        try:
+            local_max_before_int = int(local_max_before) if local_max_before is not None else None
+            remote_max_id_int = int(remote_max_id) if remote_max_id is not None else None
+        except (TypeError, ValueError):
+            local_max_before_int = None
+            remote_max_id_int = None
+        if (
+            local_max_before_int is not None
+            and remote_max_id_int is not None
+            and remote_max_id_int < local_max_before_int
+            and (local_max_before_int - remote_max_id_int) <= 3
+        ):
+            cursor.execute(
+                "SELECT COUNT(*) FROM trademc_trades WHERE id > ?",
+                (remote_max_id_int,),
+            )
+            tail_remove = int(cursor.fetchone()[0] or 0)
+            if tail_remove > 0:
+                cursor.execute(
+                    "DELETE FROM trademc_trades WHERE id > ?",
+                    (remote_max_id_int,),
+                )
+                removed += tail_remove
+
     if prune_missing and not incremental:
         safe_to_prune = True
         local_count_before = int(local_snapshot_before.get("count") or 0)
@@ -1422,6 +1549,7 @@ def sync_trademc_trades(
             warnings.append("Prune skipped: remote TradeMC ID set is empty.")
 
     if not trade_rows and not (prune_missing and not incremental):
+        conn.commit()
         conn.close()
         return {
             "success": True,
@@ -1429,6 +1557,9 @@ def sync_trademc_trades(
             "inserted": 0,
             "updated": 0,
             "removed": 0,
+            "removed_pre_start_existing": removed_pre_start_existing,
+            "filtered_before_start": filtered_before_start,
+            "trade_data_start_date": TRADE_DATA_START_DATE,
             "synced_at": synced_at,
             "mode": (
                 "incremental"
@@ -1463,6 +1594,9 @@ def sync_trademc_trades(
         "inserted": inserted,
         "updated": updated,
         "removed": removed,
+        "removed_pre_start_existing": removed_pre_start_existing,
+        "filtered_before_start": filtered_before_start,
+        "trade_data_start_date": TRADE_DATA_START_DATE,
         "synced_at": synced_at,
         "mode": (
             "incremental"
@@ -1644,12 +1778,18 @@ def sync_trademc_weight_transactions(
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
+    removed_pre_start_existing = _purge_local_weight_transactions_before_start(conn)
     synced_at = datetime.now().isoformat()
     unique_by_id: Dict[int, Dict[str, Any]] = {}
+    filtered_before_start = 0
     for row in rows:
         row_id = row.get("id")
-        if row_id is not None:
-            unique_by_id[int(row_id)] = row
+        if row_id is None:
+            continue
+        if _is_before_trade_data_start(row.get("transaction_timestamp"), row.get("date_created")):
+            filtered_before_start += 1
+            continue
+        unique_by_id[int(row_id)] = row
 
     row_values: List[tuple] = []
     for row_id, row in unique_by_id.items():
@@ -1674,12 +1814,16 @@ def sync_trademc_weight_transactions(
         ))
 
     if not row_values:
+        conn.commit()
         conn.close()
         return {
             "success": True,
             "count": 0,
             "inserted": 0,
             "updated": 0,
+            "removed_pre_start_existing": removed_pre_start_existing,
+            "filtered_before_start": filtered_before_start,
+            "trade_data_start_date": TRADE_DATA_START_DATE,
             "synced_at": synced_at,
             "mode": "incremental" if incremental else "full",
             "start_after_id": latest_local_tx_id,
@@ -1732,6 +1876,9 @@ def sync_trademc_weight_transactions(
         "count": len(row_values),
         "inserted": inserted,
         "updated": updated,
+        "removed_pre_start_existing": removed_pre_start_existing,
+        "filtered_before_start": filtered_before_start,
+        "trade_data_start_date": TRADE_DATA_START_DATE,
         "synced_at": synced_at,
         "mode": "incremental" if incremental else "full",
         "start_after_id": latest_local_tx_id,
