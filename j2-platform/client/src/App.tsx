@@ -6457,9 +6457,18 @@ function Dashboard() {
                 const requiredAbsOz = Math.abs(tmNetOz);
                 // Coverage = hedged oz / total gross position oz for this day.
                 const dayGrossOz = absLongTm + absShortTm;
-                const coveragePct = dayGrossOz > 0.001
+                const rawCoveragePct = dayGrossOz > 0.001
                     ? Math.max(0, Math.min(100, (hedgeOz / dayGrossOz) * 100))
                     : 100;
+                const dayTradeNums = tradeNumsByDate.get(dateKey) || new Set<string>();
+                let hasUnhedgedTrade = false;
+                for (const tn of dayTradeNums) {
+                    if (unhedgedTradeNums.has(tn)) {
+                        hasUnhedgedTrade = true;
+                        break;
+                    }
+                }
+                const coveragePct = hasUnhedgedTrade ? rawCoveragePct : 100;
                 return {
                     dateLabel: dateKey === 'No Date' ? 'No Date' : fmtDate(dateKey),
                     fullDate: dateKey,
@@ -6470,7 +6479,7 @@ function Dashboard() {
                     tmOz: d.tmOz,
                     hedgeOz,
                     coveragePct,
-                    hasUnhedgedTrade: coveragePct < 99,
+                    hasUnhedgedTrade,
                     tradeCount: tradeNumsByDate.get(dateKey)?.size ?? d.tradeCount,
                 };
             });
@@ -6490,7 +6499,7 @@ function Dashboard() {
         const tmNetOz = row.longTotal + row.shortTotal;
         const hedgeNetOz = row.longHedge + row.shortHedge;
         const residualOz = tmNetOz - hedgeNetOz;
-        const dayHedged = row.coveragePct >= 99;
+        const dayHedged = !Boolean((row as Row).hasUnhedgedTrade);
         const dominantHedgeBar = Math.abs(row.longHedge) >= Math.abs(row.shortHedge) ? row.longHedge : row.shortHedge;
         const statusDotY = Math.abs(dominantHedgeBar) > 0.001 ? (dominantHedgeBar / 2) : 0;
         return {
