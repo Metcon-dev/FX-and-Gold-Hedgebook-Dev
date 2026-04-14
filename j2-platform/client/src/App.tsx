@@ -5161,18 +5161,6 @@ function ProfitTab() {
             return sum + tradeNetG;
         }, 0);
 
-    const monthAbsTradedG = (trades: Row[]): number =>
-        trades.reduce((sum, trade) => {
-            const pmxTx = Array.isArray(trade.pmx_transactions) ? (trade.pmx_transactions as Row[]) : [];
-            const tradeAbsG = pmxTx.reduce((sub, tx) => {
-                if (normalizeSymbol(tx['Symbol']) !== 'XAUUSD') return sub;
-                const qty = toNullableNumber(tx['Quantity']);
-                if (qty === null) return sub;
-                return sub + (Math.abs(qty) * GRAMS_PER_TROY_OUNCE);
-            }, 0);
-            return sum + tradeAbsG;
-        }, 0);
-
     const monthlyChartData = months
         .map((month, monthIdx) => {
             const monthKey = monthKeyOf(month, monthIdx);
@@ -5430,7 +5418,7 @@ function ProfitTab() {
                                 });
                                 const pctWeightedAvg = monthProfitPctWeightedAvg(trades);
                                 const netTradedG = monthNetTradedG(trades);
-                                const absTradedG = monthAbsTradedG(trades);
+                                const absTradedG = trades.reduce((s, t) => s + (Number(t.stonex_traded_g) || 0), 0);
                                 const profitPerG = absTradedG > 0 ? (Number(month.total_profit_zar) || 0) / absTradedG : 0;
                                 return (
                                     <Fragment key={monthKey}>
@@ -5483,11 +5471,7 @@ function ProfitTab() {
                                                                     const pmxTx = Array.isArray(trade.pmx_transactions) ? (trade.pmx_transactions as Row[]) : [];
                                                                     const hedgeStatus = hedgeStatusByTrade[normalizeTradeNumberValue(tradeNum)]
                                                                         ?? asText(trade.hedge_status, Boolean(trade.hedged) ? 'Hedged' : 'Unhedged');
-                                                                    const tradeAbsG = pmxTx.reduce((s, tx) => {
-                                                                        if (normalizeSymbol(tx['Symbol']) !== 'XAUUSD') return s;
-                                                                        const qty = toNullableNumber(tx['Quantity']);
-                                                                        return qty !== null ? s + Math.abs(qty) * GRAMS_PER_TROY_OUNCE : s;
-                                                                    }, 0);
+                                                                    const tradeAbsG = Number(trade.stonex_traded_g) || 0;
                                                                     const tradeProfitPerG = tradeAbsG > 0 ? (Number(trade.total_profit_zar) || 0) / tradeAbsG : 0;
                                                                     return (
                                                                         <Fragment key={tradeExpandKey}>
