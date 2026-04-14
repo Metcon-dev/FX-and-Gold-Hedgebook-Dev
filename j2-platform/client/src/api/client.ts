@@ -4,10 +4,11 @@ function resolveApiBase(): string {
 
     if (typeof window !== 'undefined') {
         const { protocol, hostname, port } = window.location;
-        // In local Vite dev, call Flask directly to avoid proxy drift/misconfig.
+        // In Vite dev, call Flask directly only for localhost.
+        // For LAN/IP access, keep same-origin /api so Vite proxy handles backend routing.
         const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1';
         if (isLocalHost && /^517\d+$/.test(String(port))) {
-            return `${protocol}//${hostname}:5002/api`;
+            return `${protocol}//${hostname}:5001/api`;
         }
     }
 
@@ -277,11 +278,50 @@ export const api = {
             body: JSON.stringify({ trade_number: tradeNumber }),
         }),
 
-    updatePmxTradeNumber: (id: number, tradeNumber: string) =>
-        request<{ ok: boolean }>(`/pmx/trades/${id}/trade-number`, {
+    updatePmxTradeNumber: async (id: number, tradeNumber: string, options?: { overrideValidation?: boolean }) => {
+        const url = `${BASE}/pmx/trades/${id}/trade-number`;
+        const res = await fetch(url, {
             method: 'PUT',
-            body: JSON.stringify({ trade_number: tradeNumber }),
-        }),
+            cache: 'no-store',
+            credentials: 'include',
+            headers: {
+                'Content-Type': 'application/json',
+                'Cache-Control': 'no-cache',
+                Pragma: 'no-cache',
+            },
+            body: JSON.stringify({
+                trade_number: tradeNumber,
+                override_validation: Boolean(options?.overrideValidation),
+            }),
+        });
+
+        const raw = await res.text();
+        let parsed: unknown = null;
+        if (raw) {
+            try {
+                parsed = JSON.parse(raw);
+            } catch {
+                parsed = null;
+            }
+        }
+        if (!res.ok) {
+            const errMsg = (
+                parsed &&
+                typeof parsed === 'object' &&
+                parsed !== null &&
+                'error' in parsed &&
+                typeof (parsed as { error?: unknown }).error === 'string'
+            )
+                ? String((parsed as { error: string }).error)
+                : (raw || `HTTP ${res.status}`);
+            const err = new Error(errMsg) as Error & { status?: number; payload?: unknown };
+            err.status = res.status;
+            err.payload = parsed;
+            throw err;
+        }
+
+        return (parsed as { ok: boolean }) || { ok: true };
+    },
 
     // TradeMC
     getTradeMCTrades: (params?: Record<string, string>) => {
@@ -332,6 +372,32 @@ export const api = {
     // Hedging
     getHedging: () =>
         request<Record<string, unknown>[]>('/hedging'),
+    getDashboardUnlinkedPmxTrades: () =>
+        request<{
+            summary: Record<string, unknown>;
+            rows: Record<string, unknown>[];
+        }>('/dashboard/unlinked-pmx-trades'),
+    cacheDashboardTradingSummaryPdf: (data: { pdf_base64: string; run_date?: string }) =>
+        request<{ ok: boolean; run_date?: string; path?: string; error?: string }>('/dashboard/trading-summary/pdf/cache', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        }),
+    getDashboardTradingSummaryPdf: (params?: Record<string, string>) => {
+        const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+        return fetch(`${BASE}/dashboard/trading-summary/pdf${qs}`, { credentials: 'include' });
+    },
+    sendDashboardReportEmail: (data: {
+        to?: string[] | string;
+        cc?: string[] | string;
+        subject?: string;
+        body?: string;
+        filename?: string;
+        pdf_base64: string;
+    }) =>
+        request<{ ok: boolean; message?: string; error?: string; recipients?: string[] }>('/dashboard/report/email', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        }),
 
     // Weighted average
     getWeightedAverage: (tradeNum: string) =>
@@ -356,7 +422,12 @@ export const api = {
         );
     },
 
-    saveExportTradesToFolder: (data: { trades: { trade_num: string; fnc_numbers: string[] }[]; output_dir?: string }) =>
+    saveExportTradesToFolder: (data: {
+        trades?: { trade_num: string; fnc_numbers: string[] }[];
+        manual_fnc_numbers?: string[] | string;
+        trade_prefix?: string;
+        output_dir?: string;
+    }) =>
         request<Record<string, unknown>>('/export-trades/save', {
             method: 'POST',
             body: JSON.stringify(data),
@@ -371,6 +442,86 @@ export const api = {
             account_balances: Record<string, unknown>;
         }>(`/pmx/reconciliation${qs}`);
     },
+
+    // ── Supplier Payment Recons (SharePoint) ──────────────────
+    exportTradingWorksheetExcel: (data: {
+        worksheet_ref?: string;
+        usd_rows: { qty?: string; rate?: string }[];
+        xau_rows: { qty?: string; rate?: string }[];
+    }) =>
+        fetch('/api/trading-worksheet/export-excel', {
+            method: 'POST',
+            cache: 'no-store',
+            credentials: 'include',
+            headers: {
+                'Content-Type': 'application/json',
+                'Cache-Control': 'no-cache',
+                Pragma: 'no-cache',
+            },
+            body: JSON.stringify(data),
+        }),
+
+    getSupplierReconList: () =>
+        request<{ suppliers: { name: string; filename: string }[] }>('/supplier-recons/suppliers'),
+
+    getSupplierRecon: (supplier: string, force?: boolean) =>
+        request<{
+            supplier: string;
+            rows: Record<string, unknown>[];
+            row_count: number;
+            synced_at?: string;
+            cached?: boolean;
+            error?: string;
+        }>(`/supplier-recons/${encodeURIComponent(supplier)}${force ? '?force=1' : ''}`),
+
+    syncSupplierRecons: () =>
+        request<{
+            suppliers: { name: string; filename: string }[];
+            synced_at: string;
+            row_counts: Record<string, number>;
+        }>('/supplier-recons/sync', { method: 'POST' }),
+
+    // Forecast
+    getForecast: (pair: string, days?: number, sims?: number) => {
+        const params = new URLSearchParams();
+        if (days) params.set('days', String(days));
+        if (sims) params.set('sims', String(sims));
+        const qs = params.toString() ? `?${params.toString()}` : '';
+        return request<Record<string, unknown>>(`/forecast/${pair}${qs}`);
+    },
+
+    getForecastCurrentPrice: (pair: string) =>
+        request<Record<string, unknown>>(`/forecast/current-price/${pair}`),
+
+    refreshForecast: (pair: string, days?: number, sims?: number) =>
+        request<Record<string, unknown>>(`/forecast/refresh/${pair}`, {
+            method: 'POST',
+            body: JSON.stringify({ days: days || 30, sims: sims || 10000 }),
+        }),
+    getForecastMacroSummary: (month?: string, force?: boolean) => {
+        const params = new URLSearchParams();
+        if (month) params.set('month', month);
+        if (force) params.set('force', '1');
+        const qs = params.toString() ? `?${params.toString()}` : '';
+        return request<Record<string, unknown>>(`/forecast/macro-summary${qs}`);
+    },
+
+    // Purchases ML Forecast
+    getPurchasesForecast: (spotUsd?: number, fxRate?: number) => {
+        const params = new URLSearchParams();
+        if (spotUsd) params.set('spot_usd', String(spotUsd));
+        if (fxRate) params.set('fx_rate', String(fxRate));
+        const qs = params.toString() ? `?${params.toString()}` : '';
+        return request<Record<string, unknown>>(`/forecast/purchases/predict${qs}`);
+    },
+
+    trainPurchasesModel: () =>
+        request<Record<string, unknown>>('/forecast/purchases/train', { method: 'POST' }),
+
+    getPurchasesModelStatus: () =>
+        request<Record<string, unknown>>('/forecast/purchases/status'),
 };
 
 export default api;
+
+

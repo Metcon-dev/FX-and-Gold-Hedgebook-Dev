@@ -1,484 +1,192 @@
-def build_trading_ticket_pdf(trade_num_value: str,
-                             trademc_rows: pd.DataFrame,
-                             stonex_rows: pd.DataFrame,
-                             summary_rows: pd.DataFrame):
+"""
+Trading Ticket PDF Generator — Metal Concentrators SA
+
+Generates a professional trading ticket report using FPDF2.
+Called from server.py via build_trading_ticket_pdf().
+"""
+import math
+import os
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+
+
+def build_trading_ticket_pdf(
+    trade_num_value: str,
+    trademc_rows: pd.DataFrame,
+    stonex_rows: pd.DataFrame,
+    summary_rows: pd.DataFrame,
+) -> Optional[bytes]:
+    """Build a professional trading ticket PDF report.
+
+    Returns PDF bytes, or None if FPDF is unavailable.
+    """
     try:
-        from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.lib import colors
-        from reportlab.lib.units import mm
-        from reportlab.lib.styles import ParagraphStyle
-        from reportlab.platypus import (
-            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-            HRFlowable, Image as RLImage, PageBreak, KeepTogether,
-        )
-        from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-        from io import BytesIO
-        import html as _html
-        import os as _os
+        from fpdf import FPDF
     except Exception:
-        return _build_trading_ticket_pdf_fpdf(
-            trade_num_value,
-            trademc_rows,
-            stonex_rows,
-            summary_rows,
-        )
+        return None
 
-    def _esc(v: str) -> str:
-        return _html.escape(str(v), quote=False)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  HELPERS
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    # ── Font registration (Calibri with Helvetica fallback) ──────
-    FONT_REG  = "Helvetica"
-    FONT_BOLD = "Helvetica-Bold"
-    FONT_IT   = "Helvetica-Oblique"
-    try:
-        _rp = r"C:\Windows\Fonts\calibri.ttf"
-        _bp = r"C:\Windows\Fonts\calibrib.ttf"
-        _ip = r"C:\Windows\Fonts\calibrii.ttf"
-        if _os.path.isfile(_rp) and _os.path.isfile(_bp):
-            pdfmetrics.registerFont(TTFont("Calibri",      _rp))
-            pdfmetrics.registerFont(TTFont("Calibri-Bold", _bp))
-            FONT_REG  = "Calibri"
-            FONT_BOLD = "Calibri-Bold"
-            if _os.path.isfile(_ip):
-                pdfmetrics.registerFont(TTFont("Calibri-Italic", _ip))
-                FONT_IT = "Calibri-Italic"
-    except Exception:
-        pass
-
-    # ── Brand palette ────────────────────────────────────────────
-    CHARCOAL     = colors.HexColor("#1C1C1C")
-    COPPER       = colors.HexColor("#B07840")
-    COPPER_LT    = colors.HexColor("#FBF5EC")
-    COPPER_MD    = colors.HexColor("#E8D5B7")
-    COPPER_DK    = colors.HexColor("#8A5C2E")
-    NAVY         = colors.HexColor("#1E2A38")
-    CREAM_TXT    = colors.HexColor("#F5EDE3")
-    ROW_ALT      = colors.HexColor("#FAFAFA")
-    BORDER       = colors.HexColor("#E2E2E2")
-    MID_GREY     = colors.HexColor("#888888")
-    DARK_GREY    = colors.HexColor("#555555")
-    LIGHT_GREY   = colors.HexColor("#F4F4F4")
-    GREEN        = colors.HexColor("#1A7A42")
-    GREEN_LT     = colors.HexColor("#E8F5EE")
-    RED_C        = colors.HexColor("#C0392B")
-    RED_LT       = colors.HexColor("#FDECEB")
-    WHITE        = colors.white
-
-    # ── Numeric / text helpers ───────────────────────────────────
-    def _s(v) -> str:
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return ""
-        return str(v).strip()
-
-    def _n(v) -> Optional[float]:
+    def _n(v: Any) -> Optional[float]:
         try:
             f = float(v)
-            return None if pd.isna(f) else f
+            return None if (math.isnan(f) or math.isinf(f)) else f
         except Exception:
             return None
 
-    def _f(v, dp=2, prefix="") -> str:
+    def _t(v: Any) -> str:
+        """Safe latin-1 text."""
+        text = str(v if v is not None else "--")
+        try:
+            text.encode("latin-1")
+            return text
+        except Exception:
+            return text.encode("latin-1", errors="replace").decode("latin-1")
+
+    def _f(v: Any, dp: int = 2) -> str:
         n = _n(v)
-        return "\u2014" if n is None else f"{prefix}{n:,.{dp}f}"
+        return "--" if n is None else f"{n:,.{dp}f}"
 
-    def _money(v, prefix="$", dp=2) -> str:
+    def _money(v: Any, prefix: str = "$", dp: int = 2) -> str:
         n = _n(v)
-        return "\u2014" if n is None else f"{prefix}{n:,.{dp}f}"
+        return "--" if n is None else f"{prefix}{n:,.{dp}f}"
 
-    def _grams(v) -> str:
+    def _grams(v: Any) -> str:
         n = _n(v)
-        return "\u2014" if n is None else f"{n:,.2f} g"
+        return "--" if n is None else f"{n:,.2f} g"
 
-    def _ounces(v, dp=4) -> str:
+    def _oz(v: Any, dp: int = 4) -> str:
         n = _n(v)
-        return "\u2014" if n is None else f"{n:,.{dp}f} oz"
+        return "--" if n is None else f"{n:,.{dp}f} oz"
 
-    def _pct(v, dp=2) -> str:
+    def _pct(v: Any, dp: int = 2) -> str:
         n = _n(v)
-        return "\u2014" if n is None else f"{n:,.{dp}f}%"
+        return "--" if n is None else f"{n:,.{dp}f}%"
 
-    def _tr(t: str, mx: int) -> str:
-        return t if len(t) <= mx else t[:mx - 1] + "\u2026"
+    TROY_OZ = 31.1035
 
-    # ── Document setup ───────────────────────────────────────────
-    buf  = BytesIO()
-    PAGE = landscape(A4)
-    LM = RM = 20 * mm
-    TM = 18 * mm
-    BM = 16 * mm
-    doc  = SimpleDocTemplate(buf, pagesize=PAGE,
-                             leftMargin=LM, rightMargin=RM,
-                             topMargin=TM, bottomMargin=BM)
-    PW = PAGE[0] - LM - RM
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  COLOUR PALETTE
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    CHARCOAL    = (28, 28, 28)
+    DARK        = (45, 45, 45)
+    MID         = (85, 85, 85)
+    LIGHT       = (140, 140, 140)
+    FAINT       = (180, 180, 180)
 
-    # ── Style factory ────────────────────────────────────────────
-    _style_count = [0]
-    def _ps(name, **kw) -> ParagraphStyle:
-        _style_count[0] += 1
-        uname = f"{name}_{_style_count[0]}"
-        return ParagraphStyle(
-            uname,
-            fontName=kw.pop("fontName", FONT_REG),
-            fontSize=kw.pop("fontSize", 8),
-            leading=kw.pop("leading", 11),
-            textColor=kw.pop("textColor", CHARCOAL),
-            **kw,
-        )
+    GOLD        = (176, 120, 64)
+    GOLD_DK     = (138, 92, 46)
+    GOLD_LT     = (251, 245, 236)
+    GOLD_MD     = (232, 213, 183)
 
-    generated_at = datetime.now().strftime("%d %B %Y at %H:%M")
-    story = []
+    NAVY        = (26, 35, 50)
+    CREAM       = (245, 237, 227)
 
-    # ── Logo ─────────────────────────────────────────────────────
-    _logo_path = _os.path.join(
-        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-        "MetCon Logo.png",
-    )
-    _logo_cell: object = Spacer(60 * mm, 16 * mm)
-    try:
-        if _os.path.isfile(_logo_path):
-            from PIL import Image as _PILImage
-            with _PILImage.open(_logo_path) as _pimg:
-                _pimg.load()
-            _logo_cell = RLImage(_logo_path, width=60 * mm, height=16 * mm)
-    except Exception:
-        pass
+    STRIPE      = (248, 248, 248)
+    WHITE       = (255, 255, 255)
+    BORDER      = (224, 224, 224)
+    BORDER_SOFT = (238, 238, 238)
 
-    # ════════════════════════════════════════════════════════════
-    # HEADER
-    # ════════════════════════════════════════════════════════════
-    title_para = Paragraph(
-        f"<font name='{FONT_BOLD}' size='8' color='#B07840'>METAL CONCENTRATORS SA</font><br/>"
-        f"<font name='{FONT_BOLD}' size='22' color='#1C1C1C'>Trade Breakdown Report</font><br/>"
-        f"<font name='{FONT_BOLD}' size='12' color='#B07840'>Trade #{_esc(_s(trade_num_value))}</font>",
-        _ps("_hdr", leading=26, alignment=TA_RIGHT),
-    )
-    date_para = Paragraph(
-        f"<font size='7.5' color='#888888'>Report generated on {_esc(generated_at)}</font>",
-        _ps("_hdr_date", fontSize=7.5, textColor=MID_GREY, alignment=TA_RIGHT),
-    )
-    hdr = Table([[_logo_cell, title_para]], colWidths=[PW * 0.38, PW * 0.62])
-    hdr.setStyle(TableStyle([
-        ("VALIGN",        (0, 0), (-1, -1), "BOTTOM"),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
-        ("TOPPADDING",    (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-    ]))
-    story.append(hdr)
-    story.append(date_para)
-    story.append(Spacer(1, 3 * mm))
-    story.append(HRFlowable(width=PW, thickness=3, color=COPPER,
-                            spaceBefore=0, spaceAfter=0.8 * mm))
-    story.append(HRFlowable(width=PW, thickness=0.75, color=COPPER_MD,
-                            spaceBefore=0, spaceAfter=6 * mm))
+    GREEN       = (26, 122, 66)
+    GREEN_BG    = (232, 245, 238)
+    RED         = (192, 57, 43)
+    RED_BG      = (253, 236, 235)
 
-    # ════════════════════════════════════════════════════════════
-    # REUSABLE LAYOUT HELPERS
-    # ════════════════════════════════════════════════════════════
-    def _sec_lbl(title: str, description: str = ""):
-        """Section header with copper left bar, title, and optional description."""
-        inner_rows = [[Paragraph(
-            f"<font name='{FONT_BOLD}' size='10' color='#1C1C1C'>{_esc(title.upper())}</font>",
-            _ps("_sl", fontName=FONT_BOLD, fontSize=10, textColor=CHARCOAL, leading=14),
-        )]]
-        if description:
-            inner_rows.append([Paragraph(
-                f"<font size='7.5' color='#777777'>{_esc(description)}</font>",
-                _ps("_sld", fontSize=7.5, textColor=MID_GREY, leading=10),
-            )])
-        inner = Table(inner_rows, colWidths=[PW - 8])
-        inner.setStyle(TableStyle([
-            ("LEFTPADDING",   (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
-            ("TOPPADDING",    (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
-        ]))
-        lbl = Table([[Spacer(1, 1), inner]], colWidths=[5, PW - 5])
-        lbl.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (0, 0), COPPER),
-            ("BACKGROUND",    (1, 0), (1, 0), COPPER_LT),
-            ("LEFTPADDING",   (0, 0), (0, 0), 0),
-            ("RIGHTPADDING",  (0, 0), (0, 0), 0),
-            ("LEFTPADDING",   (1, 0), (-1, -1), 12),
-            ("RIGHTPADDING",  (1, 0), (-1, -1), 12),
-            ("TOPPADDING",    (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-        ]))
-        story.append(lbl)
-        story.append(Spacer(1, 4 * mm))
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  DATA PREPARATION
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    tm_df = trademc_rows.copy() if isinstance(trademc_rows, pd.DataFrame) else pd.DataFrame()
+    st_df = stonex_rows.copy() if isinstance(stonex_rows, pd.DataFrame) else pd.DataFrame()
+    sum_df = summary_rows.copy() if isinstance(summary_rows, pd.DataFrame) else pd.DataFrame()
 
-    def _audit_step_header(step_num: str, title: str, subtitle: str = ""):
-        """Numbered audit step with prominent badge and explanatory text."""
-        badge = Paragraph(
-            f"<font name='{FONT_BOLD}' size='10' color='#FFFFFF'>\u00a0{_esc(step_num)}\u00a0</font>",
-            _ps("_badge", fontName=FONT_BOLD, fontSize=10, textColor=WHITE, alignment=TA_CENTER),
-        )
-        title_p = Paragraph(
-            f"<font name='{FONT_BOLD}' size='11' color='#1C1C1C'>{_esc(title)}</font>",
-            _ps("_ash", fontName=FONT_BOLD, fontSize=11, leading=15),
-        )
-        row_tbl = Table([[badge, title_p]], colWidths=[26 * mm, PW - 26 * mm])
-        row_tbl.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (0, 0), COPPER),
-            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING",   (0, 0), (0, 0), 6),
-            ("RIGHTPADDING",  (0, 0), (0, 0), 6),
-            ("LEFTPADDING",   (1, 0), (1, 0), 10),
-            ("TOPPADDING",    (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ]))
-        story.append(row_tbl)
-        if subtitle:
-            story.append(Spacer(1, 2 * mm))
-            story.append(Paragraph(
-                f"<font name='{FONT_IT}' size='7.5' color='#666666'>{_esc(subtitle)}</font>",
-                _ps("_ass", fontName=FONT_IT, fontSize=7.5, textColor=DARK_GREY, leftIndent=8, rightIndent=8),
-            ))
-        story.append(Spacer(1, 3 * mm))
-        story.append(HRFlowable(width=PW, thickness=0.5, color=COPPER_MD,
-                                spaceBefore=0, spaceAfter=3.5 * mm))
+    # -- TradeMC bookings --
+    bookings: List[Dict[str, Any]] = []
+    tm_tot = {"g": 0.0, "oz": 0.0, "usd": 0.0, "zar_gross": 0.0, "zar_net": 0.0}
+    for _, r in tm_df.iterrows():
+        wg = _n(r.get("Weight (g)")) or 0.0
+        woz = _n(r.get("Weight (oz)")) or (wg / TROY_OZ)
+        bp = _n(r.get("$/oz Booked"))
+        fx = _n(r.get("FX Rate"))
+        usd = _n(r.get("USD Value"))
+        if usd is None and bp is not None:
+            usd = woz * bp
+        zg = _n(r.get("ZAR Value"))
+        if zg is None and usd is not None and fx is not None:
+            zg = usd * fx
+        rr = _n(r.get("company_refining_rate")) or 0.0
+        rd = (zg * rr / 100.0) if zg is not None else None
+        zn = _n(r.get("zar_value_less_refining"))
+        if zn is None and zg is not None:
+            zn = zg * (1.0 - rr / 100.0)
+        company = str(r.get("Company") or r.get("company_name") or "Unknown")
+        bookings.append({
+            "company": company, "wg": wg, "woz": woz, "bp": bp, "fx": fx,
+            "usd": usd, "zg": zg, "rr": rr, "rd": rd, "zn": zn,
+        })
+        tm_tot["g"] += wg
+        tm_tot["oz"] += woz
+        tm_tot["usd"] += usd or 0.0
+        tm_tot["zar_gross"] += zg or 0.0
+        tm_tot["zar_net"] += zn or 0.0
 
-    def _audit_row(label: str, value: str, bold_value: bool = True,
-                   value_color=None, indent: int = 0):
-        """Key-value audit row with separator."""
-        vc = value_color or CHARCOAL
-        lpad = 12 + indent * 16
-        lbl_cell = Paragraph(
-            f"<font size='8' color='#444444'>{_esc(label)}</font>",
-            _ps("_arl", fontSize=8, textColor=DARK_GREY, leading=11),
-        )
-        val_font = FONT_BOLD if bold_value else FONT_REG
-        val_cell = Paragraph(
-            f"<font name='{val_font}' size='8.5'>{_esc(value)}</font>",
-            _ps("_arv", fontName=val_font, fontSize=8.5, textColor=vc,
-                alignment=TA_RIGHT, leading=12),
-        )
-        tbl = Table([[lbl_cell, val_cell]], colWidths=[PW * 0.55, PW * 0.45])
-        tbl.setStyle(TableStyle([
-            ("LEFTPADDING",   (0, 0), (0, 0), lpad),
-            ("RIGHTPADDING",  (-1, 0), (-1, 0), 12),
-            ("TOPPADDING",    (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ("LINEBELOW",     (0, 0), (-1, -1), 0.25, BORDER),
-            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-        ]))
-        story.append(tbl)
+    # -- StoneX trades --
+    def _sym(v: Any) -> str:
+        return str(v or "").upper().replace("/", "").replace("-", "").replace(" ", "")
 
-    def _audit_row_formula(label: str, formula: str, result: str,
-                           value_color=None, indent: int = 0):
-        """Three-column audit row: label | formula -> result."""
-        vc = value_color or CHARCOAL
-        lpad = 12 + indent * 16
-        lbl_cell = Paragraph(
-            f"<font size='7.5' color='#444444'>{_esc(label)}</font>",
-            _ps("_arf_l", fontSize=7.5, textColor=DARK_GREY, leading=10),
-        )
-        formula_cell = Paragraph(
-            f"<font name='{FONT_IT}' size='7' color='#999999'>{_esc(formula)}  \u2192</font>",
-            _ps("_arf_f", fontName=FONT_IT, fontSize=7, textColor=MID_GREY, alignment=TA_RIGHT, leading=10),
-        )
-        val_cell = Paragraph(
-            f"<font name='{FONT_BOLD}' size='8.5'>{_esc(result)}</font>",
-            _ps("_arf_v", fontName=FONT_BOLD, fontSize=8.5, textColor=vc,
-                alignment=TA_RIGHT, leading=12),
-        )
-        tbl = Table([[lbl_cell, formula_cell, val_cell]],
-                     colWidths=[PW * 0.28, PW * 0.42, PW * 0.30])
-        tbl.setStyle(TableStyle([
-            ("LEFTPADDING",   (0, 0), (0, 0), lpad),
-            ("RIGHTPADDING",  (-1, 0), (-1, 0), 12),
-            ("TOPPADDING",    (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ("LINEBELOW",     (0, 0), (-1, -1), 0.25, BORDER),
-            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-        ]))
-        story.append(tbl)
+    xau_trades: List[Dict] = []
+    fx_trades: List[Dict] = []
+    all_pmx: List[Dict] = []
+    for _, r in st_df.iterrows():
+        sym = _sym(r.get("Symbol"))
+        side = str(r.get("Side", "")).upper().strip()
+        qty = abs(_n(r.get("Quantity")) or 0.0)
+        price = _n(r.get("Price"))
+        if qty <= 0:
+            continue
+        notional = (qty * price) if price is not None else None
+        info = {
+            "sym": sym, "side": side, "qty": qty, "price": price, "notional": notional,
+            "trade_date": str(r.get("Trade Date") or ""),
+            "value_date": str(r.get("Value Date") or ""),
+            "fnc": str(r.get("FNC #") or ""),
+            "doc": str(r.get("Doc #") or ""),
+            "narration": str(r.get("Narration") or ""),
+            "settle_ccy": str(r.get("Settle Currency") or ""),
+            "settle_amt": _n(r.get("Settle Amount")),
+        }
+        all_pmx.append(info)
+        if sym == "XAUUSD":
+            xau_trades.append(info)
+        elif sym == "USDZAR":
+            fx_trades.append(info)
 
-    def _audit_sub_title(title: str):
-        """Sub-section title with copper left accent."""
-        tbl = Table([[Paragraph(
-            f"<font name='{FONT_BOLD}' size='8' color='#2A2A2A'>{_esc(title)}</font>",
-            _ps("_ast", fontName=FONT_BOLD, fontSize=8, textColor=CHARCOAL),
-        )]], colWidths=[PW])
-        tbl.setStyle(TableStyle([
-            ("LEFTPADDING",   (0, 0), (-1, -1), 12),
-            ("TOPPADDING",    (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ("BACKGROUND",    (0, 0), (-1, -1), LIGHT_GREY),
-            ("LINEBEFORE",    (0, 0), (0, 0), 2.5, COPPER),
-            ("LINEBELOW",     (0, 0), (-1, -1), 0.3, BORDER),
-        ]))
-        story.append(tbl)
+    # Weighted averages
+    gold_tot_not = sum(t["notional"] or 0 for t in xau_trades)
+    gold_tot_qty = sum(t["qty"] for t in xau_trades)
+    gold_wa = (gold_tot_not / gold_tot_qty) if gold_tot_qty > 1e-9 else None
 
-    _pos_st = _ps("_pos", fontName=FONT_BOLD, fontSize=8.5, textColor=GREEN,  alignment=TA_RIGHT)
-    _neg_st = _ps("_neg", fontName=FONT_BOLD, fontSize=8.5, textColor=RED_C,  alignment=TA_RIGHT)
+    fx_tot_not = sum(t["notional"] or 0 for t in fx_trades)
+    fx_tot_qty = sum(t["qty"] for t in fx_trades)
+    fx_wa = (fx_tot_not / fx_tot_qty) if fx_tot_qty > 1e-9 else None
 
-    def _data_tbl(col_names, col_pcts, rows, right_cols=None, profit_col=None, totals=None):
-        """Professional striped data table with navy header and copper accents."""
-        right_cols = right_cols or []
-        if not rows:
-            story.append(Paragraph(
-                "<font color='#999999'>\u00a0\u00a0No data available for this section.</font>",
-                _ps("_nd", textColor=MID_GREY, fontSize=8),
-            ))
-            story.append(Spacer(1, 5 * mm))
-            return
+    spot_zar_g = (gold_wa * fx_wa) / TROY_OZ if gold_wa and fx_wa else None
 
-        cw = [PW * p for p in col_pcts]
-
-        hdr_row = [
-            Paragraph(
-                _esc(col),
-                _ps(f"_th", fontName=FONT_BOLD, fontSize=7.5, leading=10,
-                    textColor=CREAM_TXT, alignment=TA_RIGHT if ci in right_cols else TA_CENTER),
-            )
-            for ci, col in enumerate(col_names)
-        ]
-        tdata = [hdr_row]
-
-        for row in rows:
-            cells = []
-            for ci, col in enumerate(col_names):
-                raw = row.get(col, "")
-                txt = _esc(_s(raw)) if raw != "" else "\u2014"
-                if col == profit_col:
-                    nv = _n(raw)
-                    cells.append(Paragraph(
-                        txt if txt != "\u2014" else "",
-                        _pos_st if (nv is not None and nv >= 0) else _neg_st,
-                    ))
-                elif ci in right_cols:
-                    cells.append(Paragraph(txt, _ps(f"_tdr", fontSize=8, alignment=TA_RIGHT)))
-                else:
-                    cells.append(Paragraph(_esc(_tr(_s(raw), 42)), _ps(f"_td", fontSize=8)))
-            tdata.append(cells)
-
-        if totals:
-            tot_cells = []
-            for ci, col in enumerate(col_names):
-                raw = totals.get(col, "")
-                txt = _esc(_s(raw)) if raw != "" else ""
-                tot_cells.append(Paragraph(txt, _ps(
-                    f"_tot", fontName=FONT_BOLD, fontSize=8.5,
-                    alignment=TA_RIGHT if ci in right_cols else TA_LEFT,
-                )))
-            tdata.append(tot_cells)
-
-        tbl = Table(tdata, colWidths=cw, repeatRows=1)
-        ts = TableStyle([
-            ("BACKGROUND",    (0, 0), (-1, 0), NAVY),
-            ("LINEBELOW",     (0, 0), (-1, 0), 2.5, COPPER),
-            ("TOPPADDING",    (0, 0), (-1, 0), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
-            ("TOPPADDING",    (0, 1), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 1), (-1, -1), 5),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 8),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
-            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-            ("LINEBELOW",     (0, 1), (-1, -1), 0.3, BORDER),
-        ])
-        for ri in range(1, len(tdata)):
-            if totals and ri == len(tdata) - 1:
-                ts.add("BACKGROUND", (0, ri), (-1, ri), COPPER_LT)
-                ts.add("LINEABOVE",  (0, ri), (-1, ri), 1.5, COPPER)
-                ts.add("LINEBELOW",  (0, ri), (-1, ri), 1.5, COPPER)
-            else:
-                ts.add("BACKGROUND", (0, ri), (-1, ri), ROW_ALT if ri % 2 == 0 else WHITE)
-        tbl.setStyle(ts)
-        story.append(tbl)
-        story.append(Spacer(1, 5 * mm))
-
-    # ════════════════════════════════════════════════════════════
-    # PRE-COMPUTE ALL AUDIT TRAIL DATA
-    # ════════════════════════════════════════════════════════════
-    tm_pdf = trademc_rows.copy() if trademc_rows is not None else pd.DataFrame()
-    stx_pdf = stonex_rows.copy() if stonex_rows is not None else pd.DataFrame()
-    sum_pdf = summary_rows.copy() if summary_rows is not None else pd.DataFrame()
-
-    # -- TradeMC bookings with refining --
-    bookings = []
-    tm_total_g = tm_total_oz = tm_total_usd = tm_total_zar_gross = tm_total_zar_net = 0.0
-    if not tm_pdf.empty:
-        for _, r in tm_pdf.iterrows():
-            weight_g = _n(r.get("Weight (g)")) or 0.0
-            weight_oz = _n(r.get("Weight (oz)")) or (weight_g / 31.1035)
-            booked_price = _n(r.get("$/oz Booked"))
-            fx_rate = _n(r.get("FX Rate"))
-            usd_val_raw = _n(r.get("USD Value"))
-            usd_val = usd_val_raw if usd_val_raw is not None else (
-                weight_oz * booked_price if booked_price is not None else None)
-            zar_gross_raw = _n(r.get("ZAR Value"))
-            zar_gross = zar_gross_raw if zar_gross_raw is not None else (
-                usd_val * fx_rate if usd_val is not None and fx_rate is not None else None)
-            refining_rate = _n(r.get("company_refining_rate")) or 0.0
-            refining_deduction = zar_gross * (refining_rate / 100.0) if zar_gross is not None else None
-            zar_net_raw = _n(r.get("zar_value_less_refining"))
-            zar_net = zar_net_raw if zar_net_raw is not None else (
-                zar_gross * (1.0 - refining_rate / 100.0) if zar_gross is not None else None)
-            company = _s(r.get("Company")) or _s(r.get("company_name")) or "Unknown"
-            bookings.append({
-                "company": company, "weight_g": weight_g, "weight_oz": weight_oz,
-                "booked_price": booked_price, "fx_rate": fx_rate,
-                "usd_value": usd_val, "zar_gross": zar_gross,
-                "refining_rate": refining_rate, "refining_deduction": refining_deduction,
-                "zar_net": zar_net,
-            })
-            tm_total_g += weight_g
-            tm_total_oz += weight_oz
-            tm_total_usd += usd_val or 0.0
-            tm_total_zar_gross += zar_gross or 0.0
-            tm_total_zar_net += zar_net or 0.0
-
-    # -- StoneX trade classification --
-    xau_trades = []
-    fx_trades = []
-    all_pmx = []
-    if not stx_pdf.empty:
-        for _, r in stx_pdf.iterrows():
-            sym = str(r.get("Symbol", "")).upper().replace("/", "").replace("-", "").replace(" ", "")
-            side = str(r.get("Side", "")).upper().strip()
-            qty = abs(_n(r.get("Quantity")) or 0.0)
-            price = _n(r.get("Price"))
-            notional = qty * price if price is not None and qty > 0 else None
-            trade_info = {"symbol": sym, "side": side, "qty": qty, "price": price,
-                          "notional": notional,
-                          "trade_date": _s(r.get("Trade Date")),
-                          "value_date": _s(r.get("Value Date")),
-                          "fnc": _s(r.get("FNC #")), "narration": _s(r.get("Narration"))}
-            if qty > 0:
-                all_pmx.append(trade_info)
-                if sym == "XAUUSD":
-                    xau_trades.append(trade_info)
-                elif sym == "USDZAR":
-                    fx_trades.append(trade_info)
-
-    # -- Weighted averages --
-    gold_wa_total_notional = sum(t["notional"] or 0 for t in xau_trades)
-    gold_wa_total_qty = sum(t["qty"] for t in xau_trades)
-    gold_wa = gold_wa_total_notional / gold_wa_total_qty if gold_wa_total_qty > 1e-9 else None
-
-    fx_wa_total_notional = sum(t["notional"] or 0 for t in fx_trades)
-    fx_wa_total_qty = sum(t["qty"] for t in fx_trades)
-    fx_wa = fx_wa_total_notional / fx_wa_total_qty if fx_wa_total_qty > 1e-9 else None
-
-    # -- Spot ZAR/g --
-    spot_zar_per_g = (gold_wa * fx_wa) / 31.1035 if gold_wa and fx_wa else None
-
-    # -- Cash flows --
-    xau_cash_flows = []
-    net_stonex_usd = 0.0
+    # Cash flows
+    xau_cfs: List[Dict] = []
+    net_usd = 0.0
     for t in xau_trades:
         signed = None
         if t["notional"] is not None:
             signed = t["notional"] if t["side"] == "SELL" else -t["notional"]
-        xau_cash_flows.append({**t, "signed": signed})
-        net_stonex_usd += signed or 0.0
+        xau_cfs.append({**t, "signed": signed})
+        net_usd += signed or 0.0
 
-    # -- Summary data --
-    base = sum_pdf.iloc[0].to_dict() if not sum_pdf.empty else {}
+    # Summary
+    base = sum_df.iloc[0].to_dict() if not sum_df.empty else {}
     sell_usd = _n(base.get("Sell Side (USD)"))
     buy_usd = _n(base.get("Buy Side (USD)"))
     sell_zar = _n(base.get("Sell Side (ZAR)"))
@@ -489,16 +197,16 @@ def build_trading_ticket_pdf(trade_num_value: str,
     ctrl_g = _n(base.get("Control Account (g)"))
     ctrl_oz = _n(base.get("Control Account (oz)"))
     ctrl_zar = _n(base.get("Control Account (ZAR)"))
-    total_traded_g = _n(base.get("Total Traded (g)"))
-    total_traded_oz = _n(base.get("Total Traded (oz)"))
-    stonex_zar_flow = _n(base.get("StoneX ZAR Flow"))
-    sum_gold_wa = _n(base.get("Gold WA $/oz"))
-    sum_fx_wa = _n(base.get("FX WA USD/ZAR"))
-    sum_spot_zar_g = _n(base.get("Spot ZAR/g"))
+    traded_g = _n(base.get("Total Traded (g)"))
+    traded_oz = _n(base.get("Total Traded (oz)"))
+    stx_zar_flow = _n(base.get("StoneX ZAR Flow"))
+    s_gold_wa = _n(base.get("Gold WA $/oz"))
+    s_fx_wa = _n(base.get("FX WA USD/ZAR"))
+    s_spot = _n(base.get("Spot ZAR/g"))
 
-    gold_wa_display = sum_gold_wa if sum_gold_wa is not None else gold_wa
-    fx_wa_display = sum_fx_wa if sum_fx_wa is not None else fx_wa
-    spot_display = sum_spot_zar_g if sum_spot_zar_g is not None else spot_zar_per_g
+    gold_wa_d = s_gold_wa if s_gold_wa is not None else gold_wa
+    fx_wa_d = s_fx_wa if s_fx_wa is not None else fx_wa
+    spot_d = s_spot if s_spot is not None else spot_zar_g
 
     if profit_zar is None and sell_zar is not None and buy_zar is not None:
         profit_zar = sell_zar - buy_zar
@@ -507,447 +215,650 @@ def build_trading_ticket_pdf(trade_num_value: str,
     if profit_pct is None and profit_zar is not None and buy_zar and abs(buy_zar) > 1e-12:
         profit_pct = (profit_zar / buy_zar) * 100.0
     if ctrl_oz is None and ctrl_g is not None:
-        ctrl_oz = ctrl_g / 31.1035
-    if total_traded_oz is None and total_traded_g is not None:
-        total_traded_oz = total_traded_g / 31.1035
+        ctrl_oz = ctrl_g / TROY_OZ
+    if traded_oz is None and traded_g is not None:
+        traded_oz = traded_g / TROY_OZ
+    stonex_g = traded_g or (traded_oz * TROY_OZ if traded_oz else None)
 
-    stonex_g = total_traded_g or (total_traded_oz * 31.1035 if total_traded_oz else None)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PDF SETUP
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    pdf = FPDF("L", "mm", "A4")
+    pdf.set_auto_page_break(True, margin=16)
+    LM = 16.0
+    RM = 16.0
+    PW = 297.0
+    W = PW - LM - RM
+    now_str = datetime.now().strftime("%d %B %Y  %H:%M")
 
-    # ════════════════════════════════════════════════════════════
-    # SECTION 1 - EXECUTIVE SUMMARY (KPI dashboard)
-    # ════════════════════════════════════════════════════════════
-    _sec_lbl("Executive Summary",
+    # ── Page footer via alias_nb_pages ───────────────────────────
+    class TicketPDF(FPDF):
+        def footer(self):
+            self.set_y(-12)
+            self.set_draw_color(*GOLD_MD)
+            self.set_line_width(0.2)
+            self.line(LM, self.get_y(), PW - RM, self.get_y())
+            self.set_y(-10)
+            self.set_font("Arial", "", 6)
+            self.set_text_color(*LIGHT)
+            self.cell(W / 2, 4, _t(f"Metal Concentrators SA  |  Confidential  |  Trade #{trade_num_value}"),
+                      0, 0, "L")
+            self.cell(W / 2, 4, _t(f"Generated {now_str}  |  Page {self.page_no()}/{{nb}}"),
+                      0, 0, "R")
+
+    pdf = TicketPDF("L", "mm", "A4")
+    pdf.alias_nb_pages()
+    pdf.set_auto_page_break(True, margin=16)
+    pdf.set_left_margin(LM)
+    pdf.set_right_margin(RM)
+    pdf.add_page()
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  LAYOUT COMPONENTS
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _check_space(needed: float = 25.0):
+        """Add page if not enough vertical space."""
+        if pdf.get_y() > (210 - 16 - needed):
+            pdf.add_page()
+
+    def _header_block():
+        """Page header with logo, title, and double rule."""
+        logo = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "MetCon Logo.png",
+        )
+        if os.path.isfile(logo):
+            try:
+                pdf.image(logo, x=LM, y=10, w=48, h=12)
+            except Exception:
+                pass
+
+        # Right-aligned title block
+        rx = PW / 2
+        rw = PW / 2 - RM
+        pdf.set_xy(rx, 10)
+        pdf.set_text_color(*GOLD)
+        pdf.set_font("Arial", "B", 6.8)
+        pdf.cell(rw, 3.5, _t("METAL CONCENTRATORS SA"), 0, 2, "R")
+        pdf.set_text_color(*CHARCOAL)
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(rw, 6.8, _t("Trading Ticket Report"), 0, 2, "R")
+        pdf.set_text_color(*GOLD)
+        pdf.set_font("Arial", "B", 9.8)
+        pdf.cell(rw, 4.2, _t(f"Trade #{trade_num_value}"), 0, 2, "R")
+        pdf.set_text_color(*LIGHT)
+        pdf.set_font("Arial", "", 6.5)
+        pdf.cell(rw, 3.5, _t(f"Generated {now_str}"), 0, 1, "R")
+
+        y = pdf.get_y() + 1.6
+        pdf.set_draw_color(*GOLD)
+        pdf.set_line_width(0.5)
+        pdf.line(LM, y, LM + W, y)
+        pdf.set_draw_color(*GOLD_MD)
+        pdf.set_line_width(0.15)
+        pdf.line(LM, y + 1, LM + W, y + 1)
+        pdf.set_y(y + 4.4)
+
+    def _section(title: str, subtitle: str = ""):
+        """Section header with clean accent and softer spacing."""
+        _check_space(20)
+        y = pdf.get_y()
+        h = 8.5
+        pdf.set_fill_color(*GOLD_LT)
+        pdf.rect(LM, y, W, h, style="F")
+        pdf.set_fill_color(*GOLD)
+        pdf.rect(LM, y, 2.6, h, style="F")
+        pdf.set_draw_color(*BORDER)
+        pdf.set_line_width(0.12)
+        pdf.rect(LM, y, W, h, style="D")
+        pdf.set_xy(LM + 6, y + 1.9)
+        pdf.set_text_color(*CHARCOAL)
+        pdf.set_font("Arial", "B", 9.2)
+        pdf.cell(W - 8, 4, _t(title), 0, 1, "L")
+        pdf.set_y(y + h + 1.2)
+        if subtitle:
+            pdf.set_text_color(*LIGHT)
+            pdf.set_font("Arial", "", 6.6)
+            pdf.multi_cell(W, 3.5, _t(subtitle), 0, "L")
+        pdf.ln(2.2)
+
+    def _step(num: str, title: str, subtitle: str = ""):
+        """Numbered audit step header."""
+        _check_space(20)
+        y = pdf.get_y()
+        badge_w = 16
+        pdf.set_fill_color(*GOLD_DK)
+        pdf.rect(LM, y, badge_w, 6.6, style="F")
+        pdf.set_xy(LM, y + 1.0)
+        pdf.set_text_color(*WHITE)
+        pdf.set_font("Arial", "B", 8.5)
+        pdf.cell(badge_w, 4.2, _t(num), 0, 0, "C")
+        pdf.set_xy(LM + badge_w + 3.4, y + 0.7)
+        pdf.set_text_color(*CHARCOAL)
+        pdf.set_font("Arial", "B", 9.4)
+        pdf.cell(W - badge_w - 3.4, 5, _t(title), 0, 1, "L")
+        pdf.set_y(y + 7.2)
+        if subtitle:
+            pdf.set_text_color(*MID)
+            pdf.set_font("Arial", "", 6.6)
+            pdf.multi_cell(W, 3.5, _t(subtitle), 0, "L")
+        pdf.set_draw_color(*BORDER)
+        pdf.set_line_width(0.1)
+        pdf.line(LM, pdf.get_y() + 1.0, LM + W, pdf.get_y() + 1.0)
+        pdf.ln(3.8)
+
+    def _kv(label: str, value: str, bold_val: bool = True,
+            val_color=None, indent: int = 0):
+        """Key-value row with cleaner spacing."""
+        _check_space(6.5)
+        vc = val_color or DARK
+        lpad = LM + indent * 12
+        label_w = W * 0.55 - indent * 12
+        val_w = W * 0.45
+
+        pdf.set_text_color(*MID)
+        pdf.set_font("Arial", "", 7.2)
+        pdf.set_x(lpad)
+        pdf.cell(label_w, 4.8, _t(label), 0, 0, "L")
+
+        pdf.set_text_color(*vc)
+        pdf.set_font("Arial", "B" if bold_val else "", 7.4)
+        pdf.cell(val_w, 4.8, _t(value), 0, 1, "R")
+        pdf.ln(0.35)
+
+    def _formula(label: str, formula: str, result: str,
+                 val_color=None, indent: int = 0):
+        """Three-part row: label | formula -> | result."""
+        _check_space(6.5)
+        vc = val_color or DARK
+        lpad = LM + indent * 12
+        lw = W * 0.28 - indent * 12
+        fw = W * 0.42
+        rw = W * 0.30
+
+        pdf.set_text_color(*MID)
+        pdf.set_font("Arial", "", 7.0)
+        pdf.set_x(lpad)
+        pdf.cell(lw, 4.8, _t(label), 0, 0, "L")
+
+        pdf.set_text_color(*LIGHT)
+        pdf.set_font("Arial", "I", 6.0)
+        pdf.cell(fw, 4.8, _t(f"{formula}  ->"), 0, 0, "R")
+
+        pdf.set_text_color(*vc)
+        pdf.set_font("Arial", "B", 7.4)
+        pdf.cell(rw, 4.8, _t(result), 0, 1, "R")
+        pdf.ln(0.35)
+
+    def _sub_title(title: str):
+        """Sub-section title with left accent."""
+        _check_space(9)
+        y = pdf.get_y()
+        pdf.set_fill_color(*GOLD)
+        pdf.rect(LM, y, 2, 5.6, style="F")
+        pdf.set_fill_color(247, 241, 232)
+        pdf.rect(LM + 2, y, W - 2, 5.6, style="F")
+        pdf.set_xy(LM + 6, y + 1.1)
+        pdf.set_text_color(*DARK)
+        pdf.set_font("Arial", "B", 7.3)
+        pdf.cell(W - 8, 3.4, _t(title), 0, 1, "L")
+        pdf.set_y(y + 6.6)
+
+    def _table(headers: List[str], rows: List[List[str]],
+               col_pcts: List[float], right_cols: Optional[List[int]] = None):
+        """Clean data table with compact rows and readable striping."""
+        right_cols = right_cols or []
+        widths = [W * p for p in col_pcts]
+
+        if not rows:
+            pdf.set_text_color(*LIGHT)
+            pdf.set_font("Arial", "I", 7.5)
+            pdf.cell(W, 5, _t("No data available."), 0, 1, "L")
+            pdf.ln(3)
+            return
+
+        def _draw_header():
+            _check_space(12)
+            pdf.set_fill_color(*DARK)
+            pdf.set_text_color(*WHITE)
+            pdf.set_font("Arial", "B", 6.4)
+            for i, h in enumerate(headers):
+                align = "R" if i in right_cols else "C"
+                pdf.cell(widths[i], 6.6, _t(h), 0, 0, align, True)
+            pdf.ln()
+            pdf.set_draw_color(*GOLD)
+            pdf.set_line_width(0.32)
+            pdf.line(LM, pdf.get_y(), LM + W, pdf.get_y())
+            pdf.ln(0.3)
+
+        _draw_header()
+        for ri, row in enumerate(rows):
+            if pdf.get_y() > 190:
+                pdf.add_page()
+                _draw_header()
+            bg = WHITE if ri % 2 == 0 else STRIPE
+            pdf.set_fill_color(*bg)
+            pdf.set_text_color(*DARK)
+            pdf.set_font("Arial", "", 6.9)
+            for ci, cell in enumerate(row):
+                align = "R" if ci in right_cols else "L"
+                col_name = str(headers[ci]).strip().upper() if ci < len(headers) else ""
+                # Truncate long text, but preserve audit identifiers like FNC numbers.
+                if col_name in {"FNC #", "DOC #"}:
+                    max_chars = max(18, int(widths[ci] / 1.35))
+                else:
+                    max_chars = max(6, int(widths[ci] / 1.92))
+                txt = _t(cell)
+                if len(txt) > max_chars:
+                    txt = txt[:max_chars - 3] + "..."
+                pdf.cell(widths[ci], 5.4, txt, 0, 0, align, True)
+            pdf.ln()
+            pdf.set_draw_color(*BORDER_SOFT)
+            pdf.set_line_width(0.05)
+            pdf.line(LM, pdf.get_y(), LM + W, pdf.get_y())
+        pdf.ln(2.8)
+
+    def _totals_table(headers: List[str], row: List[str],
+                      col_pcts: List[float], right_cols: Optional[List[int]] = None):
+        """Single totals row with gold background."""
+        right_cols = right_cols or []
+        widths = [W * p for p in col_pcts]
+        pdf.set_draw_color(*GOLD)
+        pdf.set_line_width(0.3)
+        pdf.line(LM, pdf.get_y(), LM + W, pdf.get_y())
+        pdf.ln(0.3)
+        pdf.set_fill_color(246, 239, 228)
+        pdf.set_text_color(*CHARCOAL)
+        pdf.set_font("Arial", "B", 7.0)
+        for ci, cell in enumerate(row):
+            align = "R" if ci in right_cols else "L"
+            pdf.cell(widths[ci], 6.2, _t(cell), 0, 0, align, True)
+        pdf.ln()
+        pdf.set_draw_color(*GOLD)
+        pdf.line(LM, pdf.get_y(), LM + W, pdf.get_y())
+        pdf.ln(3.5)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  PAGE 1 — HEADER
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    _header_block()
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  EXECUTIVE SUMMARY — KPI Cards
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    _section("Executive Summary",
              "Key performance indicators for this trade at a glance.")
 
-    # -- Primary KPI cards --
-    def _make_kpi_card(label: str, value: str, bg_color=WHITE,
-                       value_color=CHARCOAL, border_color=BORDER,
-                       accent_color=COPPER):
-        lbl_p = Paragraph(
-            f"<font name='{FONT_BOLD}' size='6.5' color='#777777'>{_esc(label.upper())}</font>",
-            _ps("_kl", fontName=FONT_BOLD, fontSize=6.5, textColor=MID_GREY,
-                alignment=TA_CENTER, leading=9),
-        )
-        val_p = Paragraph(
-            f"<font name='{FONT_BOLD}' size='13'>{_esc(value)}</font>",
-            _ps("_kv", fontName=FONT_BOLD, fontSize=13, leading=17,
-                textColor=value_color, alignment=TA_CENTER),
-        )
-        card = Table([[lbl_p], [val_p]], colWidths=[PW / 4 - 5 * mm])
-        card.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (-1, -1), bg_color),
-            ("BOX",           (0, 0), (-1, -1), 0.5, border_color),
-            ("LINEABOVE",     (0, 0), (-1, 0), 3, accent_color),
-            ("TOPPADDING",    (0, 0), (-1, 0),  8),
-            ("BOTTOMPADDING", (0, -1), (-1, -1), 10),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 8),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
-            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-        ]))
-        return card
+    def _kpi_card(x: float, y: float, width: float, label: str, value: str,
+                  accent=GOLD, val_color=CHARCOAL, bg=WHITE):
+        h = 19.5
+        # Background
+        pdf.set_fill_color(*bg)
+        pdf.rect(x, y, width, h, style="F")
+        # Top accent
+        pdf.set_fill_color(*accent)
+        pdf.rect(x, y, width, 1.8, style="F")
+        # Border
+        pdf.set_draw_color(*BORDER)
+        pdf.set_line_width(0.15)
+        pdf.rect(x, y, width, h, style="D")
+        # Label
+        pdf.set_xy(x, y + 2.8)
+        pdf.set_text_color(*LIGHT)
+        pdf.set_font("Arial", "B", 5.8)
+        pdf.cell(width, 3, _t(label.upper()), 0, 0, "C")
+        # Value
+        pdf.set_xy(x, y + 8.3)
+        pdf.set_text_color(*val_color)
+        pdf.set_font("Arial", "B", 10.8)
+        pdf.cell(width, 5, _t(value), 0, 0, "C")
 
-    profit_color = GREEN if (profit_zar is not None and profit_zar >= 0) else RED_C
-    profit_bg = GREEN_LT if (profit_zar is not None and profit_zar >= 0) else RED_LT
+    card_w = (W - 12) / 4
+    card_gap = 4
+    p_clr = GREEN if (profit_zar is not None and profit_zar >= 0) else RED
+    p_bg = GREEN_BG if (profit_zar is not None and profit_zar >= 0) else RED_BG
 
-    kpi_row = [
-        _make_kpi_card("Total Weight Traded",
-                       _grams(stonex_g)),
-        _make_kpi_card("Gold WA Price",
-                       _money(gold_wa_display, "$", 3) + "/oz" if gold_wa_display else "\u2014"),
-        _make_kpi_card("Weighted Avg FX Rate",
-                       f"R\u00a0{fx_wa_display:,.4f}" if fx_wa_display else "\u2014"),
-        _make_kpi_card("Net Profit (ZAR)",
-                       _money(profit_zar, "R\u00a0"),
-                       bg_color=profit_bg, value_color=profit_color,
-                       border_color=profit_color, accent_color=profit_color),
-    ]
-    kpi_table = Table([kpi_row], colWidths=[PW / 4] * 4)
-    kpi_table.setStyle(TableStyle([
-        ("LEFTPADDING",   (0, 0), (-1, -1), 2),
-        ("RIGHTPADDING",  (0, 0), (-1, -1), 2),
-        ("TOPPADDING",    (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
-    ]))
-    story.append(kpi_table)
-    story.append(Spacer(1, 3 * mm))
+    kpi_y = pdf.get_y()
+    _kpi_card(LM, kpi_y, card_w, "Total Weight Traded", _grams(stonex_g))
+    _kpi_card(LM + card_w + card_gap, kpi_y, card_w, "Gold WA Price",
+              (_money(gold_wa_d, "$", 3) + "/oz") if gold_wa_d else "--")
+    _kpi_card(LM + 2 * (card_w + card_gap), kpi_y, card_w, "Weighted Avg FX",
+              f"R {fx_wa_d:,.4f}" if fx_wa_d else "--")
+    _kpi_card(LM + 3 * (card_w + card_gap), kpi_y, card_w, "Net Profit (ZAR)",
+              _money(profit_zar, "R ", 2), accent=p_clr, val_color=p_clr, bg=p_bg)
+    pdf.set_y(kpi_y + 22.2)
 
-    # -- Secondary metrics row --
-    kpi_row2_items = []
-    if spot_display is not None:
-        kpi_row2_items.append(("Implied Spot ZAR/g", f"R\u00a0{spot_display:,.4f}"))
-    if stonex_zar_flow is not None:
-        kpi_row2_items.append(("StoneX ZAR Inflow", _money(stonex_zar_flow, "R\u00a0")))
+    # Secondary metrics
+    sec: List[tuple] = []
+    if spot_d is not None:
+        sec.append(("Implied Spot ZAR/g", f"R {spot_d:,.4f}"))
+    if stx_zar_flow is not None:
+        sec.append(("StoneX ZAR Inflow", _money(stx_zar_flow, "R ", 2)))
     if sell_usd is not None:
-        kpi_row2_items.append(("Sell Side (USD)", _money(sell_usd, "$")))
+        sec.append(("Sell Side (USD)", _money(sell_usd, "$", 2)))
     if buy_usd is not None:
-        kpi_row2_items.append(("Buy Side (USD)", _money(buy_usd, "$")))
+        sec.append(("Buy Side (USD)", _money(buy_usd, "$", 2)))
+    if sell_zar is not None:
+        sec.append(("Sell Side (ZAR)", _money(sell_zar, "R ", 2)))
+    if buy_zar is not None:
+        sec.append(("Buy Side (ZAR)", _money(buy_zar, "R ", 2)))
+    if profit_usd is not None:
+        sec.append(("Profit (USD)", _money(profit_usd, "$", 2)))
     if profit_pct is not None:
-        kpi_row2_items.append(("Profit Margin", _pct(profit_pct, 3)))
+        sec.append(("Profit Margin", _pct(profit_pct, 3)))
     if ctrl_g is not None:
-        kpi_row2_items.append(("Control Account", _grams(ctrl_g)))
+        sec.append(("Control Account", _grams(ctrl_g)))
+    if ctrl_zar is not None:
+        sec.append(("Control (ZAR)", _money(ctrl_zar, "R ", 2)))
 
-    if kpi_row2_items:
-        n_items = len(kpi_row2_items)
-        cw_each = PW / max(n_items, 1)
-        lbl_cells = []
-        val_cells = []
-        for lbl, val in kpi_row2_items:
-            lbl_cells.append(Paragraph(
-                f"<font name='{FONT_BOLD}' size='6' color='#999999'>{_esc(lbl.upper())}</font>",
-                _ps("_k2l", fontName=FONT_BOLD, fontSize=6, textColor=MID_GREY,
-                    alignment=TA_CENTER, leading=8),
-            ))
-            val_cells.append(Paragraph(
-                f"<font name='{FONT_BOLD}' size='9.5'>{_esc(val)}</font>",
-                _ps("_k2v", fontName=FONT_BOLD, fontSize=9.5, leading=13,
-                    textColor=CHARCOAL, alignment=TA_CENTER),
-            ))
-        k2_tbl = Table([lbl_cells, val_cells], colWidths=[cw_each] * n_items)
-        k2_tbl.setStyle(TableStyle([
-            ("TOPPADDING",    (0, 0), (-1, 0), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 3),
-            ("TOPPADDING",    (0, 1), (-1, 1), 3),
-            ("BOTTOMPADDING", (0, 1), (-1, 1), 7),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
-            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-            ("BOX",           (0, 0), (-1, -1), 0.3, BORDER),
-            ("LINEBELOW",     (0, 0), (-1, 0),  0.3, BORDER),
-            ("LINEBEFORE",    (1, 0), (-1, -1), 0.3, BORDER),
-            ("BACKGROUND",    (0, 0), (-1, -1), LIGHT_GREY),
-        ]))
-        story.append(k2_tbl)
-    story.append(Spacer(1, 7 * mm))
+    if sec:
+        per_row = min(len(sec), 6)
+        cell_w = W / per_row
+        for chunk_i in range(0, len(sec), per_row):
+            chunk = sec[chunk_i:chunk_i + per_row]
+            n = len(chunk)
+            cw = W / n
+            y = pdf.get_y()
+            pdf.set_fill_color(*STRIPE)
+            pdf.rect(LM, y, W, 10, style="F")
+            pdf.set_draw_color(*BORDER)
+            pdf.set_line_width(0.1)
+            pdf.rect(LM, y, W, 10, style="D")
+            for i, (lbl, val) in enumerate(chunk):
+                x = LM + i * cw
+                if i > 0:
+                    pdf.line(x, y, x, y + 10)
+                pdf.set_xy(x, y + 1)
+                pdf.set_text_color(*LIGHT)
+                pdf.set_font("Arial", "B", 5)
+                pdf.cell(cw, 3, _t(lbl.upper()), 0, 0, "C")
+                pdf.set_xy(x, y + 4.5)
+                pdf.set_text_color(*DARK)
+                pdf.set_font("Arial", "B", 8)
+                pdf.cell(cw, 4, _t(val), 0, 0, "C")
+            pdf.set_y(y + 11.5)
+    pdf.ln(4)
 
-    # ════════════════════════════════════════════════════════════
-    # SECTION 2 - CLIENT BOOKINGS (Buy Side)
-    # ════════════════════════════════════════════════════════════
-    _sec_lbl("Client Bookings \u2014 Buy Side",
-             "Gold purchased from TradeMC clients, valued in USD and converted to ZAR with refining deductions applied.")
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  CLIENT BOOKINGS TABLE
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    _section("Client Bookings - Buy Side",
+             "Gold purchased from TradeMC clients, valued in USD and "
+             "converted to ZAR with refining deductions applied.")
 
-    TM_COLS = ["Company", "Weight (g)", "Weight (oz)", "$/oz Booked", "FX Rate",
-               "USD Value", "ZAR Gross", "Refining %", "ZAR Net"]
-    _TM_W = {"Company": 0.19, "Weight (g)": 0.09, "Weight (oz)": 0.09,
-             "$/oz Booked": 0.10, "FX Rate": 0.09, "USD Value": 0.11,
-             "ZAR Gross": 0.11, "Refining %": 0.09, "ZAR Net": 0.13}
+    tm_headers = ["Company", "Weight (g)", "Weight (oz)", "$/oz Booked",
+                   "FX Rate", "USD Value", "ZAR Gross", "Refining %", "ZAR Net"]
+    tm_pcts = [0.17, 0.09, 0.09, 0.10, 0.09, 0.11, 0.12, 0.09, 0.14]
+    tm_right = list(range(1, 9))
 
-    tm_table_rows = []
+    tm_rows = []
     for b in bookings:
-        tm_table_rows.append({
-            "Company": b["company"],
-            "Weight (g)": _f(b["weight_g"], 2),
-            "Weight (oz)": _f(b["weight_oz"], 4),
-            "$/oz Booked": _f(b["booked_price"], 2),
-            "FX Rate": _f(b["fx_rate"], 4),
-            "USD Value": _f(b["usd_value"], 2),
-            "ZAR Gross": _f(b["zar_gross"], 2),
-            "Refining %": _pct(b["refining_rate"]),
-            "ZAR Net": _f(b["zar_net"], 2),
-        })
-    tm_right = list(range(1, len(TM_COLS)))
-    tm_wids = [_TM_W[c] for c in TM_COLS]
+        tm_rows.append([
+            _t(b["company"]), _f(b["wg"]), _f(b["woz"], 4), _f(b["bp"]),
+            _f(b["fx"], 4), _f(b["usd"]), _f(b["zg"]),
+            _pct(b["rr"]), _f(b["zn"]),
+        ])
+    _table(tm_headers, tm_rows, tm_pcts, right_cols=tm_right)
 
-    tm_totals_row = {
-        "Company": "TOTAL",
-        "Weight (g)": f"{tm_total_g:,.2f}",
-        "Weight (oz)": f"{tm_total_oz:,.4f}",
-        "USD Value": f"{tm_total_usd:,.2f}",
-        "ZAR Gross": f"{tm_total_zar_gross:,.2f}",
-        "ZAR Net": f"{tm_total_zar_net:,.2f}",
-    } if bookings else None
+    if bookings:
+        _totals_table(tm_headers, [
+            "TOTAL", _f(tm_tot["g"]), _f(tm_tot["oz"], 4), "", "",
+            _f(tm_tot["usd"]), _f(tm_tot["zar_gross"]), "",
+            _f(tm_tot["zar_net"]),
+        ], tm_pcts, right_cols=tm_right)
 
-    _data_tbl(TM_COLS, tm_wids, tm_table_rows,
-              right_cols=tm_right, totals=tm_totals_row)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  STONEX / PMX TRADES TABLE
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    _section("StoneX / PMX Trades - Sell Side",
+             "Gold sold and FX hedged through StoneX, generating USD "
+             "and ZAR proceeds to settle client bookings.")
 
-    # ════════════════════════════════════════════════════════════
-    # SECTION 3 - PMX / STONEX TRADES (Sell Side)
-    # ════════════════════════════════════════════════════════════
-    _sec_lbl("StoneX / PMX Trades \u2014 Sell Side",
-             "Gold sold and FX hedged through StoneX. These trades generate the USD and ZAR proceeds used to settle client bookings.")
+    stx_all_cols = ["Doc #", "FNC #", "Trade Date", "Value Date", "Symbol",
+                    "Side", "Narration", "Quantity", "Price",
+                    "Settle Currency", "Settle Amount"]
+    stx_avail = [c for c in stx_all_cols if c in st_df.columns]
+    _sw_map = {
+        "Doc #": 0.07, "FNC #": 0.10, "Trade Date": 0.08, "Value Date": 0.08,
+        "Symbol": 0.06, "Side": 0.05, "Narration": 0.17, "Quantity": 0.10,
+        "Price": 0.09, "Settle Currency": 0.06, "Settle Amount": 0.10,
+    }
+    sw_sum = sum(_sw_map.get(c, 0.08) for c in stx_avail) or 1
+    stx_pcts = [_sw_map.get(c, 0.08) / sw_sum for c in stx_avail]
+    stx_right = [i for i, c in enumerate(stx_avail)
+                 if c in ("Quantity", "Price", "Settle Amount")]
 
-    STX_COLS = ["FNC #", "Trade Date", "Value Date", "Symbol", "Side", "Narration", "Quantity", "Price"]
-    stx_avail = [c for c in STX_COLS if c in stx_pdf.columns]
-    _STX_W = {"FNC #": 0.13, "Trade Date": 0.09, "Value Date": 0.09, "Symbol": 0.07,
-              "Side": 0.06, "Narration": 0.24, "Quantity": 0.14, "Price": 0.12}
-    _sw = sum(_STX_W.get(c, 0.10) for c in stx_avail) or 1
-    stx_wids = [_STX_W.get(c, 0.10) / _sw for c in stx_avail]
-    stx_right = [i for i, c in enumerate(stx_avail) if c in ("Quantity", "Price")]
-
-    stx_rows_data: list = []
-    for _, r in stx_pdf.iterrows():
-        rd: Dict[str, str] = {}
+    stx_rows = []
+    for _, r in st_df.iterrows():
+        row = []
+        doc_val_raw = _t(r.get("Doc #", "--"))
+        fnc_val_raw = _t(r.get("FNC #", "--"))
+        doc_upper = str(doc_val_raw).strip().upper()
+        fnc_upper = str(fnc_val_raw).strip().upper()
         for c in stx_avail:
-            if c == "Quantity":   rd[c] = _f(r.get(c), 2)
-            elif c == "Price":    rd[c] = _f(r.get(c), 4)
-            else:                 rd[c] = _s(r.get(c))
-        stx_rows_data.append(rd)
+            if c == "Quantity":
+                row.append(_f(r.get(c), 2))
+            elif c == "Price":
+                row.append(_f(r.get(c), 4))
+            elif c == "Settle Amount":
+                row.append(_f(r.get(c), 2))
+            elif c == "Doc #":
+                # Avoid duplicate audit refs when PMX stores FNC values in both Doc# and FNC#.
+                if doc_upper.startswith("FNC/") and fnc_upper.startswith("FNC/"):
+                    row.append("--")
+                else:
+                    row.append(doc_val_raw)
+            else:
+                row.append(_t(r.get(c, "--")))
+        stx_rows.append(row)
+    _table(stx_avail, stx_rows, stx_pcts, right_cols=stx_right)
 
-    _data_tbl(stx_avail, stx_wids, stx_rows_data, right_cols=stx_right)
-
-    # ════════════════════════════════════════════════════════════
-    # PAGE BREAK - DETAILED AUDIT TRAIL
-    # ════════════════════════════════════════════════════════════
-    story.append(PageBreak())
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  AUDIT TRAIL — Page Break
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    pdf.add_page()
 
     # Audit trail header
-    audit_hdr = Paragraph(
-        f"<font name='{FONT_BOLD}' size='18' color='#1C1C1C'>Detailed Calculation Audit Trail</font>",
-        _ps("_audit_hdr", fontName=FONT_BOLD, fontSize=18, leading=22),
-    )
-    audit_sub = Paragraph(
-        f"<font name='{FONT_BOLD}' size='9' color='#B07840'>Trade #{_esc(_s(trade_num_value))}</font>"
-        f"<font size='8' color='#777777'>  \u2014  Step-by-step breakdown of every calculation, "
-        f"designed for reconciliation, compliance review, and independent verification.</font>",
-        _ps("_audit_sub", fontSize=9, leading=13),
-    )
-    story.append(audit_hdr)
-    story.append(Spacer(1, 2 * mm))
-    story.append(audit_sub)
-    story.append(Spacer(1, 3 * mm))
-    story.append(HRFlowable(width=PW, thickness=3, color=COPPER,
-                            spaceBefore=0, spaceAfter=0.8 * mm))
-    story.append(HRFlowable(width=PW, thickness=0.75, color=COPPER_MD,
-                            spaceBefore=0, spaceAfter=6 * mm))
+    pdf.set_text_color(*CHARCOAL)
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(W, 7, _t("Detailed Calculation Audit Trail"), 0, 1, "L")
+    pdf.set_text_color(*GOLD)
+    pdf.set_font("Arial", "B", 8)
+    pdf.cell(0, 4, _t(f"Trade #{trade_num_value}"), 0, 0, "L")
+    pdf.set_text_color(*LIGHT)
+    pdf.set_font("Arial", "", 7)
+    pdf.cell(0, 4, _t("   -  Step-by-step breakdown for reconciliation and verification."), 0, 1, "L")
+    pdf.ln(1)
+    y = pdf.get_y()
+    pdf.set_draw_color(*GOLD)
+    pdf.set_line_width(0.6)
+    pdf.line(LM, y, LM + W, y)
+    pdf.set_draw_color(*GOLD_MD)
+    pdf.set_line_width(0.15)
+    pdf.line(LM, y + 1, LM + W, y + 1)
+    pdf.set_y(y + 5)
 
-    # ──────────────────────────────────────────────────────────
-    # STEP 1 - Source Data Overview
-    # ──────────────────────────────────────────────────────────
-    _audit_step_header("1", "Source Data Overview",
-                       "A summary of the raw data loaded from TradeMC (buy side) and "
-                       "StoneX/PMX (sell side) for this trading ticket. These counts confirm "
-                       "all expected trades have been captured before calculations begin.")
-    _audit_row("TradeMC client bookings (buy side)", str(len(bookings)))
-    _audit_row("StoneX/PMX execution trades (sell side)", str(len(all_pmx)))
-    _audit_row("  \u2022  XAU/USD gold price trades", str(len(xau_trades)), indent=1)
-    _audit_row("  \u2022  USD/ZAR foreign exchange trades", str(len(fx_trades)), indent=1)
-    _audit_row("Troy ounce conversion factor", "1 troy oz = 31.1035 grams")
-    story.append(Spacer(1, 5 * mm))
+    # ── Step 1 — Source Data Overview ────────────────────────────
+    _step("1", "Source Data Overview",
+          "Counts of raw data loaded from TradeMC (buy side) and StoneX/PMX (sell side).")
+    _kv("TradeMC client bookings (buy side)", str(len(bookings)))
+    _kv("StoneX/PMX execution trades (sell side)", str(len(all_pmx)))
+    _kv("XAU/USD gold price trades", str(len(xau_trades)), indent=1)
+    _kv("USD/ZAR foreign exchange trades", str(len(fx_trades)), indent=1)
+    _kv("Troy ounce conversion factor", "1 troy oz = 31.1035 grams")
+    pdf.ln(4)
 
-    # ──────────────────────────────────────────────────────────
-    # STEP 2 - Client Booking Valuation
-    # ──────────────────────────────────────────────────────────
-    _audit_step_header("2", "Client Booking Valuation (Buy Side)",
-                       "Each TradeMC booking is converted from grams to troy ounces, "
-                       "priced in USD at the booked gold rate, converted to ZAR at the "
-                       "client\u2019s FX rate, and then reduced by the applicable refining charge. "
-                       "The net ZAR value represents the total cost of acquiring gold from this client.")
+    # ── Step 2 — Client Booking Valuation ────────────────────────
+    _step("2", "Client Booking Valuation (Buy Side)",
+          "Each booking: grams -> oz, priced in USD, converted to ZAR, less refining.")
 
     for idx, b in enumerate(bookings):
-        _audit_sub_title(f"Booking {idx + 1}: {b['company']}")
-        _audit_row("Raw weight received", _grams(b["weight_g"]), indent=1)
-        _audit_row_formula("Converted to troy ounces",
-                           f"{_f(b['weight_g'], 2)} g \u00f7 31.1035",
-                           _ounces(b["weight_oz"], 6), indent=1)
-        _audit_row("Client\u2019s booked gold price", _money(b["booked_price"], "$") + " per troy oz", indent=1)
-        _audit_row_formula("USD value of booking",
-                           f"{_ounces(b['weight_oz'], 6)} \u00d7 {_money(b['booked_price'], '$')}",
-                           _money(b["usd_value"], "$"), indent=1)
-        _audit_row("FX rate applied (ZAR per USD)", _f(b["fx_rate"], 4), indent=1)
-        _audit_row_formula("ZAR gross value (before refining)",
-                           f"{_money(b['usd_value'], '$')} \u00d7 {_f(b['fx_rate'], 4)}",
-                           _money(b["zar_gross"], "R\u00a0"), indent=1)
-        _audit_row("Refining charge rate", _pct(b["refining_rate"]), indent=1)
-        _audit_row_formula("Refining deduction amount",
-                           f"{_money(b['zar_gross'], 'R ')} \u00d7 {_pct(b['refining_rate'])}",
-                           _money(b["refining_deduction"], "R\u00a0"), indent=1)
-        _audit_row("ZAR net value (after refining)", _money(b["zar_net"], "R\u00a0"),
-                   value_color=COPPER_DK, indent=1)
+        _sub_title(f"Booking {idx + 1}: {b['company']}")
+        _kv("Raw weight received", _grams(b["wg"]), indent=1)
+        _formula("Troy ounces", f"{_f(b['wg'])} g / 31.1035", _oz(b["woz"], 6), indent=1)
+        _kv("Booked gold price", _money(b["bp"], "$") + " /oz", indent=1)
+        _formula("USD value", f"{_oz(b['woz'], 6)} x {_money(b['bp'], '$')}", _money(b["usd"], "$"), indent=1)
+        _kv("FX rate (ZAR/USD)", _f(b["fx"], 4), indent=1)
+        _formula("ZAR gross", f"{_money(b['usd'], '$')} x {_f(b['fx'], 4)}", _money(b["zg"], "R "), indent=1)
+        _kv("Refining rate", _pct(b["rr"]), indent=1)
+        _formula("Refining deduction", f"{_money(b['zg'], 'R ')} x {_pct(b['rr'])}", _money(b["rd"], "R "), indent=1)
+        _kv("ZAR net (after refining)", _money(b["zn"], "R "), val_color=GOLD_DK, indent=1)
 
-    _audit_sub_title("Aggregated Buy Side Totals")
-    _audit_row("Combined weight", f"{_grams(tm_total_g)} ({_ounces(tm_total_oz, 6)})")
-    _audit_row("Combined USD value", _money(tm_total_usd, "$"))
-    _audit_row("Combined ZAR gross (before refining)", _money(tm_total_zar_gross, "R\u00a0"))
-    _audit_row("Combined ZAR net (after refining)", _money(tm_total_zar_net, "R\u00a0"),
-               value_color=COPPER_DK)
-    story.append(Spacer(1, 5 * mm))
+    _sub_title("Aggregated Buy Side Totals")
+    _kv("Combined weight", f"{_grams(tm_tot['g'])} ({_oz(tm_tot['oz'], 6)})")
+    _kv("Combined USD value", _money(tm_tot["usd"], "$"))
+    _kv("Combined ZAR gross", _money(tm_tot["zar_gross"], "R "))
+    _kv("Combined ZAR net", _money(tm_tot["zar_net"], "R "), val_color=GOLD_DK)
+    pdf.ln(4)
 
-    # ──────────────────────────────────────────────────────────
-    # STEP 3 - Weighted Average Pricing
-    # ──────────────────────────────────────────────────────────
-    _audit_step_header("3", "Weighted Average Price Calculation",
-                       "The weighted average is computed as the sum of all trade notional "
-                       "values divided by the sum of all trade quantities. This ensures that "
-                       "larger trades carry proportionally more weight in the average, "
-                       "giving an accurate blended execution rate.")
+    # ── Step 3 — Weighted Average Pricing ────────────────────────
+    _step("3", "Weighted Average Price Calculation",
+          "WA = Sum(qty x price) / Sum(qty). Larger trades carry more weight.")
 
-    _audit_sub_title("Gold Weighted Average (XAU/USD \u2014 price per troy ounce)")
+    _sub_title("Gold Weighted Average (XAU/USD)")
     if xau_trades:
-        for idx, t in enumerate(xau_trades):
-            _audit_row_formula(
-                f"Trade {idx+1}: {t['side']} {_ounces(t['qty'], 4)} @ {_money(t['price'], '$', 4)}",
-                f"{_ounces(t['qty'], 4)} \u00d7 {_money(t['price'], '$', 4)}",
-                _money(t["notional"], "$"),
-                indent=1,
+        for i, t in enumerate(xau_trades):
+            _formula(
+                f"Trade {i+1}: {t['side']} {_oz(t['qty'], 4)} @ {_money(t['price'], '$', 4)}",
+                f"{_oz(t['qty'], 4)} x {_money(t['price'], '$', 4)}",
+                _money(t["notional"], "$"), indent=1,
             )
-        _audit_row("Total notional value (sum of qty \u00d7 price)", _money(gold_wa_total_notional, "$"))
-        _audit_row("Total quantity traded", _ounces(gold_wa_total_qty, 4))
-        _audit_row_formula("Resulting Gold Weighted Average",
-                           f"{_money(gold_wa_total_notional, '$')} \u00f7 {_ounces(gold_wa_total_qty, 4)}",
-                           _money(gold_wa_display, "$", 4),
-                           value_color=COPPER)
+        _kv("Total notional", _money(gold_tot_not, "$"))
+        _kv("Total quantity", _oz(gold_tot_qty, 4))
+        _formula("Gold WA", f"{_money(gold_tot_not, '$')} / {_oz(gold_tot_qty, 4)}",
+                 _money(gold_wa_d, "$", 4), val_color=GOLD)
     else:
-        _audit_row("No XAU/USD trades found", "\u2014")
+        _kv("No XAU/USD trades found", "--")
+    pdf.ln(2)
 
-    story.append(Spacer(1, 3 * mm))
-
-    _audit_sub_title("FX Weighted Average (USD/ZAR \u2014 rand per dollar)")
+    _sub_title("FX Weighted Average (USD/ZAR)")
     if fx_trades:
-        for idx, t in enumerate(fx_trades):
-            _audit_row_formula(
-                f"Trade {idx+1}: {t['side']} {_money(t['qty'], '$', 2)} @ {_money(t['price'], 'R\u00a0', 4)}",
-                f"{_money(t['qty'], '$', 2)} \u00d7 {_money(t['price'], 'R\u00a0', 4)}",
-                _money(t["notional"], "R\u00a0"),
-                indent=1,
+        for i, t in enumerate(fx_trades):
+            _formula(
+                f"Trade {i+1}: {t['side']} {_money(t['qty'], '$', 2)} @ {_money(t['price'], 'R ', 4)}",
+                f"{_money(t['qty'], '$', 2)} x {_money(t['price'], 'R ', 4)}",
+                _money(t["notional"], "R "), indent=1,
             )
-        _audit_row("Total notional value (sum of qty \u00d7 rate)", _money(fx_wa_total_notional, "R\u00a0"))
-        _audit_row("Total quantity traded (USD)", _money(fx_wa_total_qty, "$", 2))
-        _audit_row_formula("Resulting FX Weighted Average",
-                           f"{_money(fx_wa_total_notional, 'R ')} \u00f7 {_money(fx_wa_total_qty, '$', 2)}",
-                           _money(fx_wa_display, "R\u00a0", 4),
-                           value_color=COPPER)
+        _kv("Total notional", _money(fx_tot_not, "R "))
+        _kv("Total quantity (USD)", _money(fx_tot_qty, "$", 2))
+        _formula("FX WA", f"{_money(fx_tot_not, 'R ')} / {_money(fx_tot_qty, '$', 2)}",
+                 _money(fx_wa_d, "R ", 4), val_color=GOLD)
     else:
-        _audit_row("No USD/ZAR trades found", "\u2014")
-    story.append(Spacer(1, 5 * mm))
+        _kv("No USD/ZAR trades found", "--")
+    pdf.ln(4)
 
-    # ──────────────────────────────────────────────────────────
-    # STEP 4 - Implied Spot Rate
-    # ──────────────────────────────────────────────────────────
-    _audit_step_header("4", "Implied Spot Rate Derivation",
-                       "Derives the effective ZAR cost per gram of gold by combining "
-                       "the gold weighted average ($/oz) with the FX weighted average (ZAR/$) "
-                       "and dividing by the troy ounce conversion factor. This rate represents "
-                       "the blended cost of acquiring gold through StoneX.")
-    _audit_row_formula("Implied spot price per gram (ZAR)",
-                       f"({_money(gold_wa_display, '$', 4)} \u00d7 {_money(fx_wa_display, 'R ', 4)}) \u00f7 31.1035",
-                       _money(spot_display, "R\u00a0", 4),
-                       value_color=COPPER)
-    story.append(Spacer(1, 5 * mm))
+    # ── Step 4 — Implied Spot Rate ───────────────────────────────
+    _step("4", "Implied Spot Rate Derivation",
+          "ZAR cost per gram = (Gold WA x FX WA) / 31.1035")
+    _formula("Spot ZAR/g",
+             f"({_money(gold_wa_d, '$', 4)} x {_money(fx_wa_d, 'R ', 4)}) / 31.1035",
+             _money(spot_d, "R ", 4), val_color=GOLD)
+    pdf.ln(4)
 
-    # ──────────────────────────────────────────────────────────
-    # STEP 5 - USD Cash Flows
-    # ──────────────────────────────────────────────────────────
-    _audit_step_header("5", "StoneX USD Cash Flow Analysis (Sell Side)",
-                       "Tracks the net USD proceeds from StoneX gold trades. "
-                       "Sell transactions generate positive cash inflows (+), while "
-                       "buy transactions represent negative outflows (\u2212). The net "
-                       "figure represents the total USD available from execution.")
-    for cf in xau_cash_flows:
-        sign_str = ""
+    # ── Step 5 — USD Cash Flows ──────────────────────────────────
+    _step("5", "StoneX USD Cash Flow (Sell Side)",
+          "Sell = +inflow, Buy = -outflow. Net = total USD available.")
+    for cf in xau_cfs:
         if cf["signed"] is not None:
-            sign_str = f"+{_money(cf['signed'], '$')}" if cf["signed"] >= 0 else f"\u2212{_money(abs(cf['signed']), '$')}"
+            s = f"+{_money(cf['signed'], '$')}" if cf["signed"] >= 0 else f"-{_money(abs(cf['signed']), '$')}"
         else:
-            sign_str = "\u2014"
-        _audit_row(
-            f"{cf['side']} {_ounces(cf['qty'], 4)} @ {_money(cf['price'], '$', 4)}",
-            sign_str,
-            value_color=GREEN if (cf["signed"] or 0) >= 0 else RED_C,
-        )
-    _audit_row("Net USD cash flow from StoneX", _money(net_stonex_usd, "$"),
-               value_color=GREEN if net_stonex_usd >= 0 else RED_C)
-    story.append(Spacer(1, 5 * mm))
+            s = "--"
+        _kv(f"{cf['side']} {_oz(cf['qty'], 4)} @ {_money(cf['price'], '$', 4)}", s,
+            val_color=GREEN if (cf["signed"] or 0) >= 0 else RED)
+    _kv("Net USD cash flow", _money(net_usd, "$"),
+        val_color=GREEN if net_usd >= 0 else RED)
+    pdf.ln(4)
 
-    # ──────────────────────────────────────────────────────────
-    # STEP 6 - Metal Exposure (Control Account)
-    # ──────────────────────────────────────────────────────────
-    _audit_step_header("6", "Control Account \u2014 Metal Exposure",
-                       "The control account tracks remaining unhedged metal. "
-                       "A zero balance indicates that all gold purchased from clients "
-                       "has been fully sold on StoneX. Any residual balance represents "
-                       "open exposure that has not yet been hedged.")
-    _audit_row("Unhedged position (grams)", _grams(ctrl_g))
-    _audit_row("Unhedged position (troy ounces)", _ounces(ctrl_oz, 4))
-    _audit_row("Unhedged position valued in ZAR", _money(ctrl_zar, "R\u00a0"))
-    story.append(Spacer(1, 5 * mm))
+    # ── Step 6 — Control Account ─────────────────────────────────
+    _step("6", "Control Account - Metal Exposure",
+          "Zero = fully hedged. Residual = open exposure.")
+    _kv("Unhedged (grams)", _grams(ctrl_g))
+    _kv("Unhedged (troy oz)", _oz(ctrl_oz, 4))
+    _kv("Unhedged (ZAR)", _money(ctrl_zar, "R "))
+    pdf.ln(4)
 
-    # ──────────────────────────────────────────────────────────
-    # STEP 7 - ZAR Position Summary
-    # ──────────────────────────────────────────────────────────
-    _audit_step_header("7", "ZAR Position \u2014 Sell vs Buy Side Comparison",
-                       "StoneX USD proceeds are converted to ZAR at the traded FX rate "
-                       "to establish the sell side valuation. This is compared against "
-                       "the TradeMC buy side (net of refining) to determine the trade\u2019s profitability.")
-    _audit_row("StoneX ZAR inflow (from FX conversion)", _money(stonex_zar_flow, "R\u00a0"))
-    _audit_row("Sell side total (ZAR received)", _money(sell_zar, "R\u00a0"))
-    _audit_row("Buy side total (ZAR paid to clients, net of refining)", _money(buy_zar, "R\u00a0"))
-    story.append(Spacer(1, 5 * mm))
+    # ── Step 7 — ZAR Position ────────────────────────────────────
+    _step("7", "ZAR Position - Sell vs Buy Side",
+          "StoneX proceeds in ZAR vs TradeMC buy side (net of refining).")
+    _kv("StoneX ZAR inflow", _money(stx_zar_flow, "R "))
+    _kv("Sell side total (ZAR)", _money(sell_zar, "R "))
+    _kv("Buy side total (ZAR)", _money(buy_zar, "R "))
+    pdf.ln(4)
 
-    # ──────────────────────────────────────────────────────────
-    # STEP 8 - Final Profit / Loss
-    # ──────────────────────────────────────────────────────────
-    _audit_step_header("8", "Profit & Loss Determination",
-                       "The final profit is calculated as the difference between "
-                       "what was received from StoneX (sell side) and what was paid "
-                       "to TradeMC clients (buy side). Profit margin is expressed as "
-                       "a percentage of the buy side cost.")
-
-    _audit_row_formula("Profit in USD",
-                       f"{_money(sell_usd, '$')} \u2212 {_money(buy_usd, '$')}",
-                       _money(profit_usd, "$"),
-                       value_color=GREEN if (profit_usd or 0) >= 0 else RED_C)
-    _audit_row_formula("Profit in ZAR",
-                       f"{_money(sell_zar, 'R ')} \u2212 {_money(buy_zar, 'R ')}",
-                       _money(profit_zar, "R\u00a0"),
-                       value_color=GREEN if (profit_zar or 0) >= 0 else RED_C)
-    _audit_row_formula("Profit margin (% of buy side cost)",
-                       f"({_money(profit_zar, 'R ')} \u00f7 {_money(buy_zar, 'R ')}) \u00d7 100",
-                       _pct(profit_pct, 3),
-                       value_color=COPPER)
-    story.append(Spacer(1, 4 * mm))
+    # ── Step 8 — Profit & Loss ───────────────────────────────────
+    _step("8", "Profit & Loss Determination",
+          "Profit = sell side - buy side. Margin = profit / buy side x 100.")
+    _formula("Profit (USD)",
+             f"{_money(sell_usd, '$')} - {_money(buy_usd, '$')}",
+             _money(profit_usd, "$"),
+             val_color=GREEN if (_n(profit_usd) or 0) >= 0 else RED)
+    _formula("Profit (ZAR)",
+             f"{_money(sell_zar, 'R ')} - {_money(buy_zar, 'R ')}",
+             _money(profit_zar, "R "),
+             val_color=GREEN if (_n(profit_zar) or 0) >= 0 else RED)
+    _formula("Profit margin",
+             f"({_money(profit_zar, 'R ')} / {_money(buy_zar, 'R ')}) x 100",
+             _pct(profit_pct, 3), val_color=GOLD)
+    pdf.ln(3)
 
     # Profit highlight box
     if profit_zar is not None:
-        p_bg = GREEN_LT if profit_zar >= 0 else RED_LT
-        p_border = GREEN if profit_zar >= 0 else RED_C
-        p_color = GREEN if profit_zar >= 0 else RED_C
-        p_label = "NET PROFIT" if profit_zar >= 0 else "NET LOSS"
-        profit_box_data = [[
-            Paragraph(
-                f"<font name='{FONT_BOLD}' size='10' color='#555555'>{p_label} (ZAR)</font>",
-                _ps("_pb_l", fontName=FONT_BOLD, fontSize=10, textColor=DARK_GREY,
-                    leading=13),
-            ),
-            Paragraph(
-                f"<font name='{FONT_BOLD}' size='18'>{_esc(_money(profit_zar, 'R '))}</font>",
-                _ps("_pb_v", fontName=FONT_BOLD, fontSize=18, leading=22,
-                    textColor=p_color, alignment=TA_RIGHT),
-            ),
-            Paragraph(
-                f"<font name='{FONT_BOLD}' size='11'>({_esc(_pct(profit_pct, 3))} margin)</font>",
-                _ps("_pb_p", fontName=FONT_BOLD, fontSize=11,
-                    textColor=p_color, alignment=TA_RIGHT, leading=14),
-            ),
-        ]]
-        pbox = Table(profit_box_data, colWidths=[PW * 0.25, PW * 0.45, PW * 0.30])
-        pbox.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (-1, -1), p_bg),
-            ("BOX",           (0, 0), (-1, -1), 1.5, p_border),
-            ("LINEABOVE",     (0, 0), (-1, 0), 3.5, p_border),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 18),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 18),
-            ("TOPPADDING",    (0, 0), (-1, -1), 14),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
-            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-        ]))
-        story.append(pbox)
-    story.append(Spacer(1, 10 * mm))
+        _check_space(16)
+        is_pos = profit_zar >= 0
+        bg = GREEN_BG if is_pos else RED_BG
+        bdr = GREEN if is_pos else RED
+        clr = GREEN if is_pos else RED
+        label = "NET PROFIT" if is_pos else "NET LOSS"
 
-    # ── Footer on every page ─────────────────────────────────
-    def _footer_on_page(canvas_obj, doc_obj):
-        canvas_obj.saveState()
-        canvas_obj.setStrokeColor(COPPER_MD)
-        canvas_obj.setLineWidth(0.5)
-        canvas_obj.line(LM, 13 * mm, PAGE[0] - RM, 13 * mm)
-        canvas_obj.setFont(FONT_REG, 7)
-        canvas_obj.setFillColor(MID_GREY)
-        footer_left = (
-            f"Metal Concentrators SA  \u2022  Confidential  \u2022  "
-            f"Trade Breakdown #{_s(trade_num_value)}"
-        )
-        footer_right = f"Generated {generated_at}  \u2022  Page {canvas_obj.getPageNumber()}"
-        canvas_obj.drawString(LM, 8.5 * mm, footer_left)
-        canvas_obj.drawRightString(PAGE[0] - RM, 8.5 * mm, footer_right)
-        canvas_obj.restoreState()
+        y = pdf.get_y()
+        h = 13
+        pdf.set_fill_color(*bg)
+        pdf.rect(LM, y, W, h, style="F")
+        pdf.set_draw_color(*bdr)
+        pdf.set_line_width(0.3)
+        pdf.rect(LM, y, W, h, style="D")
+        # Top accent
+        pdf.set_fill_color(*bdr)
+        pdf.rect(LM, y, W, 2, style="F")
 
-    doc.build(story, onFirstPage=_footer_on_page, onLaterPages=_footer_on_page)
-    return buf.getvalue()
+        # Label
+        pdf.set_xy(LM + 10, y + 4)
+        pdf.set_text_color(*MID)
+        pdf.set_font("Arial", "B", 8)
+        pdf.cell(W * 0.25, 5, _t(f"{label} (ZAR)"), 0, 0, "L")
+
+        # Value
+        pdf.set_text_color(*clr)
+        pdf.set_font("Arial", "B", 14)
+        pdf.cell(W * 0.40, 5, _t(_money(profit_zar, "R ")), 0, 0, "R")
+
+        # Margin
+        pdf.set_font("Arial", "B", 9)
+        pdf.cell(W * 0.25, 5, _t(f"({_pct(profit_pct, 3)} margin)"), 0, 0, "R")
+
+        pdf.set_y(y + h + 5)
+
+    # ── Confidentiality ──────────────────────────────────────────
+    pdf.ln(6)
+    pdf.set_draw_color(*BORDER)
+    pdf.set_line_width(0.1)
+    pdf.line(LM, pdf.get_y(), LM + W, pdf.get_y())
+    pdf.ln(2)
+    pdf.set_text_color(*FAINT)
+    pdf.set_font("Arial", "", 5.5)
+    pdf.multi_cell(W, 3, _t(
+        "This document is confidential and intended solely for the use of "
+        "Metal Concentrators SA and its authorised counterparties. "
+        "Reproduction or distribution without prior written consent is prohibited."
+    ), 0, "C")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    #  OUTPUT
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    out = pdf.output(dest="S")
+    if isinstance(out, str):
+        return out.encode("latin-1", errors="ignore")
+    if isinstance(out, (bytes, bytearray)):
+        return bytes(out)
+    return None

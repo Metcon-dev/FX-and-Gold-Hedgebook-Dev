@@ -1,6 +1,6 @@
 ﻿import { Fragment, useState, useEffect, useCallback, useMemo, useRef, Component, type ErrorInfo, type FormEvent, type ReactNode } from 'react'
 import { api, type AppUser, type AdminUser } from './api/client'
-import { ResponsiveContainer, ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, Scatter } from 'recharts'
+import { ResponsiveContainer, ComposedChart, Bar, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, Scatter } from 'recharts'
 
 // ===================================================================
 // SHARED HELPERS
@@ -593,6 +593,11 @@ function PMXLedger() {
     const { show, Toast } = useToast();
     const [sort, setSort] = useState<{ key: string; dir: 'asc' | 'desc' }>({ key: 'Trade Date', dir: 'desc' });
     const [pageError, setPageError] = useState('');
+    const [selectedUnallocatedByRowId, setSelectedUnallocatedByRowId] = useState<Record<number, boolean>>({});
+    const [selectedAllocatedByRowId, setSelectedAllocatedByRowId] = useState<Record<number, boolean>>({});
+    const [bulkAllocateTradeNum, setBulkAllocateTradeNum] = useState('');
+    const [allocatingSelected, setAllocatingSelected] = useState(false);
+    const [deallocatingSelected, setDeallocatingSelected] = useState(false);
     const hasActiveFilters = useMemo(
         () => Object.values(filters).some((value) => String(value ?? '').trim() !== ''),
         [filters]
@@ -628,6 +633,8 @@ function PMXLedger() {
                     'Trade #': normalizeTradeNumberValue((row as Row)['Trade #']),
                 }))
             );
+            setSelectedUnallocatedByRowId({});
+            setSelectedAllocatedByRowId({});
             setPageError('');
         } catch (e: unknown) {
             if (requestId !== latestLoadRequestRef.current) return;
@@ -804,6 +811,99 @@ function PMXLedger() {
     const visibleUnallocatedData = unallocatedData.slice(0, visibleUnallocatedCount);
     const hasMoreAllocated = visibleAllocatedCount < allocatedData.length;
     const hasMoreUnallocated = visibleUnallocatedCount < unallocatedData.length;
+    const selectedUnallocatedCount = useMemo(
+        () => unallocatedData.reduce((acc, row) => {
+            const rowId = toNumericId(row['id']);
+            return acc + (rowId > 0 && selectedUnallocatedByRowId[rowId] ? 1 : 0);
+        }, 0),
+        [unallocatedData, selectedUnallocatedByRowId]
+    );
+    const selectedAllocatedCount = useMemo(
+        () => allocatedData.reduce((acc, row) => {
+            const rowId = toNumericId(row['id']);
+            return acc + (rowId > 0 && selectedAllocatedByRowId[rowId] ? 1 : 0);
+        }, 0),
+        [allocatedData, selectedAllocatedByRowId]
+    );
+
+    const allocateSelectedTrades = async () => {
+        const targetTradeNum = normalizeTradeNumberValue(bulkAllocateTradeNum);
+        if (!targetTradeNum) {
+            show('Enter a Trade # first.', 'center-error');
+            return;
+        }
+
+        const selectedRows = unallocatedData.filter((row) => {
+            const rowId = toNumericId(row['id']);
+            return rowId > 0 && selectedUnallocatedByRowId[rowId];
+        });
+        if (selectedRows.length === 0) {
+            show('Select at least one unallocated trade.', 'center-error');
+            return;
+        }
+
+        setAllocatingSelected(true);
+        try {
+            let okCount = 0;
+            let failCount = 0;
+            let firstError = '';
+            for (const row of selectedRows) {
+                const rowId = toNumericId(row['id']);
+                if (rowId <= 0) continue;
+                try {
+                    await api.updatePmxTradeNumber(rowId, targetTradeNum);
+                    okCount += 1;
+                } catch (e: unknown) {
+                    failCount += 1;
+                    if (!firstError) firstError = String(e);
+                }
+            }
+
+            if (okCount > 0) show(`Allocated ${okCount.toLocaleString()} trade(s) to ${targetTradeNum}.`, 'success');
+            if (failCount > 0) show(`Failed on ${failCount.toLocaleString()} row(s): ${firstError}`, 'center-error');
+
+            setBulkAllocateTradeNum('');
+            setSelectedUnallocatedByRowId({});
+            await load(filters);
+        } finally {
+            setAllocatingSelected(false);
+        }
+    };
+
+    const deallocateSelectedTrades = async () => {
+        const selectedRows = allocatedData.filter((row) => {
+            const rowId = toNumericId(row['id']);
+            return rowId > 0 && selectedAllocatedByRowId[rowId];
+        });
+        if (selectedRows.length === 0) {
+            show('Select at least one allocated trade.', 'center-error');
+            return;
+        }
+
+        setDeallocatingSelected(true);
+        try {
+            let okCount = 0;
+            let failCount = 0;
+            let firstError = '';
+            for (const row of selectedRows) {
+                const rowId = toNumericId(row['id']);
+                if (rowId <= 0) continue;
+                try {
+                    await api.updatePmxTradeNumber(rowId, '');
+                    okCount += 1;
+                } catch (e: unknown) {
+                    failCount += 1;
+                    if (!firstError) firstError = String(e);
+                }
+            }
+            if (okCount > 0) show(`Deallocated ${okCount.toLocaleString()} trade(s).`, 'success');
+            if (failCount > 0) show(`Failed on ${failCount.toLocaleString()} row(s): ${firstError}`, 'center-error');
+            setSelectedAllocatedByRowId({});
+            await load(filters);
+        } finally {
+            setDeallocatingSelected(false);
+        }
+    };
 
     const downloadFilteredCsv = async () => {
         const params: Record<string, string> = {};
@@ -830,11 +930,52 @@ function PMXLedger() {
         }
     };
 
-    const renderLedgerTable = (rows: Row[], emptyMessage: string, containerClassName = '') => (
+    const renderLedgerTable = (rows: Row[], emptyMessage: string, containerClassName = '', selectionMode: 'unallocated' | 'allocated' | null = null) => (
         <div className={`table-container ${containerClassName}`.trim()}>
             <table className="data-table">
                 <thead>
                     <tr>
+                        {selectionMode && (
+                            <th style={{ width: 36 }}>
+                                <input
+                                    type="checkbox"
+                                    aria-label={`Select all visible ${selectionMode} trades`}
+                                    checked={rows.length > 0 && rows.every((row) => {
+                                        const rowId = toNumericId(row['id']);
+                                        if (rowId <= 0) return false;
+                                        return selectionMode === 'unallocated'
+                                            ? !!selectedUnallocatedByRowId[rowId]
+                                            : !!selectedAllocatedByRowId[rowId];
+                                    })}
+                                    onChange={(e) => {
+                                        const checked = e.target.checked;
+                                        if (selectionMode === 'unallocated') {
+                                            setSelectedUnallocatedByRowId((prev) => {
+                                                const next = { ...prev };
+                                                for (const row of rows) {
+                                                    const rowId = toNumericId(row['id']);
+                                                    if (rowId <= 0) continue;
+                                                    if (checked) next[rowId] = true;
+                                                    else delete next[rowId];
+                                                }
+                                                return next;
+                                            });
+                                        } else {
+                                            setSelectedAllocatedByRowId((prev) => {
+                                                const next = { ...prev };
+                                                for (const row of rows) {
+                                                    const rowId = toNumericId(row['id']);
+                                                    if (rowId <= 0) continue;
+                                                    if (checked) next[rowId] = true;
+                                                    else delete next[rowId];
+                                                }
+                                                return next;
+                                            });
+                                        }
+                                    }}
+                                />
+                            </th>
+                        )}
                         {cols.map(c => {
                             const isSorted = sort.key === c.key;
                             return (
@@ -856,10 +997,32 @@ function PMXLedger() {
                 </thead>
                 <tbody>
                     {rows.length === 0 && (
-                        <tr><td colSpan={cols.length} style={{ textAlign: 'left', padding: '2.5rem', color: 'var(--text-muted)' }}>{emptyMessage}</td></tr>
+                        <tr><td colSpan={cols.length + (selectionMode ? 1 : 0)} style={{ textAlign: 'left', padding: '2.5rem', color: 'var(--text-muted)' }}>{emptyMessage}</td></tr>
                     )}
                     {rows.map((row, i) => (
                         <tr key={`${String(row['id'] ?? '')}-${i}`}>
+                            {selectionMode && (
+                                <td>
+                                    {toNumericId(row['id']) > 0 && (
+                                        <input
+                                            type="checkbox"
+                                            checked={selectionMode === 'unallocated'
+                                                ? !!selectedUnallocatedByRowId[toNumericId(row['id'])]
+                                                : !!selectedAllocatedByRowId[toNumericId(row['id'])]}
+                                            onChange={(e) => {
+                                                const rowId = toNumericId(row['id']);
+                                                if (rowId <= 0) return;
+                                                const checked = e.target.checked;
+                                                if (selectionMode === 'unallocated') {
+                                                    setSelectedUnallocatedByRowId((prev) => ({ ...prev, [rowId]: checked }));
+                                                } else {
+                                                    setSelectedAllocatedByRowId((prev) => ({ ...prev, [rowId]: checked }));
+                                                }
+                                            }}
+                                        />
+                                    )}
+                                </td>
+                            )}
                             {cols.map(c => {
                                 const val = c.key === 'Oz' ? getPmxSignedOz(row) : row[c.key];
                                 const isNum = ['Debit USD', 'Credit USD', 'Balance USD', 'Net XAU g', 'Oz', 'Debit ZAR', 'Credit ZAR', 'Balance ZAR'].includes(c.key);
@@ -992,6 +1155,14 @@ function PMXLedger() {
                     <input placeholder="e.g. P1019" value={filters.trade_num} onChange={e => setFilters(f => ({ ...f, trade_num: e.target.value }))} />
                 </div>
                 <div className="filter-group">
+                    <label>Allocate To Trade #</label>
+                    <input
+                        placeholder="e.g. 9896 / JOS-070"
+                        value={bulkAllocateTradeNum}
+                        onChange={e => setBulkAllocateTradeNum(e.target.value)}
+                    />
+                </div>
+                <div className="filter-group">
                     <label>Narration</label>
                     <input placeholder="contains text" value={filters.narration} onChange={e => setFilters(f => ({ ...f, narration: e.target.value }))} />
                 </div>
@@ -1002,6 +1173,27 @@ function PMXLedger() {
                 <div className="filter-group">
                     <label>To (sync/filter)</label>
                     <input type="date" value={filters.end_date} onChange={e => setFilters(f => ({ ...f, end_date: e.target.value }))} />
+                </div>
+                <div className="filter-group">
+                    <label>&nbsp;</label>
+                    <button
+                        className="btn btn-sm btn-primary"
+                        onClick={() => { void allocateSelectedTrades(); }}
+                        disabled={allocatingSelected || selectedUnallocatedCount === 0 || !normalizeTradeNumberValue(bulkAllocateTradeNum)}
+                    >
+                        {allocatingSelected ? 'Allocating...' : `Allocate Selected (${selectedUnallocatedCount})`}
+                    </button>
+                </div>
+                <div className="filter-group">
+                    <label>&nbsp;</label>
+                    <button
+                        className="btn btn-sm"
+                        style={{ borderColor: 'var(--danger)', color: 'var(--danger)' }}
+                        onClick={() => { void deallocateSelectedTrades(); }}
+                        disabled={deallocatingSelected || selectedAllocatedCount === 0}
+                    >
+                        {deallocatingSelected ? 'Deallocating...' : `Deallocate Selected (${selectedAllocatedCount})`}
+                    </button>
                 </div>
                 <div className="filter-group">
                     <label>&nbsp;</label>
@@ -1016,7 +1208,7 @@ function PMXLedger() {
                 <>
                     <div className="section">
                         <div className="section-title">Unallocated Trades</div>
-                        {renderLedgerTable(visibleUnallocatedData, 'No unallocated trades', 'pmx-ledger-table-scroll pmx-ledger-table-scroll-unallocated')}
+                        {renderLedgerTable(visibleUnallocatedData, 'No unallocated trades', 'pmx-ledger-table-scroll pmx-ledger-table-scroll-unallocated', 'unallocated')}
                         {hasMoreUnallocated && (
                             <div style={{ textAlign: 'center', padding: '1rem' }}>
                                 <button className="btn btn-sm" onClick={() => setVisibleUnallocatedCount(c => c + UNALLOCATED_PAGE_SIZE)}>
@@ -1033,7 +1225,7 @@ function PMXLedger() {
 
                     <div className="section mt-3">
                         <div className="section-title">Allocated Trades</div>
-                        {renderLedgerTable(visibleAllocatedData, 'No allocated trades', 'pmx-ledger-table-scroll')}
+                        {renderLedgerTable(visibleAllocatedData, 'No allocated trades', 'pmx-ledger-table-scroll', 'allocated')}
                         {hasMoreAllocated && (
                             <div style={{ textAlign: 'center', padding: '1rem' }}>
                                 <button className="btn btn-sm" onClick={() => setVisibleAllocatedCount(c => c + ALLOCATED_PAGE_SIZE)}>
@@ -2550,13 +2742,6 @@ function GoldHedging() {
             const bHedged = Boolean(b.hedged);
             if (aHedged !== bHedged) return aHedged ? 1 : -1; // needs-hedging first
 
-            const aTs = toTimestampMs(a.tm_latest_trade_ts);
-            const bTs = toTimestampMs(b.tm_latest_trade_ts);
-            const aHasTs = Number.isFinite(aTs);
-            const bHasTs = Number.isFinite(bTs);
-            if (aHasTs && bHasTs && Math.abs(bTs - aTs) > 1e-9) return bTs - aTs;
-            if (aHasTs !== bHasTs) return bHasTs ? 1 : -1;
-
             const ta = normalizeTradeNumberValue(a.trade_num);
             const tb = normalizeTradeNumberValue(b.trade_num);
             const aNumMatch = ta.match(/(\d+)(?!.*\d)/);
@@ -3275,6 +3460,30 @@ function WeightedAverage() {
     const [result, setResult] = useState<Record<string, unknown> | null>(null);
     const [loading, setLoading] = useState(false);
     const { show, Toast } = useToast();
+    type SheetRow = { id: string; weight: string; rate: string };
+    const makeBlankRow = (): SheetRow => ({ id: `${Date.now()}-${Math.random()}`, weight: '', rate: '' });
+    const [goldSheetRows, setGoldSheetRows] = useState<SheetRow[]>([makeBlankRow(), makeBlankRow(), makeBlankRow()]);
+    const [fxSheetRows, setFxSheetRows] = useState<SheetRow[]>([makeBlankRow(), makeBlankRow(), makeBlankRow()]);
+
+    const toNum = (v: unknown): number | null => {
+        const n = Number(String(v ?? '').replace(/,/g, '').trim());
+        return Number.isFinite(n) ? n : null;
+    };
+    const sheetTotals = (rows: SheetRow[]) => {
+        let totalWeight = 0;
+        let totalValue = 0;
+        for (const r of rows) {
+            const w = toNum(r.weight);
+            const rate = toNum(r.rate);
+            if (w === null || rate === null) continue;
+            totalWeight += w;
+            totalValue += w * rate;
+        }
+        const wa = Math.abs(totalWeight) > 1e-12 ? (totalValue / totalWeight) : null;
+        return { totalWeight, totalValue, wa };
+    };
+    const goldTotals = useMemo(() => sheetTotals(goldSheetRows), [goldSheetRows]);
+    const fxTotals = useMemo(() => sheetTotals(fxSheetRows), [fxSheetRows]);
 
     const search = async () => {
         if (!tradeNum.trim()) return;
@@ -3282,6 +3491,35 @@ function WeightedAverage() {
         try {
             const res = await api.getWeightedAverage(tradeNum.trim());
             setResult(res);
+            const xauRows = ((res?.xau_usd as Row[] | undefined) || []);
+            const zarRows = ((res?.usd_zar as Row[] | undefined) || []);
+            const mapToSheet = (rows: Row[], weightKeys: string[], rateKeys: string[]): SheetRow[] => {
+                const mapped = rows.map((row) => {
+                    const weightVal = weightKeys.map(k => row[k]).find(v => toNum(v) !== null);
+                    const rateVal = rateKeys.map(k => row[k]).find(v => toNum(v) !== null);
+                    return {
+                        id: `${Date.now()}-${Math.random()}`,
+                        weight: weightVal !== undefined && weightVal !== null ? String(weightVal) : '',
+                        rate: rateVal !== undefined && rateVal !== null ? String(rateVal) : '',
+                    };
+                });
+                if (mapped.length === 0) mapped.push(makeBlankRow(), makeBlankRow(), makeBlankRow());
+                return mapped;
+            };
+            setGoldSheetRows(
+                mapToSheet(
+                    xauRows,
+                    ['quantity', 'qty', 'weight', 'weight_oz'],
+                    ['price', 'rate', 'usd_per_oz']
+                )
+            );
+            setFxSheetRows(
+                mapToSheet(
+                    zarRows,
+                    ['quantity', 'qty', 'usd_amount', 'amount'],
+                    ['price', 'rate', 'usd_zar']
+                )
+            );
         } catch (e: unknown) {
             show(String(e), 'error');
             setResult(null);
@@ -3289,12 +3527,80 @@ function WeightedAverage() {
         setLoading(false);
     };
 
-    const xauRows = (result?.xau_usd as Row[] | undefined) || [];
-    const zarRows = (result?.usd_zar as Row[] | undefined) || [];
+    const updateRow = (
+        setRows: React.Dispatch<React.SetStateAction<SheetRow[]>>,
+        rowId: string,
+        field: 'weight' | 'rate',
+        value: string
+    ) => {
+        setRows((prev) => prev.map(r => (r.id === rowId ? { ...r, [field]: value } : r)));
+    };
+    const addRow = (setRows: React.Dispatch<React.SetStateAction<SheetRow[]>>) =>
+        setRows((prev) => [...prev, makeBlankRow()]);
+    const removeRow = (setRows: React.Dispatch<React.SetStateAction<SheetRow[]>>, rowId: string) =>
+        setRows((prev) => prev.filter(r => r.id !== rowId));
+    const renderSheet = (
+        title: string,
+        rows: SheetRow[],
+        setRows: React.Dispatch<React.SetStateAction<SheetRow[]>>,
+        weightLabel: string,
+        rateLabel: string,
+        totalPrefix: string
+    ) => (
+        <div className="section mt-3">
+            <div className="section-title">{title}</div>
+            <div className="table-container">
+                <table className="data-table">
+                    <thead>
+                        <tr>
+                            <th style={{ width: '40%' }}>{weightLabel}</th>
+                            <th style={{ width: '30%' }}>{rateLabel}</th>
+                            <th style={{ width: '20%' }}>Total</th>
+                            <th style={{ width: '10%' }}></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows.map((r) => {
+                            const w = toNum(r.weight);
+                            const rate = toNum(r.rate);
+                            const total = w !== null && rate !== null ? w * rate : null;
+                            return (
+                                <tr key={r.id}>
+                                    <td>
+                                        <input
+                                            className="editable-input"
+                                            value={r.weight}
+                                            placeholder="0"
+                                            onChange={(e) => updateRow(setRows, r.id, 'weight', e.target.value)}
+                                        />
+                                    </td>
+                                    <td>
+                                        <input
+                                            className="editable-input"
+                                            value={r.rate}
+                                            placeholder="0"
+                                            onChange={(e) => updateRow(setRows, r.id, 'rate', e.target.value)}
+                                        />
+                                    </td>
+                                    <td className="num">{total !== null ? `${totalPrefix}${fmt(total, 2)}` : '--'}</td>
+                                    <td>
+                                        <button className="btn btn-sm" onClick={() => removeRow(setRows, r.id)}>x</button>
+                                    </td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </table>
+            </div>
+            <div style={{ marginTop: '0.5rem' }}>
+                <button className="btn btn-sm" onClick={() => addRow(setRows)}>Add Row</button>
+            </div>
+        </div>
+    );
 
     return (
         <div>
-            <div className="page-header"><h2>Weighted Average Calculator (PMX)</h2></div>
+            <div className="page-header"><h2>Trading Worksheet</h2></div>
 
             <div className="filter-bar">
                 <div className="filter-group">
@@ -3302,65 +3608,28 @@ function WeightedAverage() {
                     <input placeholder="e.g. P1019" value={tradeNum} onChange={e => setTradeNum(e.target.value)}
                         onKeyDown={e => e.key === 'Enter' && search()} />
                 </div>
-                <button className="btn btn-primary btn-sm" onClick={search} style={{ alignSelf: 'flex-end' }}>Calculate</button>
+                <button className="btn btn-primary btn-sm" onClick={search} style={{ alignSelf: 'flex-end' }}>Load Trade</button>
             </div>
 
             {loading && <Loading />}
 
-            {result && (
-                <>
-                    <div className="stat-grid">
-                        <div className="stat-card">
-                            <div className="stat-label">XAU/USD Weighted Avg</div>
-                            <div className="stat-value">${fmt(result.xau_usd_wa_price, 4)}</div>
-                            <div className="stat-sub">{fmt(result.xau_usd_total_qty, 3)} oz total</div>
-                        </div>
-                        <div className="stat-card">
-                            <div className="stat-label">USD/ZAR Weighted Avg</div>
-                            <div className="stat-value">R{fmt(result.usd_zar_wa_price, 5)}</div>
-                            <div className="stat-sub">${fmt(result.usd_zar_total_qty, 2)} total</div>
-                        </div>
-                    </div>
+            <div className="stat-grid">
+                <div className="stat-card">
+                    <div className="stat-label">Gold WA ($/oz)</div>
+                    <div className="stat-value">{goldTotals.wa !== null ? `$${fmt(goldTotals.wa, 4)}` : '--'}</div>
+                    <div className="stat-sub">Weight: {fmt(goldTotals.totalWeight, 3)} | Total: ${fmt(goldTotals.totalValue, 2)}</div>
+                </div>
+                <div className="stat-card">
+                    <div className="stat-label">USD/ZAR WA</div>
+                    <div className="stat-value">{fxTotals.wa !== null ? `R${fmt(fxTotals.wa, 5)}` : '--'}</div>
+                    <div className="stat-sub">Weight: {fmt(fxTotals.totalWeight, 2)} | Total: R{fmt(fxTotals.totalValue, 2)}</div>
+                </div>
+            </div>
 
-                    {xauRows.length > 0 && (
-                        <div className="section">
-                            <div className="section-title">XAU/USD Trades</div>
-                            <DataTable
-                                columns={[
-                                    { key: 'date', label: 'Date' },
-                                    { key: 'side', label: 'Side' },
-                                    { key: 'quantity', label: 'Qty (oz)' },
-                                    { key: 'price', label: 'Price' },
-                                    { key: 'value', label: 'Value' },
-                                ]}
-                                data={xauRows}
-                                numericCols={['quantity', 'price', 'value']}
-                                dateCols={['date']}
-                            />
-                        </div>
-                    )}
+            {renderSheet('Gold Worksheet (Excel Style)', goldSheetRows, setGoldSheetRows, 'Weight (oz)', 'Rate ($/oz)', '$')}
+            {renderSheet('USD/ZAR Worksheet (Excel Style)', fxSheetRows, setFxSheetRows, 'Weight (USD)', 'Rate (USD/ZAR)', 'R')}
 
-                    {zarRows.length > 0 && (
-                        <div className="section mt-3">
-                            <div className="section-title">USD/ZAR Trades</div>
-                            <DataTable
-                                columns={[
-                                    { key: 'date', label: 'Date' },
-                                    { key: 'side', label: 'Side' },
-                                    { key: 'quantity', label: 'Qty' },
-                                    { key: 'price', label: 'Rate' },
-                                    { key: 'value', label: 'Value' },
-                                ]}
-                                data={zarRows}
-                                numericCols={['quantity', 'price', 'value']}
-                                dateCols={['date']}
-                            />
-                        </div>
-                    )}
-                </>
-            )}
-
-            {!loading && !result && <Empty title="Enter a trade number to calculate weighted averages" />}
+            {!loading && !result && <Empty title="Load a trade number or enter rows manually in both tables." />}
             {Toast}
         </div>
     );
@@ -4559,6 +4828,18 @@ function ProfitTab() {
             return sum + tradeNetG;
         }, 0);
 
+    const monthAbsTradedG = (trades: Row[]): number =>
+        trades.reduce((sum, trade) => {
+            const pmxTx = Array.isArray(trade.pmx_transactions) ? (trade.pmx_transactions as Row[]) : [];
+            const tradeAbsG = pmxTx.reduce((sub, tx) => {
+                if (normalizeSymbol(tx['Symbol']) !== 'XAUUSD') return sub;
+                const qty = toNullableNumber(tx['Quantity']);
+                if (qty === null) return sub;
+                return sub + (Math.abs(qty) * GRAMS_PER_TROY_OUNCE);
+            }, 0);
+            return sum + tradeAbsG;
+        }, 0);
+
     const toggleMonth = (monthKey: string) => {
         setExpandedMonths(prev => ({ ...prev, [monthKey]: !prev[monthKey] }));
     };
@@ -4621,6 +4902,8 @@ function ProfitTab() {
                                 <th>Total Profit (ZAR)</th>
                                 <th>Profit % (WAvg)</th>
                                 <th>Traded (g)</th>
+                                <th>ABS Traded (g)</th>
+                                <th>Profit (R/g)</th>
                                 <th>Details</th>
                             </tr>
                         </thead>
@@ -4642,6 +4925,8 @@ function ProfitTab() {
                                 });
                                 const pctWeightedAvg = monthProfitPctWeightedAvg(trades);
                                 const netTradedG = monthNetTradedG(trades);
+                                const absTradedG = monthAbsTradedG(trades);
+                                const profitPerG = absTradedG > 0 ? (Number(month.total_profit_zar) || 0) / absTradedG : 0;
                                 return (
                                     <Fragment key={monthKey}>
                                         <tr>
@@ -4652,6 +4937,8 @@ function ProfitTab() {
                                             <td className={numClass(month.total_profit_zar)}>R{fmt(month.total_profit_zar)}</td>
                                             <td className={numClass(pctWeightedAvg)}>{fmt(pctWeightedAvg, 3)}%</td>
                                             <td className={numClass(netTradedG)}>{fmt(netTradedG, 2)}</td>
+                                            <td className="num">{fmt(absTradedG, 2)}</td>
+                                            <td className={numClass(profitPerG)}>R{fmt(profitPerG, 2)}</td>
                                             <td>
                                                 <button className="btn btn-sm" onClick={() => toggleMonth(monthKey)}>
                                                     {expandedMonth ? 'Collapse' : 'Expand'}
@@ -4660,7 +4947,7 @@ function ProfitTab() {
                                         </tr>
                                         {expandedMonth && (
                                             <tr>
-                                                <td colSpan={8} style={{ padding: '0.75rem' }}>
+                                                <td colSpan={12} style={{ padding: '0.75rem' }}>
                                                     <div className="table-container">
                                                         <table className="data-table">
                                                             <thead>
@@ -4673,13 +4960,15 @@ function ProfitTab() {
                                                                     <th>Metal Profit (ZAR)</th>
                                                                     <th>Total Profit (ZAR)</th>
                                                                     <th>Profit %</th>
+                                                                    <th>ABS Traded (g)</th>
+                                                                    <th>Profit (R/g)</th>
                                                                     <th>Hedge Status</th>
                                                                     <th>Transactions</th>
                                                                 </tr>
                                                             </thead>
                                                             <tbody>
                                                                 {tradesSorted.length === 0 && (
-                                                                    <tr><td colSpan={10} style={{ textAlign: 'left', padding: '1rem', color: 'var(--text-muted)' }}>No trades for this month</td></tr>
+                                                                    <tr><td colSpan={12} style={{ textAlign: 'left', padding: '1rem', color: 'var(--text-muted)' }}>No trades for this month</td></tr>
                                                                 )}
                                                                 {tradesSorted.map((trade, tradeIdx) => {
                                                                     const tradeNum = asText(trade.trade_num, `trade-${tradeIdx}`);
@@ -4689,6 +4978,12 @@ function ProfitTab() {
                                                                     const pmxTx = Array.isArray(trade.pmx_transactions) ? (trade.pmx_transactions as Row[]) : [];
                                                                     const hedgeStatus = hedgeStatusByTrade[normalizeTradeNumberValue(tradeNum)]
                                                                         ?? asText(trade.hedge_status, Boolean(trade.hedged) ? 'Hedged' : 'Unhedged');
+                                                                    const tradeAbsG = pmxTx.reduce((s, tx) => {
+                                                                        if (normalizeSymbol(tx['Symbol']) !== 'XAUUSD') return s;
+                                                                        const qty = toNullableNumber(tx['Quantity']);
+                                                                        return qty !== null ? s + Math.abs(qty) * GRAMS_PER_TROY_OUNCE : s;
+                                                                    }, 0);
+                                                                    const tradeProfitPerG = tradeAbsG > 0 ? (Number(trade.total_profit_zar) || 0) / tradeAbsG : 0;
                                                                     return (
                                                                         <Fragment key={tradeExpandKey}>
                                                                             <tr>
@@ -4700,6 +4995,8 @@ function ProfitTab() {
                                                                                 <td className={numClass(trade.metal_profit_zar)}>R{fmt(trade.metal_profit_zar)}</td>
                                                                                 <td className={numClass(trade.total_profit_zar)}>R{fmt(trade.total_profit_zar)}</td>
                                                                                 <td className={numClass(trade.profit_pct)}>{fmt(trade.profit_pct, 3)}%</td>
+                                                                                <td className="num">{fmt(tradeAbsG, 2)}</td>
+                                                                                <td className={numClass(tradeProfitPerG)}>R{fmt(tradeProfitPerG, 2)}</td>
                                                                                 <td>{hedgeStatus}</td>
                                                                                 <td>
                                                                                     <button className="btn btn-sm" onClick={() => toggleTrade(monthKey, tradeNum)}>
@@ -4709,7 +5006,7 @@ function ProfitTab() {
                                                                             </tr>
                                                                             {expandedTrade && (
                                                                                 <tr>
-                                                                                    <td colSpan={10} style={{ padding: '0.75rem' }}>
+                                                                                    <td colSpan={12} style={{ padding: '0.75rem' }}>
                                                                                         {(() => {
                                                                                             const tmWaGold = toNullableNumber(trade.trademc_wa_gold_usd_oz);
                                                                                             const tmWaFx = toNullableNumber(trade.trademc_wa_usdzar);
@@ -6960,6 +7257,288 @@ function Dashboard() {
     );
 }
 
+type ForecastDay = {
+    day: number;
+    date: string;
+    mean: number;
+    p50: number;
+    p5: number;
+    p10: number;
+    p25: number;
+    p75: number;
+    p90: number;
+    p95: number;
+    pct_change: number;
+};
+
+type ForecastResult = {
+    ok: boolean;
+    error?: string;
+    pair: string;
+    forecast_days: number;
+    current_price: number;
+    mu_annual: number;
+    sigma_annual: number;
+    prob_up: number;
+    data_start: string;
+    data_end: string;
+    data_points: number;
+    simulation_count: number;
+    daily_summary: ForecastDay[];
+    historical?: { date: string; close: number }[];
+};
+
+function ForecastPanel({ pair, label, decimals = 2 }: { pair: string; label: string; decimals?: number }) {
+    const [data, setData] = useState<ForecastResult | null>(null);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState('');
+    const [currentPrice, setCurrentPrice] = useState<{ rate: number; last_refreshed: string } | null>(null);
+    const [priceLoading, setPriceLoading] = useState(false);
+    const [days, setDays] = useState(30);
+    const [sims, setSims] = useState(10000);
+
+    const loadForecast = useCallback(async (refresh = false) => {
+        setLoading(true);
+        setError('');
+        try {
+            const res = refresh
+                ? await api.refreshForecast(pair, days, sims) as unknown as ForecastResult
+                : await api.getForecast(pair, days, sims) as unknown as ForecastResult;
+            if (!res.ok) throw new Error(res.error || 'Forecast failed');
+            setData(res);
+        } catch (e: unknown) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setLoading(false);
+        }
+    }, [pair, days, sims]);
+
+    const fetchPrice = useCallback(async () => {
+        setPriceLoading(true);
+        try {
+            const res = await api.getForecastCurrentPrice(pair) as { ok: boolean; rate: number; last_refreshed: string; error?: string };
+            if (!res.ok) throw new Error(res.error || 'Price fetch failed');
+            setCurrentPrice({ rate: res.rate, last_refreshed: res.last_refreshed });
+        } catch (e: unknown) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setPriceLoading(false);
+        }
+    }, [pair]);
+
+    useEffect(() => { void loadForecast(); }, [loadForecast]);
+
+    const pctClass = (v: number) => v > 0 ? 'num positive' : v < 0 ? 'num negative' : 'num';
+
+    return (
+        <div className="card" style={{ marginBottom: '1.5rem' }}>
+            <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
+                <h3 style={{ margin: 0, fontSize: '1rem' }}>{label}</h3>
+                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                    <label style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                        Days: <input type="number" min={7} max={90} value={days} onChange={e => setDays(Number(e.target.value) || 30)}
+                            style={{ width: 50, padding: '0.2rem 0.3rem', fontSize: '0.75rem', border: '1px solid #d1d5db', borderRadius: 4 }} />
+                    </label>
+                    <label style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                        Sims: <select value={sims} onChange={e => setSims(Number(e.target.value))}
+                            style={{ padding: '0.2rem 0.3rem', fontSize: '0.75rem', border: '1px solid #d1d5db', borderRadius: 4 }}>
+                            <option value={1000}>1,000</option>
+                            <option value={5000}>5,000</option>
+                            <option value={10000}>10,000</option>
+                            <option value={25000}>25,000</option>
+                            <option value={50000}>50,000</option>
+                        </select>
+                    </label>
+                    <button className="btn btn-sm" onClick={() => { void fetchPrice(); }} disabled={priceLoading}>
+                        {priceLoading ? 'Fetching...' : 'Get Live Price'}
+                    </button>
+                    <button className="btn btn-sm btn-primary" onClick={() => { void loadForecast(true); }} disabled={loading}>
+                        {loading ? 'Running...' : 'Update Forecast'}
+                    </button>
+                </div>
+            </div>
+
+            {error && <div style={{ margin: '0.75rem', padding: '0.6rem 0.75rem', fontSize: '0.8rem', background: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', borderRadius: 6 }}>{error}</div>}
+
+            {data && (
+                <>
+                    <div className="stat-grid dashboard-stat-grid">
+                        <div className="stat-card">
+                            <div className="stat-label">Current Price</div>
+                            <div className="stat-value">{fmt(currentPrice?.rate ?? data.current_price, decimals)}</div>
+                            {currentPrice && <div style={{ fontSize: '0.65rem', color: '#94a3b8' }}>as of {currentPrice.last_refreshed}</div>}
+                        </div>
+                        <div className="stat-card">
+                            <div className="stat-label">Ann. Drift</div>
+                            <div className="stat-value">{(data.mu_annual * 100).toFixed(2)}%</div>
+                        </div>
+                        <div className="stat-card">
+                            <div className="stat-label">Ann. Volatility</div>
+                            <div className="stat-value">{(data.sigma_annual * 100).toFixed(2)}%</div>
+                        </div>
+                        <div className="stat-card">
+                            <div className="stat-label">Prob(Up) {data.forecast_days}d</div>
+                            <div className={`stat-value ${data.prob_up >= 50 ? 'positive' : 'negative'}`}>{data.prob_up}%</div>
+                        </div>
+                    </div>
+
+                    {/* Monte Carlo Forecast Chart */}
+                    {(() => {
+                        const hist = (data.historical || []).slice(-30);
+                        const chartData = [
+                            ...hist.map(h => ({ date: h.date, close: h.close, mean: null as number | null, p50: null as number | null, p10_p90: [null, null] as [number | null, number | null], p25_p75: [null, null] as [number | null, number | null], p5_p95: [null, null] as [number | null, number | null] })),
+                            // bridge point: last historical day at current price, starts the forecast bands
+                            ...(hist.length > 0 ? [{
+                                date: hist[hist.length - 1].date,
+                                close: null as number | null,
+                                mean: data.current_price,
+                                p50: data.current_price,
+                                p10_p90: [data.current_price, data.current_price] as [number | null, number | null],
+                                p25_p75: [data.current_price, data.current_price] as [number | null, number | null],
+                                p5_p95: [data.current_price, data.current_price] as [number | null, number | null],
+                            }] : []),
+                            ...data.daily_summary.map(r => ({
+                                date: r.date,
+                                close: null as number | null,
+                                mean: r.mean,
+                                p50: r.p50,
+                                p10_p90: [r.p10, r.p90] as [number | null, number | null],
+                                p25_p75: [r.p25, r.p75] as [number | null, number | null],
+                                p5_p95: [r.p5 ?? r.p10, r.p95 ?? r.p90] as [number | null, number | null],
+                            })),
+                        ];
+                        const allVals = chartData.flatMap(d => [d.close, d.mean, d.p5_p95?.[0], d.p5_p95?.[1]].filter((v): v is number => v != null && isFinite(v)));
+                        const yMin = Math.min(...allVals);
+                        const yMax = Math.max(...allVals);
+                        const pad = (yMax - yMin) * 0.05 || 1;
+                        const fmtY = (v: number) => fmt(v, decimals);
+                        const fmtDateShort = (d: string) => { const parts = d.split('-'); return parts.length >= 3 ? `${parts[1]}/${parts[2]}` : d; };
+
+                        return (
+                            <div style={{ padding: '0.75rem' }}>
+                                <div style={{ fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.5rem', color: 'var(--text-primary, #1e293b)' }}>
+                                    Monte Carlo Forecast — {data.simulation_count?.toLocaleString()} simulations
+                                </div>
+                                <ResponsiveContainer width="100%" height={360}>
+                                    <ComposedChart data={chartData} margin={{ top: 5, right: 10, left: 10, bottom: 5 }}>
+                                        <defs>
+                                            <linearGradient id={`fcBand95_${pair}`} x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.08} />
+                                                <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.04} />
+                                            </linearGradient>
+                                            <linearGradient id={`fcBand90_${pair}`} x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.14} />
+                                                <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.08} />
+                                            </linearGradient>
+                                            <linearGradient id={`fcBand50_${pair}`} x1="0" y1="0" x2="0" y2="1">
+                                                <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.25} />
+                                                <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.15} />
+                                            </linearGradient>
+                                        </defs>
+                                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(28,28,28,0.08)" />
+                                        <XAxis dataKey="date" tickFormatter={fmtDateShort} tick={{ fontSize: 10, fill: 'var(--text-muted)' }} tickLine={false} axisLine={{ stroke: 'rgba(28,28,28,0.2)' }} interval="preserveStartEnd" />
+                                        <YAxis domain={[yMin - pad, yMax + pad]} tickFormatter={fmtY} tick={{ fontSize: 10, fill: 'var(--text-muted)' }} tickLine={false} axisLine={false} width={70} />
+                                        <Tooltip
+                                            contentStyle={{ fontSize: '0.75rem', borderRadius: 6, border: '1px solid #e2e8f0' }}
+                                            formatter={(value: unknown, name: unknown) => {
+                                                if (Array.isArray(value)) return [value.map((v: unknown) => fmtY(Number(v))).join(' — '), String(name ?? '')];
+                                                return [fmtY(Number(value)), String(name ?? '')];
+                                            }}
+                                            labelFormatter={(label: unknown) => fmtDateShort(String(label ?? ''))}
+                                        />
+                                        <Area type="monotone" dataKey="p5_p95" fill={`url(#fcBand95_${pair})`} stroke="none" name="P5–P95" isAnimationActive={false} connectNulls={false} />
+                                        <Area type="monotone" dataKey="p10_p90" fill={`url(#fcBand90_${pair})`} stroke="none" name="P10–P90" isAnimationActive={false} connectNulls={false} />
+                                        <Area type="monotone" dataKey="p25_p75" fill={`url(#fcBand50_${pair})`} stroke="none" name="P25–P75" isAnimationActive={false} connectNulls={false} />
+                                        <Line type="monotone" dataKey="close" stroke="#1e293b" strokeWidth={2} dot={false} name="Historical" isAnimationActive={false} connectNulls={false} />
+                                        <Line type="monotone" dataKey="mean" stroke="#3b82f6" strokeWidth={2} dot={false} name="Mean Forecast" isAnimationActive={false} connectNulls={false} />
+                                        <Line type="monotone" dataKey="p50" stroke="#8b5cf6" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="Median (P50)" isAnimationActive={false} connectNulls={false} />
+                                        <ReferenceLine y={data.current_price} stroke="#f59e0b" strokeDasharray="3 3" label={{ value: `Current: ${fmtY(data.current_price)}`, position: 'right', fontSize: 10, fill: '#f59e0b' }} />
+                                    </ComposedChart>
+                                </ResponsiveContainer>
+                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14, marginTop: 8, fontSize: 10, color: 'var(--text-muted)' }}>
+                                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span style={{ width: 16, height: 2, background: '#1e293b', display: 'inline-block' }} /> Historical</span>
+                                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span style={{ width: 16, height: 2, background: '#3b82f6', display: 'inline-block' }} /> Mean</span>
+                                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span style={{ width: 16, height: 2, background: '#8b5cf6', borderTop: '1px dashed #8b5cf6', display: 'inline-block' }} /> P50</span>
+                                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span style={{ width: 12, height: 12, background: 'rgba(59,130,246,0.25)', borderRadius: 2, display: 'inline-block' }} /> P25–P75</span>
+                                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span style={{ width: 12, height: 12, background: 'rgba(59,130,246,0.14)', borderRadius: 2, display: 'inline-block' }} /> P10–P90</span>
+                                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span style={{ width: 12, height: 12, background: 'rgba(59,130,246,0.06)', borderRadius: 2, display: 'inline-block' }} /> P5–P95</span>
+                                </div>
+                            </div>
+                        );
+                    })()}
+
+                    <div style={{ padding: '0.75rem', overflowX: 'auto' }}>
+                        <table className="data-table" style={{ fontSize: '0.75rem' }}>
+                            <thead>
+                                <tr>
+                                    <th>Date</th>
+                                    <th style={{ textAlign: 'right' }}>Mean</th>
+                                    <th style={{ textAlign: 'right' }}>P50</th>
+                                    <th style={{ textAlign: 'right' }}>P10</th>
+                                    <th style={{ textAlign: 'right' }}>P90</th>
+                                    <th style={{ textAlign: 'right' }}>Change %</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {Array.isArray(data.daily_summary) && data.daily_summary.length > 0 ? data.daily_summary.map((row) => (
+                                    <tr key={`${row.day}-${row.date}`}>
+                                        <td>{row.date}</td>
+                                        <td style={{ textAlign: 'right' }}>{fmt(row.mean, decimals)}</td>
+                                        <td style={{ textAlign: 'right' }}>{fmt(row.p50, decimals)}</td>
+                                        <td style={{ textAlign: 'right' }}>{fmt(row.p10, decimals)}</td>
+                                        <td style={{ textAlign: 'right' }}>{fmt(row.p90, decimals)}</td>
+                                        <td style={{ textAlign: 'right' }} className={pctClass(row.pct_change)}>{row.pct_change > 0 ? '+' : ''}{Number(row.pct_change ?? 0).toFixed(2)}%</td>
+                                    </tr>
+                                )) : (
+                                    <tr><td colSpan={6} style={{ padding: '1rem', color: 'var(--text-muted)' }}>No forecast rows available</td></tr>
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+                </>
+            )}
+        </div>
+    );
+}
+
+const FORECAST_SUB_TABS = [
+    { id: 'gold', label: 'Gold (XAU/USD)', pair: 'gold', decimals: 2 },
+    { id: 'usdzar', label: 'USD/ZAR', pair: 'usdzar', decimals: 4 },
+    { id: 'purchases', label: 'Purchases (XAU/ZAR)', pair: 'purchases', decimals: 2 },
+] as const;
+
+function ForecastTab() {
+    const [subTab, setSubTab] = usePersistentState<string>('forecast:sub_tab', 'gold');
+    const active = FORECAST_SUB_TABS.find(t => t.id === subTab) || FORECAST_SUB_TABS[0];
+
+    return (
+        <div>
+            <div style={{ display: 'flex', gap: '0', marginBottom: '1rem', borderBottom: '2px solid #e2e8f0' }}>
+                {FORECAST_SUB_TABS.map(t => (
+                    <button
+                        key={t.id}
+                        onClick={() => setSubTab(t.id)}
+                        style={{
+                            padding: '0.55rem 1.2rem',
+                            fontSize: '0.82rem',
+                            fontWeight: subTab === t.id ? 600 : 400,
+                            color: subTab === t.id ? '#1e40af' : '#64748b',
+                            background: subTab === t.id ? '#eff6ff' : 'transparent',
+                            border: 'none',
+                            borderBottom: subTab === t.id ? '2px solid #3b82f6' : '2px solid transparent',
+                            marginBottom: '-2px',
+                            cursor: 'pointer',
+                        }}
+                    >
+                        {t.label}
+                    </button>
+                ))}
+            </div>
+            <ForecastPanel key={active.id} pair={active.pair} label={active.label} decimals={active.decimals} />
+        </div>
+    );
+}
+
 // ===================================================================
 // SIDEBAR NAV ITEMS
 // ===================================================================
@@ -6979,6 +7558,8 @@ const NAV_SECTIONS: NavSection[] = [
         label: 'Overview',
         items: [
             { id: 'dashboard', label: 'Dashboard' },
+            { id: 'forecast', label: 'Forecasts' },
+            { id: 'profit', label: 'Profit' },
         ],
     },
     {
@@ -6988,7 +7569,6 @@ const NAV_SECTIONS: NavSection[] = [
             { id: 'hedging', label: 'Hedging' },
             { id: 'forward_exposure', label: 'Forward Exposure' },
             { id: 'open_positions_reval', label: 'Open Positions Reval' },
-            { id: 'profit', label: 'Profit' },
         ],
     },
     {
@@ -7003,6 +7583,7 @@ const NAV_SECTIONS: NavSection[] = [
         items: [
             { id: 'export_trades', label: 'Export Trades' },
             { id: 'ticket', label: 'Trading Ticket' },
+            { id: 'trading_worksheet', label: 'Trading Worksheet' },
             { id: 'trade_breakdown', label: 'Trade Breakdown' },
         ],
     },
@@ -7026,7 +7607,9 @@ const PAGE_TITLES: Record<string, string> = {
     suppliers: 'Supplier Balances',
     export_trades: 'Export Trades',
     ticket: 'Trading Ticket',
+    trading_worksheet: 'Trading Worksheet',
     trade_breakdown: 'Trade Breakdown',
+    forecast: 'Forecasts',
     user_management: 'User Management',
 };
 
@@ -7398,6 +7981,8 @@ export default function App() {
                                             {item.id === 'suppliers' && <><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z" /><line x1="3" y1="6" x2="21" y2="6" /></>}
                                             {item.id === 'export_trades' && <><path d="M12 3v12" /><polyline points="7 10 12 15 17 10" /><path d="M5 21h14" /></>}
                                             {item.id === 'ticket' && <><polyline points="6 9 6 2 18 2 18 9" /><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" /><rect x="6" y="14" width="12" height="8" /></>}
+                                            {item.id === 'forecast' && <><polyline points="22 12 18 12 15 21 9 3 6 12 2 12" /></>}
+                                            {item.id === 'trading_worksheet' && <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="14" y2="17" /></>}
                                             {item.id === 'trade_breakdown' && <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="14" y2="17" /></>}
                                             {item.id === 'user_management' && <><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="8.5" cy="7" r="4" /><path d="M20 8v6" /><path d="M23 11h-6" /></>}
                                         </svg>
@@ -7461,6 +8046,7 @@ export default function App() {
                 <main className="content-body">
                     <RenderGuard title={PAGE_TITLES[String(tab)] || 'Current Section'}>
                         {tab === 'dashboard' && <Dashboard />}
+                        {tab === 'forecast' && <ForecastTab />}
                         {tab === 'pmx_ledger' && <PMXLedger />}
                         {tab === 'profit' && <ProfitTab />}
                         {tab === 'forward_exposure' && <ForwardExposure />}
@@ -7471,6 +8057,7 @@ export default function App() {
                         {tab === 'suppliers' && <SupplierBalances />}
                         {tab === 'export_trades' && <ExportTrades />}
                         {tab === 'ticket' && <TradingTicket />}
+                        {tab === 'trading_worksheet' && <WeightedAverage />}
                         {tab === 'trade_breakdown' && <TradeBreakdownTab />}
                         {tab === 'user_management' && isAdmin && <UserManagement currentUserId={authUser ? Number(authUser.id) : null} />}
                     </RenderGuard>

@@ -4,14 +4,34 @@ import sqlite3
 import time
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SHARED_DB_ROOT = r"T:\Trading Platform - db"
-DB_PATH = os.path.join(SHARED_DB_ROOT, "fx_trading_ledger.db")
+DEFAULT_SHARED_DB_ROOT = r"T:\Trading Platform - db"
+LOCAL_DB_PATH = os.path.join(PROJECT_ROOT, "fx_trading_ledger.db")
+
+
+def _resolve_db_path() -> str:
+    # Respect an explicit path when provided.
+    env_db_path = str(os.getenv("LEDGER_DB_PATH", "") or "").strip()
+    if env_db_path:
+        return env_db_path
+
+    shared_root = str(os.getenv("SHARED_DB_ROOT", DEFAULT_SHARED_DB_ROOT) or DEFAULT_SHARED_DB_ROOT).strip() or DEFAULT_SHARED_DB_ROOT
+    shared_db_path = os.path.join(shared_root, "fx_trading_ledger.db")
+
+    # Use network DB only when the mapped directory is present in this process/session.
+    if os.path.isdir(shared_root):
+        return shared_db_path
+
+    return LOCAL_DB_PATH
+
+
+DB_PATH = _resolve_db_path()
 os.environ["LEDGER_DB_PATH"] = DB_PATH
 
 
 def get_db_connection():
     """Create database connection"""
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    timeout_seconds = float(str(os.getenv("LEDGER_DB_TIMEOUT_SECONDS", "5") or "5"))
+    conn = sqlite3.connect(DB_PATH, timeout=timeout_seconds, check_same_thread=False)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")

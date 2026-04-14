@@ -438,6 +438,40 @@ h3 {
   font-weight: 600;
 }
 
+/* PDF export numeric cleanup: prevent kerning/spacing artifacts in captured cards. */
+.pdf-export-mode .stat-value,
+.pdf-export-mode .stat-sub,
+.pdf-export-mode .dashboard-kpi-value,
+.pdf-export-mode .data-table td.num,
+.pdf-export-mode .data-table td[class*='num'] {
+  letter-spacing: 0 !important;
+  word-spacing: 0 !important;
+  font-kerning: none;
+  font-variant-ligatures: none;
+  font-variant-numeric: tabular-nums lining-nums !important;
+  font-feature-settings: "tnum" 1, "lnum" 1;
+}
+
+.pdf-export-mode .dashboard-stat-grid .stat-card {
+  text-align: center;
+  align-items: center;
+}
+
+.pdf-export-mode .pdf-summary-cards {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.pdf-export-mode .pdf-summary-ledger {
+  margin-top: -0.5rem;
+  margin-bottom: 0.8rem;
+}
+
+.pdf-export-mode .pdf-summary-ledger .data-table th,
+.pdf-export-mode .pdf-summary-ledger .data-table td {
+  padding-top: 0.45rem;
+  padding-bottom: 0.45rem;
+}
+
 @media (max-width: 1180px) {
   .dashboard-chart-kpis {
     grid-template-columns: repeat(2, minmax(130px, 1fr));
@@ -740,6 +774,33 @@ h3 {
   box-shadow: var(--shadow-card);
 }
 
+.filter-bar-active {
+  border-color: rgba(180, 112, 49, 0.45);
+  box-shadow: 0 0 0 2px rgba(180, 112, 49, 0.12), var(--shadow-card);
+}
+
+.filter-active-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  height: 32px;
+  padding: 0 0.7rem;
+  border-radius: 999px;
+  border: 1px solid rgba(180, 112, 49, 0.45);
+  background: rgba(180, 112, 49, 0.12);
+  color: #8f4a1b;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.filter-active-indicator .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #b47031;
+}
+
 .filter-group {
   display: flex;
   flex-direction: column;
@@ -786,7 +847,7 @@ h3 {
 }
 
 .pmx-ledger-table-scroll {
-  max-height: clamp(170px, 24vh, 300px);
+  max-height: clamp(260px, 36vh, 460px);
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -2589,5 +2650,248 @@ h3 {
 
   .auth-footer {
     text-align: center;
+  }
+}
+
+/* Trading worksheet */
+.worksheet-grid-two {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.worksheet-card .section-title {
+  margin-bottom: 0.5rem;
+}
+
+.worksheet-table-wrap {
+  overflow: auto;
+  max-height: 520px;
+}
+
+.worksheet-table td {
+  vertical-align: middle;
+}
+
+.worksheet-table {
+  table-layout: fixed;
+}
+
+.worksheet-table th,
+.worksheet-table td {
+  vertical-align: middle;
+}
+
+.worksheet-table th:nth-child(1),
+.worksheet-table td:nth-child(1) {
+  width: 88px;
+  text-align: center;
+}
+
+.worksheet-table th:nth-child(2),
+.worksheet-table td:nth-child(2),
+.worksheet-table th:nth-child(3),
+.worksheet-table td:nth-child(3),
+.worksheet-table th:nth-child(4),
+.worksheet-table td:nth-child(4) {
+  text-align: right;
+}
+
+.worksheet-summary-bar {
+  position: sticky;
+  top: 0;
+  z-index: 8;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr;
+  border: 1px solid #e5e7eb;
+  border-bottom: none;
+  background: #ffffff;
+}
+
+.worksheet-summary-cell {
+  padding: 0.5rem 0.6rem;
+  border-right: 1px solid #e5e7eb;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-align: right;
+}
+
+.worksheet-summary-cell:last-child {
+  border-right: none;
+}
+
+.worksheet-summary-label {
+  color: #1f2937;
+  text-align: left;
+}
+
+.worksheet-cell-input {
+  width: 100%;
+  min-width: 100px;
+  height: 30px;
+  border: 1px solid #d1d5db;
+  border-radius: 0;
+  background: #ffffff;
+  color: #111827;
+  padding: 0 0.45rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  outline: none;
+}
+
+.worksheet-cell-input:focus {
+  border-color: #94a3b8;
+  box-shadow: inset 0 0 0 1px #94a3b8;
+  background: #ffffff;
+}
+
+.worksheet-side-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 58px;
+  padding: 0.2rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.worksheet-side-chip.buy {
+  background: #f0fdf4;
+  color: #166534;
+  border: 1px solid #bbf7d0;
+}
+
+.worksheet-side-chip.sell {
+  background: #fef2f2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+}
+
+.worksheet-side-empty {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.65rem;
+}
+
+.trading-worksheet-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.worksheet-balance-kpi {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 0.7rem 0.8rem;
+  background: #ffffff;
+  max-width: 420px;
+}
+
+.worksheet-balance-label {
+  font-size: 0.72rem;
+  color: #64748b;
+  margin-bottom: 0.25rem;
+}
+
+.worksheet-balance-value {
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.worksheet-balance-kpi.balanced {
+  border-color: #86efac;
+  background: #f0fdf4;
+}
+
+.worksheet-balance-kpi.unbalanced {
+  border-color: #fecaca;
+  background: #fef2f2;
+}
+
+.worksheet-balance-meta {
+  margin-top: 0.25rem;
+  font-size: 0.74rem;
+  color: #475569;
+}
+
+.worksheet-balance-status .worksheet-balance-value {
+  letter-spacing: 0.01em;
+}
+
+.trademc-forecast-split {
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.trademc-forecast-panel {
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 0.85rem;
+  background: #fff;
+}
+
+.trademc-forecast-panel-title {
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 0.55rem;
+  letter-spacing: 0.01em;
+}
+
+.trademc-forecast-controls {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.35rem;
+}
+
+.trademc-forecast-controls .filter-group {
+  min-width: 220px;
+  margin: 0;
+}
+
+.trademc-forecast-chart {
+  width: 100%;
+  height: 300px;
+}
+
+.trademc-forecast-totals {
+  margin-top: 0.7rem;
+}
+
+.trademc-forecast-totals .data-table th,
+.trademc-forecast-totals .data-table td {
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
+}
+
+@media (max-width: 1080px) {
+  .worksheet-grid-two {
+    grid-template-columns: 1fr;
+  }
+
+  .trademc-forecast-split {
+    grid-template-columns: 1fr;
+  }
+
+  .trademc-forecast-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .trademc-forecast-controls .filter-group {
+    min-width: 0;
   }
 }

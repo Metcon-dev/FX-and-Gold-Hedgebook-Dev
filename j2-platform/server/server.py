@@ -30,8 +30,63 @@ sys.path.insert(0, ORIGINAL_PROJECT)
 os.chdir(ORIGINAL_PROJECT)
 # Shared DBs are hosted on the network T: drive for this deployment.
 SHARED_DB_ROOT = r"T:\Trading Platform - db"
-FORCED_LEDGER_DB_PATH = os.path.join(SHARED_DB_ROOT, "fx_trading_ledger.db")
-FORCED_PMX_DB_PATH = os.path.join(SHARED_DB_ROOT, "pmx_database.db")
+
+
+def _load_env_file_early(path: str) -> None:
+    try:
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except Exception:
+        return
+
+
+_SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SERVER_DIR, "..", ".."))
+_load_env_file_early(os.path.join(_PROJECT_ROOT, ".env"))
+_load_env_file_early(os.path.join(_SERVER_DIR, ".env"))
+
+
+def _resolve_db_path(file_name: str, env_keys: Optional[List[str]] = None) -> str:
+    if env_keys:
+        for k in env_keys:
+            raw = str(os.getenv(k, "") or "").strip()
+            if not raw:
+                continue
+            expanded = os.path.abspath(os.path.expanduser(raw))
+            try:
+                if os.path.exists(expanded) and os.path.isfile(expanded):
+                    return expanded
+            except Exception:
+                continue
+    server_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(server_dir, "..", ".."))
+    candidates = [
+        os.path.join(SHARED_DB_ROOT, file_name),
+        os.path.join(project_root, file_name),
+        os.path.join(server_dir, file_name),
+        os.path.join(server_dir, "..", file_name),
+    ]
+    for path in candidates:
+        try:
+            if os.path.exists(path) and os.path.isfile(path):
+                return os.path.abspath(path)
+        except Exception:
+            continue
+    return os.path.abspath(candidates[0])
+
+
+FORCED_LEDGER_DB_PATH = _resolve_db_path("fx_trading_ledger.db", env_keys=["LEDGER_DB_PATH", "FX_LEDGER_DB_PATH"])
+FORCED_PMX_DB_PATH = _resolve_db_path("pmx_database.db", env_keys=["PMX_DB_PATH", "PMX_DATABASE_PATH"])
 os.environ["LEDGER_DB_PATH"] = FORCED_LEDGER_DB_PATH
 os.environ["PMX_DB_PATH"] = FORCED_PMX_DB_PATH
 
@@ -80,6 +135,16 @@ from services.rest_service import (
 from services.clean_data_pipeline import (
     initialize_clean_pipeline_db,
     run_clean_data_pipeline,
+)
+from services.forecast_service import (
+    get_forecast as _forecast_get,
+    fetch_current_price as _forecast_current_price,
+    invalidate_cache as _forecast_invalidate_cache,
+)
+from services.purchases_ml_service import (
+    train_model as _purchases_train_model,
+    get_ml_forecast as _purchases_get_forecast,
+    get_model_status as _purchases_model_status,
 )
 
 def _load_env_file(path: str = ".env"):
@@ -162,6 +227,7 @@ AUTH_EXEMPT_PATHS = {
     "/api/auth/login",
     "/api/auth/logout",
     "/api/auth/me",
+    "/api/reports/daily-trading/send-test",
 }
 try:
     AUTH_PASSWORD_ITERATIONS = max(120000, int(os.getenv("APP_AUTH_PBKDF2_ITERATIONS", "240000") or 240000))
@@ -273,6 +339,42 @@ DAILY_BALANCE_EMAIL_JOB_NAME = "pmx_daily_balance_pdf_email"
 _daily_balance_email_scheduler_lock = threading.Lock()
 _daily_balance_email_scheduler_started = False
 _daily_balance_email_last_attempt_epoch: Dict[str, float] = {}
+
+# Daily Trading Report HTML email scheduler.
+DAILY_TRADING_REPORT_EMAIL_ENABLED = str(
+    os.getenv("DAILY_TRADING_REPORT_EMAIL_ENABLED", "true")
+).strip().lower() in {"1", "true", "yes", "y", "on"}
+try:
+    DAILY_TRADING_REPORT_EMAIL_HOUR = min(
+        23, max(0, int(os.getenv("DAILY_TRADING_REPORT_EMAIL_HOUR", "18") or 18))
+    )
+except Exception:
+    DAILY_TRADING_REPORT_EMAIL_HOUR = 18
+try:
+    DAILY_TRADING_REPORT_EMAIL_MINUTE = min(
+        59, max(0, int(os.getenv("DAILY_TRADING_REPORT_EMAIL_MINUTE", "0") or 0))
+    )
+except Exception:
+    DAILY_TRADING_REPORT_EMAIL_MINUTE = 0
+try:
+    DAILY_TRADING_REPORT_EMAIL_CHECK_INTERVAL_SECONDS = max(
+        15, int(os.getenv("DAILY_TRADING_REPORT_EMAIL_CHECK_INTERVAL_SECONDS", "30") or 30)
+    )
+except Exception:
+    DAILY_TRADING_REPORT_EMAIL_CHECK_INTERVAL_SECONDS = 30
+try:
+    DAILY_TRADING_REPORT_EMAIL_RETRY_SECONDS = max(
+        60, int(os.getenv("DAILY_TRADING_REPORT_EMAIL_RETRY_SECONDS", "900") or 900)
+    )
+except Exception:
+    DAILY_TRADING_REPORT_EMAIL_RETRY_SECONDS = 900
+DAILY_TRADING_REPORT_EMAIL_SUBJECT_PREFIX = str(
+    os.getenv("DAILY_TRADING_REPORT_EMAIL_SUBJECT_PREFIX", "Daily Trading Report") or "Daily Trading Report"
+).strip() or "Daily Trading Report"
+DAILY_TRADING_REPORT_EMAIL_JOB_NAME = "daily_trading_summary_html_email"
+_daily_trading_report_email_scheduler_lock = threading.Lock()
+_daily_trading_report_email_scheduler_started = False
+_daily_trading_report_email_last_attempt_epoch: Dict[str, float] = {}
 
 
 def _pmx_non_empty(*values: Any) -> str:
@@ -4426,6 +4528,484 @@ def _start_daily_balance_email_scheduler() -> None:
         _daily_balance_email_scheduler_started = True
 
 
+def _daily_trading_report_parse_recipients(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        values = [str(v or "").strip() for v in raw]
+    else:
+        values = [v.strip() for v in str(raw).replace(";", ",").split(",")]
+    out: List[str] = []
+    for item in values:
+        if item and "@" in item:
+            out.append(item)
+    return out
+
+
+def _daily_trading_report_html_escape(value: Any) -> str:
+    text = str(value or "")
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def _daily_trading_report_money(value: Any, prefix: str = "R", decimals: int = 2) -> str:
+    try:
+        num = float(value)
+        if not math.isfinite(num):
+            return "--"
+        return f"{prefix}{num:,.{decimals}f}"
+    except Exception:
+        return "--"
+
+
+def _daily_trading_report_num(value: Any, decimals: int = 2) -> str:
+    try:
+        num = float(value)
+        if not math.isfinite(num):
+            return "--"
+        return f"{num:,.{decimals}f}"
+    except Exception:
+        return "--"
+
+
+def _daily_trading_report_pct(value: Any, decimals: int = 2) -> str:
+    try:
+        num = float(value)
+        if not math.isfinite(num):
+            return "--"
+        return f"{num:.{decimals}f}%"
+    except Exception:
+        return "--"
+
+
+def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict[str, Any]:
+    run_date = str(run_date_iso or datetime.now().strftime("%Y-%m-%d")).strip()
+    dashboard_profit_min_date = "2026-03-01"
+
+    profit = build_profit_monthly_report() or {}
+    months = profit.get("months", []) if isinstance(profit, dict) else []
+    summary = profit.get("summary", {}) if isinstance(profit, dict) else {}
+    if not isinstance(months, list):
+        months = []
+    if not isinstance(summary, dict):
+        summary = {}
+
+    all_trades: List[Dict[str, Any]] = []
+    for month in months:
+        if not isinstance(month, dict):
+            continue
+        trades = month.get("trades", [])
+        if isinstance(trades, list):
+            for tr in trades:
+                if isinstance(tr, dict):
+                    all_trades.append(tr)
+
+    day_profit_map: Dict[str, float] = {}
+    day_trade_count_map: Dict[str, int] = {}
+    normalized_profit_rows: List[Tuple[str, float, Optional[float]]] = []
+    for tr in all_trades:
+        d = str(tr.get("trade_date") or "").strip()[:10]
+        if not d or d < dashboard_profit_min_date:
+            continue
+        try:
+            pv = float(tr.get("total_profit_zar") or 0.0)
+            if not math.isfinite(pv):
+                continue
+        except Exception:
+            continue
+        pct_val: Optional[float] = None
+        try:
+            p = tr.get("profit_pct")
+            if p is not None and str(p).strip() != "":
+                pct = float(str(p).replace("%", "").strip())
+                if math.isfinite(pct):
+                    pct_val = pct
+        except Exception:
+            pct_val = None
+        normalized_profit_rows.append((d, pv, pct_val))
+        day_profit_map[d] = float(day_profit_map.get(d, 0.0)) + pv
+        day_trade_count_map[d] = int(day_trade_count_map.get(d, 0)) + 1
+
+    # Strict Profit-tab style aggregation:
+    # - Daily = sum for run_date only
+    # - MTD = sum from month start up to run_date
+    selected_day = run_date
+    daily_profit = float(day_profit_map.get(run_date, 0.0))
+    daily_trades = int(day_trade_count_map.get(run_date, 0))
+
+    month_key = run_date[:7]
+    mtd_profit = 0.0
+    mtd_trades = 0
+    for d, pv, _pct in normalized_profit_rows:
+        if d.startswith(month_key) and d <= run_date:
+            mtd_profit += float(pv)
+            mtd_trades += 1
+
+    hedging_rows = build_hedging_comparison(source="pmx") or []
+    if not isinstance(hedging_rows, list):
+        hedging_rows = []
+
+    unhedged_tol_g = GRAMS_PER_TROY_OUNCE
+    total_tm_g = 0.0
+    under_hedged_total_g = 0.0
+    under_hedged_count = 0
+    hedged_rows = 0
+    for row in hedging_rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            tm_g_signed = float(row.get("tm_weight_g") or 0.0)
+        except Exception:
+            tm_g_signed = 0.0
+        total_tm_g += abs(tm_g_signed)
+
+        try:
+            need_g_signed = float(row.get("hedge_need_g") or 0.0)
+        except Exception:
+            need_g_signed = 0.0
+
+        is_under_hedged = (
+            (tm_g_signed > 0 and need_g_signed > unhedged_tol_g)
+            or (tm_g_signed < 0 and need_g_signed < -unhedged_tol_g)
+        )
+        if is_under_hedged:
+            under_hedged_count += 1
+            under_hedged_total_g += abs(need_g_signed)
+        else:
+            hedged_rows += 1
+
+    total_to_hedge_g = float(under_hedged_total_g)
+    covered_g = max(0.0, float(total_tm_g) - total_to_hedge_g)
+
+    if normalized_profit_rows:
+        total_profit_all = float(sum(r[1] for r in normalized_profit_rows))
+        total_trades_all = int(len(normalized_profit_rows))
+        pct_values = [r[2] for r in normalized_profit_rows if r[2] is not None]
+        overall_profit_pct = float(sum(pct_values) / len(pct_values)) if pct_values else float(summary.get("average_profit_margin_pct") or 0.0)
+    else:
+        total_profit_all = float(summary.get("total_profit_zar") or 0.0)
+        total_trades_all = int(summary.get("trades") or 0)
+        overall_profit_pct = float(summary.get("average_profit_margin_pct") or 0.0)
+
+    month_plot_rows: List[Dict[str, Any]] = []
+    for m in months[-6:]:
+        if not isinstance(m, dict):
+            continue
+        month_plot_rows.append(
+            {
+                "label": str(m.get("month_label") or m.get("month_key") or ""),
+                "value": float(m.get("total_profit_zar") or 0.0),
+            }
+        )
+    sorted_days = sorted(day_profit_map.keys())
+    daily_plot_rows = [{"label": d, "value": float(day_profit_map[d])} for d in sorted_days[-12:]]
+
+    return {
+        "run_date": run_date,
+        "selected_day": selected_day,
+        "daily_profit": daily_profit,
+        "daily_trades": daily_trades,
+        "month_to_date_profit": mtd_profit,
+        "month_to_date_trades": mtd_trades,
+        "total_profit_all": total_profit_all,
+        "total_trades_all": total_trades_all,
+        "overall_profit_pct": overall_profit_pct,
+        "total_grams_to_hedge": total_to_hedge_g,
+        "covered_g": covered_g,
+        "hedged_rows": hedged_rows,
+        "unhedged_rows": under_hedged_count,
+        "month_plot_rows": month_plot_rows,
+        "daily_plot_rows": daily_plot_rows,
+    }
+
+
+def _daily_trading_report_build_payload(run_date_iso: Optional[str] = None) -> Dict[str, Any]:
+    dash = _build_dashboard_summary_payload(run_date_iso)
+    run_date = str(dash.get("run_date") or (run_date_iso or datetime.now().strftime("%Y-%m-%d"))).strip()
+
+    reval = build_open_positions_reval({}, None) or {}
+    reval_summary = reval.get("summary", {}) if isinstance(reval, dict) else {}
+    if not isinstance(reval_summary, dict):
+        reval_summary = {}
+    open_trades = int(reval_summary.get("open_trades") or 0)
+    open_positions_pnl = float(reval_summary.get("total_pnl_zar") or 0.0)
+
+    return {
+        "date": run_date,
+        "subtitle": f"{run_date} | Executive overview + desk detail",
+        "source": "local:rule-based",
+        "daily_profit": float(dash.get("daily_profit") or 0.0),
+        "daily_trades": int(dash.get("daily_trades") or 0),
+        "month_to_date_profit": float(dash.get("month_to_date_profit") or 0.0),
+        "month_to_date_trades": int(dash.get("month_to_date_trades") or 0),
+        "open_positions_pnl": open_positions_pnl,
+        "open_positions_trades": open_trades,
+        "total_grams_to_hedge": float(dash.get("total_grams_to_hedge") or 0.0),
+        "hedged_rows": int(dash.get("hedged_rows") or 0),
+        "unhedged_rows": int(dash.get("unhedged_rows") or 0),
+        "covered_g": float(dash.get("covered_g") or 0.0),
+        "overall_profit_pct": float(dash.get("overall_profit_pct") or 0.0),
+        "total_profit_all": float(dash.get("total_profit_all") or 0.0),
+        "total_trades_all": int(dash.get("total_trades_all") or 0),
+        "month_plot_rows": list(dash.get("month_plot_rows") or []),
+        "daily_plot_rows": list(dash.get("daily_plot_rows") or []),
+    }
+
+
+def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
+    def _bar_rows(rows: List[Dict[str, Any]], currency_prefix: str = "R", units: str = "") -> str:
+        if not rows:
+            return "<tr><td colspan='3' style='padding:8px 0;color:#738095;'>No data</td></tr>"
+        max_abs = max(max(abs(float(r.get("value") or 0.0)) for r in rows), 1.0)
+        out = []
+        for r in rows:
+            label = _daily_trading_report_html_escape(r.get("label", ""))
+            value = float(r.get("value") or 0.0)
+            width = max(2.0, min(100.0, (abs(value) / max_abs) * 100.0))
+            color = "#1f8b4c" if value >= 0 else "#d83b2d"
+            val_txt = f"{currency_prefix}{value:,.2f}{units}"
+            out.append(
+                "<tr>"
+                f"<td style='padding:4px 0; width:86px; color:#34445d; font-size:12px;'>{label}</td>"
+                "<td style='padding:4px 8px;'>"
+                "<div style='height:10px;background:#dce3ee;border-radius:999px;overflow:hidden;'>"
+                f"<div style='width:{width:.2f}%;height:100%;background:{color};'></div>"
+                "</div>"
+                "</td>"
+                f"<td style='padding:4px 0; width:120px; text-align:right; font-weight:700; color:#1f2a3d; font-size:12px;'>{_daily_trading_report_html_escape(val_txt)}</td>"
+                "</tr>"
+            )
+        return "".join(out)
+
+    date_txt = _daily_trading_report_html_escape(payload.get("date", ""))
+    subtitle = _daily_trading_report_html_escape(payload.get("subtitle", ""))
+    source = _daily_trading_report_html_escape(payload.get("source", ""))
+    daily_profit = float(payload.get("daily_profit") or 0.0)
+    daily_is_loss = daily_profit < 0
+    daily_card_bg = "#f7e6e8" if daily_is_loss else "#e9f6ec"
+    daily_card_bd = "#d95a66" if daily_is_loss else "#9fd2ad"
+    daily_card_tx = "#8b1220" if daily_is_loss else "#1f7a46"
+
+    month_rows_html = _bar_rows(payload.get("month_plot_rows", []), "R")
+    daily_rows_html = _bar_rows(payload.get("daily_plot_rows", []), "R")
+    hedge_rows_html = _bar_rows(
+        [
+            {"label": "Covered g", "value": float(payload.get("covered_g") or 0.0)},
+            {"label": "To Hedge g", "value": float(payload.get("total_grams_to_hedge") or 0.0)},
+        ],
+        "",
+        "g",
+    )
+
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<style>
+  @media only screen and (max-width: 640px) {{
+    .kpi-title {{ font-size:16px !important; }}
+    .kpi-value {{ font-size:38px !important; }}
+    .kpi-sub {{ font-size:16px !important; }}
+    .main-title {{ font-size:20px !important; }}
+    .main-subtitle {{ font-size:14px !important; }}
+    .main-meta {{ font-size:12px !important; }}
+  }}
+</style>
+</head>
+<body style="margin:0;padding:0;background:#f4f6fa;font-family:Segoe UI,Arial,sans-serif;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f4f6fa;"><tr><td align="center" style="padding:10px;">
+  <table role="presentation" width="760" cellspacing="0" cellpadding="0" style="max-width:760px;width:100%;background:#ffffff;border:1px solid #d6dce6;">
+    <tr><td style="padding:14px 14px 10px;background:#cdd5e2;border-bottom:1px solid #bcc6d5;">
+      <div class="main-title" style="font-size:38px;line-height:1;color:#1b273b;font-weight:800;">Daily Trading Report</div>
+      <div class="main-subtitle" style="margin-top:6px;color:#1f2e46;font-size:18px;">{subtitle}</div>
+      <div class="main-meta" style="margin-top:4px;color:#3f4f67;font-size:14px;">Date: {date_txt} | Source: {source}</div>
+    </td></tr>
+    <tr><td style="padding:10px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
+        <td width="50%" style="padding:4px;"><div style="border:1px solid {daily_card_bd};background:{daily_card_bg};border-radius:10px;padding:10px;">
+          <div class="kpi-title" style="font-size:20px;color:{daily_card_tx};font-weight:700;">Daily Profit{ " (LOSS)" if daily_is_loss else ""}</div>
+          <div class="kpi-value" style="font-size:50px;line-height:1.05;color:{daily_card_tx};font-weight:800;">{_daily_trading_report_money(payload.get("daily_profit"), "R", 2)}</div>
+          <div class="kpi-sub" style="font-size:22px;color:{daily_card_tx};">Trades: {int(payload.get("daily_trades") or 0)} | Profit %: {_daily_trading_report_pct(payload.get("overall_profit_pct"), 2)}</div>
+        </div></td>
+        <td width="50%" style="padding:4px;"><div style="border:1px solid #9fd2ad;background:#e9f6ec;border-radius:10px;padding:10px;">
+          <div class="kpi-title" style="font-size:20px;color:#1f7a46;font-weight:700;">Month-to-date Profit</div>
+          <div class="kpi-value" style="font-size:50px;line-height:1.05;color:#1f7a46;font-weight:800;">{_daily_trading_report_money(payload.get("month_to_date_profit"), "R", 2)}</div>
+          <div class="kpi-sub" style="font-size:22px;color:#1f7a46;">Trades: {int(payload.get("month_to_date_trades") or 0)} | Profit %: {_daily_trading_report_pct(payload.get("overall_profit_pct"), 2)}</div>
+        </div></td>
+      </tr><tr>
+        <td width="50%" style="padding:4px;"><div style="border:1px solid #9db2e5;background:#edf2fc;border-radius:10px;padding:10px;">
+          <div class="kpi-title" style="font-size:20px;color:#2753bc;font-weight:700;">Open Positions Reval</div>
+          <div class="kpi-value" style="font-size:50px;line-height:1.05;color:#2753bc;font-weight:800;">{_daily_trading_report_money(payload.get("open_positions_pnl"), "R", 2)}</div>
+          <div class="kpi-sub" style="font-size:22px;color:#2753bc;">Open trades: {int(payload.get("open_positions_trades") or 0)} | Overall Profit %: {_daily_trading_report_pct(payload.get("overall_profit_pct"), 2)}</div>
+        </div></td>
+        <td width="50%" style="padding:4px;"><div style="border:1px solid #e7bea6;background:#fcf3eb;border-radius:10px;padding:10px;">
+          <div class="kpi-title" style="font-size:20px;color:#a74917;font-weight:700;">Total Grams To Hedge</div>
+          <div class="kpi-value" style="font-size:50px;line-height:1.05;color:#c01e1e;font-weight:800;">{_daily_trading_report_num(payload.get("total_grams_to_hedge"), 2)}g</div>
+          <div class="kpi-sub" style="font-size:22px;color:#a74917;">Hedged rows: {int(payload.get("hedged_rows") or 0)} | Unhedged rows: {int(payload.get("unhedged_rows") or 0)}</div>
+        </div></td>
+      </tr></table>
+
+      <div style="margin-top:8px;border-left:4px solid #2d5ad0;background:#eaf0ff;padding:8px 10px;font-size:15px;font-weight:700;color:#2c4ea3;">Executive Summary</div>
+      <ul style="margin:8px 0 10px 20px;padding:0;color:#1f2b3c;font-size:14px;line-height:1.6;">
+        <li>Daily closed P&amp;L was {_daily_trading_report_money(payload.get("daily_profit"), "R", 2)} across {int(payload.get("daily_trades") or 0)} trades, with month-to-date at {_daily_trading_report_money(payload.get("month_to_date_profit"), "R", 2)}.</li>
+        <li>Total cumulative profit stands at {_daily_trading_report_money(payload.get("total_profit_all"), "R", 2)} across {int(payload.get("total_trades_all") or 0)} trades.</li>
+        <li>Hedge coverage tracks {int(payload.get("hedged_rows") or 0)} hedged rows with {_daily_trading_report_num(payload.get("total_grams_to_hedge"), 2)}g remaining to hedge.</li>
+      </ul>
+
+      <div style="margin-top:8px;border-left:4px solid #5f8f28;background:#eef6df;padding:8px 10px;font-size:15px;font-weight:700;color:#4a6b1f;">Monthly Profit Plot (ZAR)</div>
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:6px;">{month_rows_html}</table>
+
+      <div style="margin-top:10px;border-left:4px solid #2f68b2;background:#e8f2ff;padding:8px 10px;font-size:15px;font-weight:700;color:#21508d;">Daily Profit Plot (ZAR)</div>
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:6px;">{daily_rows_html}</table>
+
+      <div style="margin-top:10px;border-left:4px solid #bd7a2f;background:#fbf3e8;padding:8px 10px;font-size:15px;font-weight:700;color:#9a5d1d;">Hedging Plot (grams)</div>
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:6px;">{hedge_rows_html}</table>
+      <div style="color:#364860;font-size:12px;margin-top:6px;">Rows: Hedged {int(payload.get("hedged_rows") or 0)} | Unhedged {int(payload.get("unhedged_rows") or 0)} | To hedge {_daily_trading_report_num(payload.get("total_grams_to_hedge"), 2)}g</div>
+
+      <div style="margin-top:10px;border-left:4px solid #cc4f86;background:#fdeff6;padding:8px 10px;font-size:15px;font-weight:700;color:#a42f64;">Open Positions Revaluation Detail</div>
+      <div style="padding:8px 2px;color:#1f2b3c;font-size:14px;">Open Trades: {int(payload.get("open_positions_trades") or 0)} | Total P&amp;L: <strong>{_daily_trading_report_money(payload.get("open_positions_pnl"), "R", 2)}</strong></div>
+      <div style="padding-top:8px;border-top:1px solid #d4dce8;color:#6d7d95;font-size:11px;">Auto-generated for mobile and desktop viewing.</div>
+    </td></tr>
+  </table>
+</td></tr></table></body></html>"""
+    return html
+
+
+def _daily_trading_report_send_html(
+    run_date_iso: str,
+    html_body: str,
+    recipients_override: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    recipients = recipients_override or _daily_trading_report_parse_recipients(
+        os.getenv("DAILY_TRADING_REPORT_EMAIL_TO", "")
+    )
+    if not recipients:
+        recipients = _daily_trading_report_parse_recipients(os.getenv("DASHBOARD_REPORT_EMAIL_TO", ""))
+    if not recipients:
+        return {"ok": False, "error": "DAILY_TRADING_REPORT_EMAIL_TO is not configured."}
+
+    smtp_host = str(os.getenv("SMTP_HOST", "") or "").strip()
+    smtp_user = str(os.getenv("SMTP_USER", "") or "").strip()
+    smtp_password = str(os.getenv("SMTP_PASSWORD", "") or "").strip()
+    smtp_from = _pmx_non_empty(os.getenv("SMTP_FROM", ""), smtp_user)
+    try:
+        smtp_port = int(os.getenv("SMTP_PORT", "587") or 587)
+    except Exception:
+        smtp_port = 587
+    use_ssl = str(os.getenv("SMTP_SSL", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    use_starttls = str(os.getenv("SMTP_STARTTLS", "true") or "true").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    if not smtp_host:
+        return {"ok": False, "error": "SMTP_HOST is not configured."}
+    if not smtp_from:
+        return {"ok": False, "error": "SMTP_FROM/SMTP_USER is not configured."}
+    if not smtp_password:
+        return {"ok": False, "error": "SMTP_PASSWORD is not configured."}
+
+    run_date = str(run_date_iso or datetime.now().strftime("%Y-%m-%d")).strip()
+    subject = f"{DAILY_TRADING_REPORT_EMAIL_SUBJECT_PREFIX} | {run_date}"
+    plain_body = (
+        f"Daily Trading Report for {run_date}\n"
+        f"Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = smtp_from
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(plain_body)
+    msg.add_alternative(html_body, subtype="html")
+
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host=smtp_host, port=smtp_port, context=ssl.create_default_context(), timeout=60) as client:
+                if smtp_user:
+                    client.login(smtp_user, smtp_password)
+                client.send_message(msg)
+        else:
+            with smtplib.SMTP(host=smtp_host, port=smtp_port, timeout=60) as client:
+                client.ehlo()
+                if use_starttls:
+                    client.starttls(context=ssl.create_default_context())
+                    client.ehlo()
+                if smtp_user:
+                    client.login(smtp_user, smtp_password)
+                client.send_message(msg)
+        return {"ok": True, "message": f"Daily trading report email sent to {', '.join(recipients)}"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _daily_trading_report_run_once_for_date(
+    run_date_iso: str,
+    recipients_override: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    try:
+        # Use current dashboard-ready data/cache; avoid forced TradeMC sync here.
+        try:
+            _clear_heavy_route_cache(["profit_monthly", "hedging:", "pmx_open_positions_reval"])
+        except Exception:
+            pass
+        payload = _daily_trading_report_build_payload(run_date_iso)
+        html_body = _daily_trading_report_render_html(payload)
+    except Exception as exc:
+        return {"ok": False, "error": f"Failed to build report payload: {exc}"}
+    return _daily_trading_report_send_html(run_date_iso, html_body, recipients_override=recipients_override)
+
+
+def _daily_trading_report_scheduler_loop() -> None:
+    print(
+        f"[SCHED] Daily Trading Report email scheduler active at "
+        f"{DAILY_TRADING_REPORT_EMAIL_HOUR:02d}:{DAILY_TRADING_REPORT_EMAIL_MINUTE:02d}."
+    )
+    _daily_balance_email_ensure_log_table()
+    while True:
+        try:
+            now = datetime.now()
+            run_date_iso = now.strftime("%Y-%m-%d")
+            due_now = (
+                now.hour == DAILY_TRADING_REPORT_EMAIL_HOUR
+                and now.minute >= DAILY_TRADING_REPORT_EMAIL_MINUTE
+            )
+            if due_now and not _daily_balance_email_has_success(DAILY_TRADING_REPORT_EMAIL_JOB_NAME, run_date_iso):
+                now_epoch = time.time()
+                last_attempt = float(_daily_trading_report_email_last_attempt_epoch.get(run_date_iso, 0.0))
+                if (now_epoch - last_attempt) >= float(DAILY_TRADING_REPORT_EMAIL_RETRY_SECONDS):
+                    _daily_trading_report_email_last_attempt_epoch[run_date_iso] = now_epoch
+                    result = _daily_trading_report_run_once_for_date(run_date_iso)
+                    status = "success" if result.get("ok") else "failed"
+                    message = str(result.get("message") or result.get("error") or "").strip()
+                    _daily_balance_email_log_run(DAILY_TRADING_REPORT_EMAIL_JOB_NAME, run_date_iso, status, message)
+                    print(f"[SCHED] {DAILY_TRADING_REPORT_EMAIL_JOB_NAME} {status} for {run_date_iso}: {message}")
+
+            for key in list(_daily_trading_report_email_last_attempt_epoch.keys()):
+                if key != run_date_iso:
+                    _daily_trading_report_email_last_attempt_epoch.pop(key, None)
+        except Exception as exc:
+            print(f"[SCHED] Daily Trading Report email scheduler error: {exc}")
+            try:
+                traceback.print_exc()
+            except Exception:
+                pass
+        time.sleep(DAILY_TRADING_REPORT_EMAIL_CHECK_INTERVAL_SECONDS)
+
+
+def _start_daily_trading_report_email_scheduler() -> None:
+    global _daily_trading_report_email_scheduler_started
+    if not DAILY_TRADING_REPORT_EMAIL_ENABLED:
+        print("[SCHED] Daily Trading Report email scheduler disabled (DAILY_TRADING_REPORT_EMAIL_ENABLED=false).")
+        return
+    with _daily_trading_report_email_scheduler_lock:
+        if _daily_trading_report_email_scheduler_started:
+            return
+        t = threading.Thread(target=_daily_trading_report_scheduler_loop, daemon=True)
+        t.start()
+        _daily_trading_report_email_scheduler_started = True
+
+
 def _empty_open_positions_reval_payload(market: Any = None) -> Dict[str, Any]:
     market = market if isinstance(market, dict) else {}
     xau_val = _safe_float(market.get("xau_usd"), default=float("nan"))
@@ -6835,9 +7415,10 @@ def build_trading_ticket_pdf(trade_num_value: str,
     story.append(Spacer(1, 2 * mm))
 
     _audit_sub_title("FX Weighted Average (ZAR/USD)")
+    rand_nbsp = "R\u00a0"
     if fx_trades:
         for idx, t in enumerate(fx_trades):
-            lbl_parts = [f"{t['side']} {_money(t['qty'], '$', 2)} @ {_money(t['price'], 'R\u00a0', 4)}"]
+            lbl_parts = [f"{t['side']} {_money(t['qty'], '$', 2)} @ {_money(t['price'], rand_nbsp, 4)}"]
             if t.get("fnc"):
                 lbl_parts.append(f"FNC: {t['fnc']}")
             if t.get("trade_date"):
@@ -6846,7 +7427,7 @@ def build_trading_ticket_pdf(trade_num_value: str,
                 lbl_parts.append(_tr(t["narration"], 50))
             _audit_row_formula(
                 " \u2014 ".join(lbl_parts),
-                f"{_money(t['qty'], '$', 2)} x {_money(t['price'], 'R\u00a0', 4)}",
+                f"{_money(t['qty'], '$', 2)} x {_money(t['price'], rand_nbsp, 4)}",
                 _money(t["notional"], "R\u00a0"),
                 indent=1,
             )
@@ -6906,10 +7487,10 @@ def build_trading_ticket_pdf(trade_num_value: str,
     for cf in fx_cash_flows:
         sign_str = ""
         if cf["signed"] is not None:
-            sign_str = f"+{_money(cf['signed'], 'R\u00a0')}" if cf["signed"] >= 0 else f"-{_money(abs(cf['signed']), 'R\u00a0')}"
+            sign_str = f"+{_money(cf['signed'], rand_nbsp)}" if cf["signed"] >= 0 else f"-{_money(abs(cf['signed']), rand_nbsp)}"
         else:
             sign_str = "\u2014"
-        lbl_parts = [f"{cf['side']} {_money(cf['qty'], '$', 2)} @ {_money(cf['price'], 'R\u00a0', 4)}"]
+        lbl_parts = [f"{cf['side']} {_money(cf['qty'], '$', 2)} @ {_money(cf['price'], rand_nbsp, 4)}"]
         if cf.get("fnc"):
             lbl_parts.append(f"FNC: {cf['fnc']}")
         if cf.get("trade_date"):
@@ -11629,6 +12210,22 @@ def get_profit_monthly():
     return jsonify(_json_safe(result))
 
 
+@app.route("/api/reports/daily-trading/send-test", methods=["POST"])
+def send_daily_trading_report_test():
+    data = request.get_json(silent=True) or {}
+    run_date = str(data.get("date") or datetime.now().strftime("%Y-%m-%d")).strip()
+    recipients_raw = data.get("to")
+    recipients_override = _daily_trading_report_parse_recipients(recipients_raw)
+    if recipients_raw and not recipients_override:
+        return jsonify({"ok": False, "error": "Invalid recipient list in 'to'."}), 400
+    result = _daily_trading_report_run_once_for_date(
+        run_date_iso=run_date,
+        recipients_override=recipients_override or None,
+    )
+    status = 200 if result.get("ok") else 500
+    return jsonify(_json_safe(result)), status
+
+
 @app.route("/api/export-trades/save", methods=["POST"])
 def export_trades_save_to_folder():
     data = request.json or {}
@@ -11816,6 +12413,108 @@ def export_ledger():
                          as_attachment=True, download_name="trading_ledger.csv")
 
 
+# ---------------------------------------------------------------------------
+# Forecast endpoints  (gold / usdzar / purchases Monte Carlo)
+# ---------------------------------------------------------------------------
+
+_FORECAST_PAIR_MAP = {
+    "gold": ("XAU", "USD"),
+    "usdzar": ("USD", "ZAR"),
+    "purchases": ("XAU", "ZAR"),
+}
+
+
+@app.route("/api/forecast/<pair>")
+def api_forecast_get(pair: str):
+    symbols = _FORECAST_PAIR_MAP.get(pair.lower().strip())
+    if not symbols:
+        return jsonify({"ok": False, "error": f"Unknown pair '{pair}'. Use gold, usdzar, or purchases."}), 400
+    try:
+        days = int(request.args.get("days", 30))
+        sims = int(request.args.get("sims", 10000))
+    except Exception:
+        days, sims = 30, 10000
+    try:
+        result = _forecast_get(symbols[0], symbols[1], forecast_days=days, n_simulations=sims)
+        result["ok"] = True
+        return jsonify(_json_safe(result))
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/forecast/current-price/<pair>")
+def api_forecast_current_price(pair: str):
+    symbols = _FORECAST_PAIR_MAP.get(pair.lower().strip())
+    if not symbols:
+        return jsonify({"ok": False, "error": f"Unknown pair '{pair}'."}), 400
+    try:
+        result = _forecast_current_price(symbols[0], symbols[1])
+        return jsonify({"ok": True, "rate": result["rate"], "last_refreshed": result.get("last_refreshed", "")})
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/forecast/refresh/<pair>", methods=["POST"])
+def api_forecast_refresh(pair: str):
+    symbols = _FORECAST_PAIR_MAP.get(pair.lower().strip())
+    if not symbols:
+        return jsonify({"ok": False, "error": f"Unknown pair '{pair}'."}), 400
+    data = request.get_json(silent=True) or {}
+    try:
+        days = int(data.get("days", 30))
+        sims = int(data.get("sims", 10000))
+    except Exception:
+        days, sims = 30, 10000
+    try:
+        _forecast_invalidate_cache(symbols[0], symbols[1])
+        result = _forecast_get(symbols[0], symbols[1], forecast_days=days, n_simulations=sims)
+        result["ok"] = True
+        return jsonify(_json_safe(result))
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/forecast/purchases/predict")
+def api_forecast_purchases_predict():
+    try:
+        spot_usd = float(request.args["spot_usd"]) if request.args.get("spot_usd") else None
+    except Exception:
+        spot_usd = None
+    try:
+        fx_rate = float(request.args["fx_rate"]) if request.args.get("fx_rate") else None
+    except Exception:
+        fx_rate = None
+    try:
+        result = _purchases_get_forecast(spot_usd=spot_usd, fx_rate=fx_rate)
+        return jsonify(_json_safe(result))
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/forecast/purchases/train", methods=["POST"])
+def api_forecast_purchases_train():
+    try:
+        result = _purchases_train_model(force=True)
+        return jsonify(_json_safe(result))
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/forecast/purchases/status")
+def api_forecast_purchases_status():
+    try:
+        result = _purchases_model_status()
+        return jsonify(_json_safe(result))
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 if __name__ == "__main__":
     try:
         server_port = int(str(os.getenv("PORT", os.getenv("J2_API_PORT", "5001")) or "5001").strip())
@@ -11823,6 +12522,7 @@ if __name__ == "__main__":
         server_port = 5001
     print(f"J2 API Server starting on http://localhost:{server_port}")
     _start_daily_balance_email_scheduler()
+    _start_daily_trading_report_email_scheduler()
     app.run(host="0.0.0.0", port=server_port, debug=True, use_reloader=False)
 
 
