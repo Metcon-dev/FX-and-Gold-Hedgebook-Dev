@@ -1,4 +1,4 @@
-function resolveApiBase(): string {
+﻿function resolveApiBase(): string {
     const envBaseRaw = String(import.meta.env?.VITE_API_BASE_URL || '').trim();
     if (envBaseRaw) return envBaseRaw.replace(/\/+$/, '');
 
@@ -8,7 +8,7 @@ function resolveApiBase(): string {
         // For LAN/IP access, keep same-origin /api so Vite proxy handles backend routing.
         const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1';
         if (isLocalHost && /^517\d+$/.test(String(port))) {
-            return `${protocol}//${hostname}:5001/api`;
+            return `${protocol}//${hostname}:5003/api`;
         }
     }
 
@@ -106,7 +106,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     return parsed as T;
 }
 
-// ── Trades ──────────────────────────────────────────────────────────
+// â”€â”€ Trades â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 export const api = {
     health: () => request<{ status: string; time: string }>('/health'),
 
@@ -406,6 +406,72 @@ export const api = {
     // Trading ticket
     getTicket: (tradeNum: string) =>
         request<Record<string, unknown>>(`/ticket/${encodeURIComponent(tradeNum)}`),
+    checkTradeBookScreenshot: async (tradeNum: string, file: File, tradeMcRows?: Record<string, unknown>[]) => {
+        const form = new FormData();
+        form.append('image', file);
+        form.append('trade_num', String(tradeNum || '').trim());
+        if (Array.isArray(tradeMcRows) && tradeMcRows.length > 0) {
+            form.append('trademc_rows_json', JSON.stringify(tradeMcRows));
+        }
+        const endpointDynamic = `/ticket/${encodeURIComponent(tradeNum)}/book-check`;
+        const endpointFlat = '/ticket/book-check';
+        const urls: string[] = [`${BASE}${endpointDynamic}`, `${BASE}${endpointFlat}`];
+        if (typeof window !== 'undefined') {
+            const host = String(window.location.hostname || '').trim();
+            const proto = String(window.location.protocol || 'http:');
+            if (host) {
+                const localHostDynamic = `${proto}//${host}:5003/api${endpointDynamic}`;
+                const localHostFlat = `${proto}//${host}:5003/api${endpointFlat}`;
+                if (!urls.includes(localHostDynamic)) urls.push(localHostDynamic);
+                if (!urls.includes(localHostFlat)) urls.push(localHostFlat);
+            }
+            const localhostDynamic = `http://localhost:5003/api${endpointDynamic}`;
+            const localhostFlat = `http://localhost:5003/api${endpointFlat}`;
+            if (!urls.includes(localhostDynamic)) urls.push(localhostDynamic);
+            if (!urls.includes(localhostFlat)) urls.push(localhostFlat);
+        }
+
+        let lastErr = 'Trade book checker request failed.';
+        for (let idx = 0; idx < urls.length; idx += 1) {
+            const url = urls[idx];
+            const res = await fetch(url, {
+                method: 'POST',
+                credentials: 'include',
+                body: form,
+            });
+            const raw = await res.text();
+            let parsed: unknown = null;
+            if (raw) {
+                try {
+                    parsed = JSON.parse(raw);
+                } catch {
+                    parsed = null;
+                }
+            }
+
+            if (res.ok) return (parsed as Record<string, unknown>) || {};
+
+            const errMsg = (
+                parsed &&
+                typeof parsed === 'object' &&
+                parsed !== null &&
+                'error' in parsed &&
+                typeof (parsed as { error?: unknown }).error === 'string'
+            )
+                ? String((parsed as { error: string }).error)
+                : (raw || `HTTP ${res.status}`);
+            lastErr = errMsg;
+
+            const looksLikeRouteMiss = /404\s+not\s+found|method\s+not\s+allowed/i.test(errMsg);
+            const canTryFallback = (
+                res.status === 404 ||
+                res.status === 405 ||
+                (res.status >= 500 && looksLikeRouteMiss)
+            ) && idx < (urls.length - 1);
+            if (!canTryFallback) break;
+        }
+        throw new Error(lastErr);
+    },
     getTicketPdf: (tradeNum: string) =>
         fetch(`${BASE}/ticket/${encodeURIComponent(tradeNum)}/pdf`, { credentials: 'include' }),
     getPmxFncPdf: (cell: string, docType = 'FNC', pmxHeaders?: PmxAuthHeaders) => {
@@ -443,7 +509,7 @@ export const api = {
         }>(`/pmx/reconciliation${qs}`);
     },
 
-    // ── Supplier Payment Recons (SharePoint) ──────────────────
+    // â”€â”€ Supplier Payment Recons (SharePoint) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     exportTradingWorksheetExcel: (data: {
         worksheet_ref?: string;
         usd_rows: { qty?: string; rate?: string }[];
@@ -523,5 +589,6 @@ export const api = {
 };
 
 export default api;
+
 
 

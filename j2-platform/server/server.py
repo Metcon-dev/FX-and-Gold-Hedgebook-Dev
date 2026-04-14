@@ -9,6 +9,7 @@ import io
 import json
 import math
 import csv
+import base64
 import hashlib
 import hmac
 import smtplib
@@ -16,8 +17,10 @@ import sqlite3
 import threading
 import traceback
 import time
+from collections import Counter
 from copy import copy
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from email.message import EmailMessage
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12166,7 +12169,7 @@ def get_weighted_average(trade_num):
     return jsonify(result)
 
 
-@app.route("/api/ticket/<trade_num>")
+@app.route("/api/ticket/<path:trade_num>")
 def get_ticket(trade_num):
     result = build_trading_ticket(trade_num)
     if result is None:
@@ -12174,7 +12177,384 @@ def get_ticket(trade_num):
     return jsonify(result)
 
 
-@app.route("/api/ticket/<trade_num>/pdf")
+def _normalize_tradebook_supplier(value: Any) -> str:
+    text = str(value or "").upper().strip()
+    text = re.sub(r"^\s*\d+\s*[\)\.\-:]*\s*", "", text)
+    text = re.sub(r"[^A-Z0-9&]+", " ", text)
+    text = re.sub(r"\bLTD\b", "LIMITED", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_tradebook_number(value: Any) -> str:
+    text = str(value or "").strip()
+    text = text.replace(",", "").replace(" ", "")
+    text = text.replace("R/", "").replace("$", "").replace("R", "")
+    text = text.replace("–", "-").replace("—", "-")
+    if not text:
+        return ""
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", text) is None:
+        return ""
+    try:
+        dec = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return ""
+    normalized = format(dec, "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized if normalized else "0"
+
+
+def _tradebook_key(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    return (
+        _normalize_tradebook_supplier(row.get("Supplier")),
+        _normalize_tradebook_number(row.get("Weight (g)")),
+        _normalize_tradebook_number(row.get("Gold Rate ($/oz)")),
+        _normalize_tradebook_number(row.get("Exchange Rate")),
+    )
+
+
+def _tradebook_key_to_row(key: Tuple[str, str, str, str]) -> Dict[str, Any]:
+    def _num_or_text(v: str) -> Any:
+        if not v:
+            return ""
+        try:
+            return float(v)
+        except Exception:
+            return v
+
+    return {
+        "Supplier": key[0],
+        "Weight (g)": _num_or_text(key[1]),
+        "Gold Rate ($/oz)": _num_or_text(key[2]),
+        "Exchange Rate": _num_or_text(key[3]),
+    }
+
+
+def _extract_trademc_truth_rows(ticket_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    tm_rows = ticket_payload.get("trademc") or []
+    if not isinstance(tm_rows, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for raw in tm_rows:
+        if not isinstance(raw, dict):
+            continue
+        supplier = raw.get("Company")
+        if str(supplier or "").strip().upper() == "TRADING CONTROL ACCOUNT":
+            continue
+        row = {
+            "Supplier": supplier,
+            "Weight (g)": raw.get("Weight (g)"),
+            "Gold Rate ($/oz)": raw.get("$/oz Booked"),
+            "Exchange Rate": raw.get("FX Rate"),
+        }
+        key = _tradebook_key(row)
+        if not all(key):
+            continue
+        out.append({
+            "Supplier": key[0],
+            "Weight (g)": float(key[1]),
+            "Gold Rate ($/oz)": float(key[2]),
+            "Exchange Rate": float(key[3]),
+        })
+    return out
+
+
+def _extract_trademc_truth_rows_from_uploaded_rows(rows: Any) -> List[Dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        row = {
+            "Supplier": raw.get("Supplier", raw.get("Company")),
+            "Weight (g)": raw.get("Weight (g)"),
+            "Gold Rate ($/oz)": raw.get("Gold Rate ($/oz)", raw.get("$/oz Booked")),
+            "Exchange Rate": raw.get("Exchange Rate", raw.get("FX Rate")),
+        }
+        key = _tradebook_key(row)
+        if not all(key):
+            continue
+        out.append({
+            "Supplier": key[0],
+            "Weight (g)": float(key[1]),
+            "Gold Rate ($/oz)": float(key[2]),
+            "Exchange Rate": float(key[3]),
+        })
+    return out
+
+
+def _parse_tradebook_rows_from_image_bytes(
+    image_bytes: bytes,
+    mime_type: str = "image/png",
+    trade_mc_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    api_key = str(os.getenv("GEMINI_API_KEY", "") or "").strip()
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY in environment.")
+
+    env_model = str(os.getenv("GEMINI_MODEL", "") or "").strip()
+    model_candidates: List[str] = []
+    if env_model:
+        model_candidates.append(env_model)
+    model_candidates.extend([
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash",
+    ])
+    # Preserve order while removing duplicates.
+    seen_models = set()
+    model_candidates = [m for m in model_candidates if not (m in seen_models or seen_models.add(m))]
+
+    api_versions = ["v1beta", "v1"]
+    tm_rows = trade_mc_rows or []
+    tm_lines: List[str] = []
+    for idx, row in enumerate(tm_rows):
+        tm_lines.append(
+            f"{idx + 1}. Supplier={row.get('Supplier','')}, Weight={row.get('Weight (g)','')}, PM Price={row.get('Gold Rate ($/oz)','')}, FX Rate={row.get('Exchange Rate','')}"
+        )
+    tm_block = "\n".join(tm_lines) if tm_lines else "None provided"
+    prompt = (
+        "You are validating a manual trading book screenshot against TradeMC source rows.\n"
+        "Task:\n"
+        "1) Read ONLY supplier table rows from screenshot.\n"
+        "2) For EACH screenshot row, match it to ONE TradeMC row by comparing Weight, PM Price, FX Rate first, then supplier name.\n"
+        "3) Handle normal supplier aliases: LTD == LIMITED, (PTY) == PTY, optional punctuation/brackets.\n"
+        "4) Return one output row per screenshot row. Do not deduplicate.\n"
+        "5) If a TradeMC row match is found, set Supplier to the matched TradeMC Supplier text.\n"
+        "6) If no match is found, keep screenshot Supplier text and add warning.\n\n"
+        f"TradeMC rows:\n{tm_block}\n\n"
+        "Return strict JSON only with shape: "
+        "{\"rows\":[{\"Supplier\":\"...\",\"Weight\":\"...\",\"PM Price\":\"...\",\"FX Rate\":\"...\"}],\"warnings\":[\"...\"]}"
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": str(mime_type or "image/png"),
+                            "data": base64.b64encode(image_bytes).decode("ascii"),
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+        },
+    }
+    resp = None
+    last_model_err = ""
+    transient_statuses = {429, 500, 502, 503, 504}
+    for api_version in api_versions:
+        for model in model_candidates:
+            endpoint = f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent"
+            for attempt in range(2):
+                try:
+                    trial = requests.post(
+                        endpoint,
+                        params={"key": api_key},
+                        json=payload,
+                        timeout=60,
+                    )
+                except Exception as exc:
+                    last_model_err = f"Gemini request failed for {model} ({api_version}): {exc}"
+                    if attempt == 0:
+                        time.sleep(0.35)
+                        continue
+                    break
+
+                if trial.ok:
+                    resp = trial
+                    break
+
+                body = str(trial.text or "")
+                status = int(trial.status_code)
+                is_model_not_found = (
+                    status == 404 and
+                    ("models/" in body or "NOT_FOUND" in body or "not found" in body.lower())
+                )
+                if is_model_not_found:
+                    last_model_err = f"Model not found: {model} ({api_version})"
+                    break
+
+                if status in transient_statuses:
+                    last_model_err = f"Temporary Gemini error ({status}) on {model}/{api_version}"
+                    if attempt == 0:
+                        time.sleep(0.5)
+                        continue
+                    break
+
+                body_preview = body.strip()[:400]
+                raise RuntimeError(f"Gemini API error ({status}) on {model}/{api_version}: {body_preview}")
+
+            if resp is not None:
+                break
+        if resp is not None:
+            break
+
+    if resp is None:
+        raise RuntimeError(
+            "Gemini model discovery failed. "
+            f"Tried: {', '.join(model_candidates)} across {', '.join(api_versions)}. "
+            f"Last error: {last_model_err or 'unknown'}"
+        )
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError("Gemini returned non-JSON response.")
+
+    candidates = data.get("candidates") if isinstance(data, dict) else None
+    if not isinstance(candidates, list) or not candidates:
+        raise RuntimeError("Gemini returned no candidates.")
+    parts = (((candidates[0] or {}).get("content") or {}).get("parts")) if isinstance(candidates[0], dict) else None
+    text = ""
+    if isinstance(parts, list):
+        for p in parts:
+            if isinstance(p, dict) and isinstance(p.get("text"), str):
+                text += p["text"]
+    text = text.strip()
+    if not text:
+        raise RuntimeError("Gemini returned empty extraction output.")
+
+    try:
+        obj = json.loads(text)
+    except Exception:
+        text_clean = re.sub(r"^```json\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+        try:
+            obj = json.loads(text_clean)
+        except Exception:
+            raise RuntimeError(f"Unable to parse Gemini JSON output: {text[:220]}")
+
+    rows_raw = obj.get("rows") if isinstance(obj, dict) else None
+    warnings_raw = obj.get("warnings") if isinstance(obj, dict) else None
+    warnings: List[str] = [str(w).strip() for w in (warnings_raw or []) if str(w).strip()] if isinstance(warnings_raw, list) else []
+    if not isinstance(rows_raw, list):
+        return [], warnings or ["Gemini did not return row data."]
+
+    parsed_rows: List[Dict[str, Any]] = []
+    for raw in rows_raw:
+        if not isinstance(raw, dict):
+            continue
+        row = {
+            "Supplier": raw.get("Supplier", raw.get("supplier")),
+            "Weight (g)": raw.get("Weight", raw.get("weight")),
+            "Gold Rate ($/oz)": raw.get("PM Price", raw.get("pm_price")),
+            "Exchange Rate": raw.get("FX Rate", raw.get("fx_rate")),
+        }
+        key = _tradebook_key(row)
+        if not all(key):
+            continue
+        parsed_rows.append({
+            "Supplier": key[0],
+            "Weight (g)": float(key[1]),
+            "Gold Rate ($/oz)": float(key[2]),
+            "Exchange Rate": float(key[3]),
+        })
+
+    if not parsed_rows:
+        warnings.append("Gemini did not return any valid supplier rows.")
+    return parsed_rows, warnings
+
+
+def _check_tradebook_against_trademc_impl(trade_num: str):
+    upload = request.files.get("image") or request.files.get("screenshot")
+    if upload is None:
+        return jsonify({"error": "Missing image upload. Use form field 'image'."}), 400
+
+    image_bytes = upload.read() or b""
+    if not image_bytes:
+        return jsonify({"error": "Uploaded image is empty."}), 400
+
+    uploaded_truth_rows: List[Dict[str, Any]] = []
+    uploaded_truth_json = str(request.form.get("trademc_rows_json") or "").strip()
+    if uploaded_truth_json:
+        try:
+            payload_rows = json.loads(uploaded_truth_json)
+            uploaded_truth_rows = _extract_trademc_truth_rows_from_uploaded_rows(payload_rows)
+        except Exception:
+            uploaded_truth_rows = []
+
+    ticket = None
+    truth_rows = uploaded_truth_rows
+    if not truth_rows:
+        return jsonify({
+            "error": (
+                "No TradeMC source rows were provided for comparison. "
+                "Load the ticket first so TradeMC rows are visible, then upload screenshot again."
+            )
+        }), 400
+
+    try:
+        parsed_rows, parse_warnings = _parse_tradebook_rows_from_image_bytes(
+            image_bytes=image_bytes,
+            mime_type=str(getattr(upload, "mimetype", "") or "image/png"),
+            trade_mc_rows=truth_rows,
+        )
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    parsed_counter = Counter(_tradebook_key(r) for r in parsed_rows if all(_tradebook_key(r)))
+    truth_counter = Counter(_tradebook_key(r) for r in truth_rows if all(_tradebook_key(r)))
+
+    matched = 0
+    for key, parsed_count in parsed_counter.items():
+        matched += min(parsed_count, truth_counter.get(key, 0))
+
+    manual_not_in_trademc: List[Dict[str, Any]] = []
+    missing_from_manual_book: List[Dict[str, Any]] = []
+    all_keys = sorted(set(parsed_counter.keys()) | set(truth_counter.keys()))
+    for key in all_keys:
+        parsed_count = parsed_counter.get(key, 0)
+        truth_count = truth_counter.get(key, 0)
+        if parsed_count > truth_count:
+            manual_not_in_trademc.extend([_tradebook_key_to_row(key) for _ in range(parsed_count - truth_count)])
+        elif truth_count > parsed_count:
+            missing_from_manual_book.extend([_tradebook_key_to_row(key) for _ in range(truth_count - parsed_count)])
+
+    return jsonify({
+        "ok": True,
+        "trade_num": str((ticket or {}).get("trade_num") or trade_num),
+        "source_of_truth": "TradeMC",
+        "parsed_rows": parsed_rows,
+        "parse_warnings": parse_warnings,
+        "manual_not_in_trademc": manual_not_in_trademc,
+        "missing_from_manual_book": missing_from_manual_book,
+        "counts": {
+            "parsed_rows": len(parsed_rows),
+            "trademc_rows": len(truth_rows),
+            "matched_rows": int(matched),
+            "manual_not_in_trademc": len(manual_not_in_trademc),
+            "missing_from_manual_book": len(missing_from_manual_book),
+        },
+    })
+
+
+@app.route("/api/ticket/<path:trade_num>/book-check", methods=["POST"])
+def check_tradebook_against_trademc(trade_num):
+    return _check_tradebook_against_trademc_impl(str(trade_num or "").strip())
+
+
+@app.route("/api/ticket/book-check", methods=["POST"])
+def check_tradebook_against_trademc_flat():
+    trade_num = str(
+        request.form.get("trade_num")
+        or request.args.get("trade_num")
+        or (request.get_json(silent=True) or {}).get("trade_num")
+        or ""
+    ).strip()
+    if not trade_num:
+        return jsonify({"error": "Missing trade_num in form/query/json."}), 400
+    return _check_tradebook_against_trademc_impl(trade_num)
+
+
+@app.route("/api/ticket/<path:trade_num>/pdf")
 def get_ticket_pdf(trade_num):
     frames = build_trading_ticket_frames(trade_num)
     if frames is None:
@@ -12517,13 +12897,10 @@ def api_forecast_purchases_status():
 
 if __name__ == "__main__":
     try:
-        server_port = int(str(os.getenv("PORT", os.getenv("J2_API_PORT", "5001")) or "5001").strip())
+        server_port = int(str(os.getenv("PORT", os.getenv("J2_API_PORT", "5003")) or "5003").strip())
     except Exception:
-        server_port = 5001
+        server_port = 5003
     print(f"J2 API Server starting on http://localhost:{server_port}")
     _start_daily_balance_email_scheduler()
     _start_daily_trading_report_email_scheduler()
     app.run(host="0.0.0.0", port=server_port, debug=True, use_reloader=False)
-
-
-

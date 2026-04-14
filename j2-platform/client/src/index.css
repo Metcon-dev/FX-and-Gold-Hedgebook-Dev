@@ -2677,6 +2677,11 @@ h3 {
   table-layout: fixed;
 }
 
+/* Keep worksheet header non-sticky so only the summary row is pinned. */
+.worksheet-table thead {
+  position: static;
+}
+
 .worksheet-table th,
 .worksheet-table td {
   vertical-align: middle;
@@ -2697,22 +2702,28 @@ h3 {
   text-align: right;
 }
 
+.worksheet-table th:nth-child(5),
+.worksheet-table td:nth-child(5) {
+  text-align: center;
+}
+
 .worksheet-summary-bar {
   position: sticky;
   top: 0;
-  z-index: 8;
+  z-index: 12;
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr;
   border: 1px solid #e5e7eb;
   border-bottom: none;
   background: #ffffff;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.04);
 }
 
 .worksheet-summary-cell {
-  padding: 0.5rem 0.6rem;
+  padding: 0.75rem 0.8rem;
   border-right: 1px solid #e5e7eb;
-  font-size: 0.78rem;
-  font-weight: 700;
+  font-size: 0.9rem;
+  font-weight: 800;
   text-align: right;
 }
 
@@ -2743,6 +2754,17 @@ h3 {
   border-color: #94a3b8;
   box-shadow: inset 0 0 0 1px #94a3b8;
   background: #ffffff;
+}
+
+.worksheet-row-locked {
+  background: #f8fafc;
+}
+
+.worksheet-row-locked .worksheet-cell-input {
+  background: #eef2f7;
+  color: #475569;
+  border-color: #dbe2ea;
+  cursor: not-allowed;
 }
 
 .worksheet-side-chip {
@@ -2894,4 +2916,96 @@ h3 {
   .trademc-forecast-controls .filter-group {
     min-width: 0;
   }
+}
+
+.trade-book-checker-upload-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.trade-book-checker-upload-btn {
+  position: relative;
+  overflow: hidden;
+}
+
+.trade-book-checker-file-input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.trade-book-checker-file-name {
+  color: #4b5563;
+  font-size: 12px;
+}
+
+.trade-book-checker-summary-grid {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+.trade-book-checker-summary-card {
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 10px;
+  background: #f9fafb;
+}
+
+.trade-book-checker-summary-card-discrepancy {
+  border-color: #fca5a5;
+  background: #fff1f2;
+}
+
+.trade-book-checker-summary-label {
+  font-size: 11px;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.trade-book-checker-summary-value {
+  margin-top: 4px;
+  font-size: 20px;
+  font-weight: 700;
+  color: #111827;
+}
+
+.trade-book-checker-warning {
+  margin-top: 10px;
+  border: 1px solid #f59e0b;
+  background: #fffbeb;
+  color: #92400e;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.trade-book-diff-table .trade-book-diff-type {
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.trade-book-diff-table .diff-row-manual td {
+  border-top: 1px solid #f3f4f6;
+}
+
+.trade-book-diff-table .diff-row-correct td {
+  border-bottom: 2px solid #d1d5db;
+}
+
+.trade-book-diff-bad {
+  background: #fff1f2;
+  color: #b91c1c;
+  font-weight: 700;
+}
+
+.trade-book-diff-good {
+  background: #f0fdf4;
+  color: #166534;
+  font-weight: 700;
 }

@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+﻿import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
@@ -9,11 +9,12 @@ export default defineConfig({
         port: 5173,
         proxy: {
             '/api': {
-                target: 'http://localhost:5001',
+                target: 'http://localhost:5003',
                 changeOrigin: true,
-                timeout: 600000,       // 10 min – full sync fetches ~13k trades
-                proxyTimeout: 600000,  // 10 min – allow long-running syncs
+                timeout: 600000,       // 10 min â€“ full sync fetches ~13k trades
+                proxyTimeout: 600000,  // 10 min â€“ allow long-running syncs
             }
         }
     }
 })
+

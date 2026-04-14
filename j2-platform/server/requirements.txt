@@ -9,3 +9,5 @@ yfinance
 scikit-learn
 reportlab
 fpdf2
+Pillow
+pytesseract

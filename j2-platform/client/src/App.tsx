@@ -1,4 +1,4 @@
-﻿import { Fragment, useState, useEffect, useCallback, useMemo, useRef, Component, type ErrorInfo, type FormEvent, type ReactNode } from 'react'
+﻿import { Fragment, useState, useEffect, useCallback, useMemo, useRef, Component, type ErrorInfo, type FormEvent, type ReactNode, type ChangeEvent } from 'react'
 import { api, type AppUser, type AdminUser } from './api/client'
 import { ResponsiveContainer, ComposedChart, Bar, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, Scatter } from 'recharts'
 
@@ -3460,10 +3460,18 @@ function WeightedAverage() {
     const [result, setResult] = useState<Record<string, unknown> | null>(null);
     const [loading, setLoading] = useState(false);
     const { show, Toast } = useToast();
-    type SheetRow = { id: string; weight: string; rate: string };
-    const makeBlankRow = (): SheetRow => ({ id: `${Date.now()}-${Math.random()}`, weight: '', rate: '' });
-    const [goldSheetRows, setGoldSheetRows] = useState<SheetRow[]>([makeBlankRow(), makeBlankRow(), makeBlankRow()]);
-    const [fxSheetRows, setFxSheetRows] = useState<SheetRow[]>([makeBlankRow(), makeBlankRow(), makeBlankRow()]);
+    type SheetRow = { id: string; side: string; weight: string; rate: string; total: string; locked: boolean };
+    const TOLERANCE = 0.1;
+    const makeBlankRow = (): SheetRow => ({
+        id: `${Date.now()}-${Math.random()}`,
+        side: '',
+        weight: '',
+        rate: '',
+        total: '',
+        locked: false,
+    });
+    const [goldSheetRows, setGoldSheetRows] = useState<SheetRow[]>([makeBlankRow()]);
+    const [fxSheetRows, setFxSheetRows] = useState<SheetRow[]>([makeBlankRow()]);
 
     const toNum = (v: unknown): number | null => {
         const n = Number(String(v ?? '').replace(/,/g, '').trim());
@@ -3471,19 +3479,48 @@ function WeightedAverage() {
     };
     const sheetTotals = (rows: SheetRow[]) => {
         let totalWeight = 0;
-        let totalValue = 0;
+        let enteredTotal = 0;
+        let calculatedTotal = 0;
+        let loadedReferenceTotal = 0;
+        let loadedRowsCount = 0;
+        let enteredRowsCount = 0;
         for (const r of rows) {
             const w = toNum(r.weight);
             const rate = toNum(r.rate);
-            if (w === null || rate === null) continue;
-            totalWeight += w;
-            totalValue += w * rate;
+            const total = toNum(r.total);
+            if (w !== null) totalWeight += w;
+            if (w !== null && rate !== null) calculatedTotal += w * rate;
+            if (total !== null) {
+                enteredTotal += total;
+                enteredRowsCount += 1;
+                if (r.locked) {
+                    loadedReferenceTotal += total;
+                    loadedRowsCount += 1;
+                }
+            }
         }
-        const wa = Math.abs(totalWeight) > 1e-12 ? (totalValue / totalWeight) : null;
-        return { totalWeight, totalValue, wa };
+        const wa = Math.abs(totalWeight) > 1e-12 ? (calculatedTotal / totalWeight) : null;
+        const delta = enteredRowsCount > 0 ? (enteredTotal - calculatedTotal) : null;
+        const out = delta !== null ? Math.abs(delta) > TOLERANCE : false;
+        return {
+            totalWeight,
+            enteredTotal,
+            calculatedTotal,
+            wa,
+            delta,
+            out,
+            loadedReferenceTotal,
+            loadedRowsCount,
+        };
     };
     const goldTotals = useMemo(() => sheetTotals(goldSheetRows), [goldSheetRows]);
     const fxTotals = useMemo(() => sheetTotals(fxSheetRows), [fxSheetRows]);
+    const overallDelta = useMemo(() => {
+        const deltas = [goldTotals.delta, fxTotals.delta].filter((v): v is number => v !== null);
+        if (deltas.length === 0) return null;
+        return deltas.reduce((acc, v) => acc + v, 0);
+    }, [goldTotals.delta, fxTotals.delta]);
+    const overallOut = overallDelta !== null ? Math.abs(overallDelta) > TOLERANCE : false;
 
     const search = async () => {
         if (!tradeNum.trim()) return;
@@ -3493,24 +3530,30 @@ function WeightedAverage() {
             setResult(res);
             const xauRows = ((res?.xau_usd as Row[] | undefined) || []);
             const zarRows = ((res?.usd_zar as Row[] | undefined) || []);
-            const mapToSheet = (rows: Row[], weightKeys: string[], rateKeys: string[]): SheetRow[] => {
+            const pickFirst = (row: Row, keys: string[]): unknown => keys.map((k) => row[k]).find((v) => v !== undefined && v !== null && String(v).trim() !== '');
+            const mapToSheet = (rows: Row[], weightKeys: string[], rateKeys: string[], totalKeys: string[]): SheetRow[] => {
                 const mapped = rows.map((row) => {
-                    const weightVal = weightKeys.map(k => row[k]).find(v => toNum(v) !== null);
-                    const rateVal = rateKeys.map(k => row[k]).find(v => toNum(v) !== null);
+                    const weightVal = pickFirst(row, weightKeys);
+                    const rateVal = pickFirst(row, rateKeys);
+                    const totalVal = pickFirst(row, totalKeys);
+                    const sideRaw = String(pickFirst(row, ['side', 'trade_side', 'deal_side']) ?? '').trim().toUpperCase();
                     return {
                         id: `${Date.now()}-${Math.random()}`,
+                        side: sideRaw === 'BUY' || sideRaw === 'SELL' ? sideRaw : '',
                         weight: weightVal !== undefined && weightVal !== null ? String(weightVal) : '',
                         rate: rateVal !== undefined && rateVal !== null ? String(rateVal) : '',
+                        total: totalVal !== undefined && totalVal !== null ? String(totalVal) : '',
+                        locked: true,
                     };
                 });
-                if (mapped.length === 0) mapped.push(makeBlankRow(), makeBlankRow(), makeBlankRow());
-                return mapped;
+                return mapped.length > 0 ? [...mapped, makeBlankRow()] : [makeBlankRow()];
             };
             setGoldSheetRows(
                 mapToSheet(
                     xauRows,
                     ['quantity', 'qty', 'weight', 'weight_oz'],
-                    ['price', 'rate', 'usd_per_oz']
+                    ['price', 'rate', 'usd_per_oz'],
+                    ['total', 'value', 'notional', 'total_val', 'usd_value']
                 )
             );
             setFxSheetRows(
@@ -3518,6 +3561,8 @@ function WeightedAverage() {
                     zarRows,
                     ['quantity', 'qty', 'usd_amount', 'amount'],
                     ['price', 'rate', 'usd_zar']
+                    ,
+                    ['total', 'value', 'notional', 'total_val', 'zar_value']
                 )
             );
         } catch (e: unknown) {
@@ -3530,32 +3575,49 @@ function WeightedAverage() {
     const updateRow = (
         setRows: React.Dispatch<React.SetStateAction<SheetRow[]>>,
         rowId: string,
-        field: 'weight' | 'rate',
+        field: 'side' | 'weight' | 'rate' | 'total',
         value: string
     ) => {
-        setRows((prev) => prev.map(r => (r.id === rowId ? { ...r, [field]: value } : r)));
+        setRows((prev) => prev.map((r) => {
+            if (r.id !== rowId) return r;
+            if (r.locked) return r;
+            return { ...r, [field]: value };
+        }));
     };
     const addRow = (setRows: React.Dispatch<React.SetStateAction<SheetRow[]>>) =>
         setRows((prev) => [...prev, makeBlankRow()]);
     const removeRow = (setRows: React.Dispatch<React.SetStateAction<SheetRow[]>>, rowId: string) =>
-        setRows((prev) => prev.filter(r => r.id !== rowId));
+        setRows((prev) => prev.filter(r => !(r.id === rowId && !r.locked)));
+    const manualRowCount = (rows: SheetRow[]) => rows.filter((r) => !r.locked).length;
     const renderSheet = (
         title: string,
         rows: SheetRow[],
         setRows: React.Dispatch<React.SetStateAction<SheetRow[]>>,
         weightLabel: string,
         rateLabel: string,
-        totalPrefix: string
+        totalPrefix: string,
+        rateDecimals: number,
+        totals: {
+            totalTraded: number;
+            weightedRate: number | null;
+            product: number;
+        }
     ) => (
-        <div className="section mt-3">
+        <div className="worksheet-card section">
             <div className="section-title">{title}</div>
-            <div className="table-container">
-                <table className="data-table">
+            <div className="worksheet-table-wrap">
+                <div className="worksheet-summary-bar">
+                    <div className="worksheet-summary-cell">{`Total Traded: ${fmt(totals.totalTraded, 4)}`}</div>
+                    <div className="worksheet-summary-cell">{`Weighted Rate: ${totals.weightedRate !== null ? fmt(totals.weightedRate, rateDecimals) : '--'}`}</div>
+                    <div className="worksheet-summary-cell">{`Product: ${totalPrefix}${fmt(totals.product, 2)}`}</div>
+                </div>
+                <table className="data-table worksheet-table">
                     <thead>
                         <tr>
-                            <th style={{ width: '40%' }}>{weightLabel}</th>
-                            <th style={{ width: '30%' }}>{rateLabel}</th>
-                            <th style={{ width: '20%' }}>Total</th>
+                            <th style={{ width: '14%' }}>Side</th>
+                            <th style={{ width: '24%' }}>{weightLabel}</th>
+                            <th style={{ width: '24%' }}>{rateLabel}</th>
+                            <th style={{ width: '28%' }}>Total</th>
                             <th style={{ width: '10%' }}></th>
                         </tr>
                     </thead>
@@ -3563,28 +3625,57 @@ function WeightedAverage() {
                         {rows.map((r) => {
                             const w = toNum(r.weight);
                             const rate = toNum(r.rate);
-                            const total = w !== null && rate !== null ? w * rate : null;
+                            const calc = w !== null && rate !== null ? w * rate : null;
+                            const entered = toNum(r.total);
+                            const rowDelta = entered !== null && calc !== null ? entered - calc : null;
+                            const rowOut = rowDelta !== null ? Math.abs(rowDelta) > TOLERANCE : false;
                             return (
-                                <tr key={r.id}>
+                                <tr key={r.id} className={r.locked ? 'worksheet-row-locked' : ''}>
+                                    <td>
+                                        {r.locked ? (
+                                            <span className={`worksheet-side-chip ${String(r.side).toLowerCase()}`}>{r.side || '--'}</span>
+                                        ) : (
+                                            <input
+                                                className="worksheet-cell-input"
+                                                value={r.side}
+                                                placeholder="BUY/SELL"
+                                                onChange={(e) => updateRow(setRows, r.id, 'side', e.target.value.toUpperCase())}
+                                            />
+                                        )}
+                                    </td>
                                     <td>
                                         <input
-                                            className="editable-input"
+                                            className="worksheet-cell-input"
                                             value={r.weight}
                                             placeholder="0"
+                                            disabled={r.locked}
                                             onChange={(e) => updateRow(setRows, r.id, 'weight', e.target.value)}
                                         />
                                     </td>
                                     <td>
                                         <input
-                                            className="editable-input"
+                                            className="worksheet-cell-input"
                                             value={r.rate}
                                             placeholder="0"
+                                            disabled={r.locked}
                                             onChange={(e) => updateRow(setRows, r.id, 'rate', e.target.value)}
                                         />
                                     </td>
-                                    <td className="num">{total !== null ? `${totalPrefix}${fmt(total, 2)}` : '--'}</td>
+                                    <td className={`num ${rowOut ? 'trade-book-diff-bad' : ''}`}>
+                                        <input
+                                            className="worksheet-cell-input"
+                                            value={r.total}
+                                            placeholder={calc !== null ? fmt(calc, 2) : '0'}
+                                            disabled={r.locked}
+                                            onChange={(e) => updateRow(setRows, r.id, 'total', e.target.value)}
+                                        />
+                                    </td>
                                     <td>
-                                        <button className="btn btn-sm" onClick={() => removeRow(setRows, r.id)}>x</button>
+                                        {r.locked ? (
+                                            <span className="worksheet-side-empty">-</span>
+                                        ) : (
+                                            <button className="btn btn-sm" onClick={() => removeRow(setRows, r.id)}>x</button>
+                                        )}
                                     </td>
                                 </tr>
                             );
@@ -3617,19 +3708,52 @@ function WeightedAverage() {
                 <div className="stat-card">
                     <div className="stat-label">Gold WA ($/oz)</div>
                     <div className="stat-value">{goldTotals.wa !== null ? `$${fmt(goldTotals.wa, 4)}` : '--'}</div>
-                    <div className="stat-sub">Weight: {fmt(goldTotals.totalWeight, 3)} | Total: ${fmt(goldTotals.totalValue, 2)}</div>
+                    <div className="stat-sub">Weight: {fmt(goldTotals.totalWeight, 3)} | Calc: ${fmt(goldTotals.calculatedTotal, 2)}</div>
                 </div>
                 <div className="stat-card">
                     <div className="stat-label">USD/ZAR WA</div>
                     <div className="stat-value">{fxTotals.wa !== null ? `R${fmt(fxTotals.wa, 5)}` : '--'}</div>
-                    <div className="stat-sub">Weight: {fmt(fxTotals.totalWeight, 2)} | Total: R{fmt(fxTotals.totalValue, 2)}</div>
+                    <div className="stat-sub">Weight: {fmt(fxTotals.totalWeight, 2)} | Calc: R{fmt(fxTotals.calculatedTotal, 2)}</div>
+                </div>
+                <div className={`worksheet-balance-kpi ${overallOut ? 'unbalanced' : 'balanced'}`}>
+                    <div className="worksheet-balance-label">Out Check (Tolerance {TOLERANCE})</div>
+                    <div className="worksheet-balance-value">{overallOut ? 'Out' : 'In Balance'}</div>
+                    <div className="worksheet-balance-meta">{overallDelta !== null ? `Combined Delta: ${fmt(overallDelta, 2)}` : 'Enter totals in manual rows to compare.'}</div>
                 </div>
             </div>
 
-            {renderSheet('Gold Worksheet (Excel Style)', goldSheetRows, setGoldSheetRows, 'Weight (oz)', 'Rate ($/oz)', '$')}
-            {renderSheet('USD/ZAR Worksheet (Excel Style)', fxSheetRows, setFxSheetRows, 'Weight (USD)', 'Rate (USD/ZAR)', 'R')}
+            <div className="worksheet-grid-two">
+                {renderSheet(
+                    'Gold Worksheet',
+                    goldSheetRows,
+                    setGoldSheetRows,
+                    'Weight (oz)',
+                    'PM Price ($/oz)',
+                    '$',
+                    2,
+                    {
+                        totalTraded: goldTotals.totalWeight,
+                        weightedRate: goldTotals.wa,
+                        product: goldTotals.calculatedTotal,
+                    }
+                )}
+                {renderSheet(
+                    'FX Worksheet',
+                    fxSheetRows,
+                    setFxSheetRows,
+                    'Weight (USD)',
+                    'FX Rate (USD/ZAR)',
+                    'R',
+                    4,
+                    {
+                        totalTraded: fxTotals.totalWeight,
+                        weightedRate: fxTotals.wa,
+                        product: fxTotals.calculatedTotal,
+                    }
+                )}
+            </div>
 
-            {!loading && !result && <Empty title="Load a trade number or enter rows manually in both tables." />}
+            {!loading && !result && <Empty title="Load a trade number to lock source rows, then add manual rows below for adjustments." />}
             {Toast}
         </div>
     );
@@ -3643,6 +3767,9 @@ function TradingTicket() {
     const [ticket, setTicket] = useState<Record<string, unknown> | null>(null);
     const [loading, setLoading] = useState(false);
     const [downloading, setDownloading] = useState(false);
+    const [bookCheckRunning, setBookCheckRunning] = useState(false);
+    const [bookCheckResult, setBookCheckResult] = useState<Record<string, unknown> | null>(null);
+    const [bookCheckFileName, setBookCheckFileName] = useState('');
     const { show, Toast } = useToast();
 
     const search = async () => {
@@ -3651,9 +3778,13 @@ function TradingTicket() {
         try {
             const res = await api.getTicket(tradeNum.trim());
             setTicket(res);
+            setBookCheckResult(null);
+            setBookCheckFileName('');
         } catch (e: unknown) {
             show(String(e), 'error');
             setTicket(null);
+            setBookCheckResult(null);
+            setBookCheckFileName('');
         }
         setLoading(false);
     };
@@ -4020,6 +4151,105 @@ function TradingTicket() {
         return [primaryRow, controlRow];
     })();
 
+    const onBookCheckUpload = async (event: ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        event.currentTarget.value = '';
+        if (!file) return;
+        if (!ticketTradeNum) {
+            show('Load a Trading Ticket first before running the trade book checker.', 'error');
+            return;
+        }
+        setBookCheckRunning(true);
+        setBookCheckResult(null);
+        setBookCheckFileName(file.name);
+        try {
+            const lookupTradeNum = String(tradeNum || '').trim() || ticketTradeNum;
+            const truthRows = tmData.map((row) => ({
+                Supplier: row['Company'],
+                'Weight (g)': row['Weight (g)'],
+                'Gold Rate ($/oz)': row['$/oz Booked'],
+                'Exchange Rate': row['FX Rate'],
+            }));
+            const result = await api.checkTradeBookScreenshot(lookupTradeNum, file, truthRows);
+            setBookCheckResult(result);
+            const counts = (result.counts as Record<string, unknown>) || {};
+            const discrepancyCount = Number(counts.manual_not_in_trademc || 0) + Number(counts.missing_from_manual_book || 0);
+            if (discrepancyCount > 0) show(`Discrepancies found: ${discrepancyCount}`, 'error');
+            else show('No discrepancies found against TradeMC source-of-truth rows.', 'success');
+        } catch (e: unknown) {
+            show(String(e), 'error');
+            setBookCheckResult(null);
+        } finally {
+            setBookCheckRunning(false);
+        }
+    };
+
+    const bookCheckCounts = ((bookCheckResult?.counts as Record<string, unknown>) || {});
+    const manualNotInTradeMC = (Array.isArray(bookCheckResult?.manual_not_in_trademc) ? (bookCheckResult?.manual_not_in_trademc as Row[]) : []);
+    const missingFromManualBook = (Array.isArray(bookCheckResult?.missing_from_manual_book) ? (bookCheckResult?.missing_from_manual_book as Row[]) : []);
+    const parseWarnings = (Array.isArray(bookCheckResult?.parse_warnings) ? (bookCheckResult?.parse_warnings as string[]) : []);
+    const diffKeys = ['Supplier', 'Weight (g)', 'Gold Rate ($/oz)', 'Exchange Rate'] as const;
+    type DiffKey = typeof diffKeys[number];
+    type DiffPair = { manual?: Row; correct?: Row };
+    const normalizeSupplierForDiff = (value: unknown): string => String(value ?? '')
+        .toUpperCase()
+        .replace(/\(PTY\)/g, 'PTY')
+        .replace(/\bLTD\b/g, 'LIMITED')
+        .replace(/[^A-Z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const normalizeNumericForDiff = (value: unknown): string => {
+        const n = toNullableNumber(value);
+        if (n === null) return '';
+        return Number(n).toFixed(4);
+    };
+    const equalDiffValue = (key: DiffKey, a: unknown, b: unknown): boolean => {
+        if (key === 'Supplier') return normalizeSupplierForDiff(a) === normalizeSupplierForDiff(b);
+        return normalizeNumericForDiff(a) === normalizeNumericForDiff(b);
+    };
+    const diffScore = (manual: Row, correct: Row): number => {
+        const supplierPenalty = normalizeSupplierForDiff(manual['Supplier']) === normalizeSupplierForDiff(correct['Supplier']) ? 0 : 1000;
+        let mismatchPenalty = 0;
+        for (const key of diffKeys) {
+            if (!equalDiffValue(key, manual[key], correct[key])) mismatchPenalty += 10;
+        }
+        const numDistance = (Math.abs((toNullableNumber(manual['Weight (g)']) ?? 0) - (toNullableNumber(correct['Weight (g)']) ?? 0))
+            + Math.abs((toNullableNumber(manual['Gold Rate ($/oz)']) ?? 0) - (toNullableNumber(correct['Gold Rate ($/oz)']) ?? 0))
+            + Math.abs((toNullableNumber(manual['Exchange Rate']) ?? 0) - (toNullableNumber(correct['Exchange Rate']) ?? 0)));
+        return supplierPenalty + mismatchPenalty + numDistance;
+    };
+    const discrepancyPairs = useMemo<DiffPair[]>(() => {
+        const pairs: DiffPair[] = [];
+        const remaining = missingFromManualBook.map((row) => ({ row, used: false }));
+        for (const manual of manualNotInTradeMC) {
+            let bestIdx = -1;
+            let bestScore = Number.POSITIVE_INFINITY;
+            for (let i = 0; i < remaining.length; i += 1) {
+                if (remaining[i].used) continue;
+                const score = diffScore(manual, remaining[i].row);
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestIdx = i;
+                }
+            }
+            if (bestIdx >= 0) {
+                remaining[bestIdx].used = true;
+                pairs.push({ manual, correct: remaining[bestIdx].row });
+            } else {
+                pairs.push({ manual });
+            }
+        }
+        for (const item of remaining) {
+            if (!item.used) pairs.push({ correct: item.row });
+        }
+        return pairs;
+    }, [manualNotInTradeMC, missingFromManualBook]);
+    const formatDiffValue = (key: DiffKey, value: unknown): string => {
+        if (key === 'Supplier') return String(value ?? '');
+        const n = toNullableNumber(value);
+        return n === null ? '--' : fmt(n, 4);
+    };
+
     return (
         <div>
             <div className="page-header"><h2>Trading Ticket</h2></div>
@@ -4090,6 +4320,106 @@ function TradingTicket() {
                             />
                         </div>
                     )}
+
+                    <div className="section mt-3">
+                        <div className="section-title">Trade Book Checker (TradeMC Source of Truth)</div>
+                        <div className="trade-book-checker-upload-row">
+                            <label className="btn btn-sm btn-primary trade-book-checker-upload-btn">
+                                {bookCheckRunning ? 'Checking Screenshot...' : 'Upload Trading Book Screenshot'}
+                                <input
+                                    type="file"
+                                    accept="image/png,image/jpeg,image/jpg"
+                                    onChange={onBookCheckUpload}
+                                    disabled={bookCheckRunning || !ticketTradeNum}
+                                    className="trade-book-checker-file-input"
+                                />
+                            </label>
+                            {bookCheckFileName && <span className="trade-book-checker-file-name">{bookCheckFileName}</span>}
+                        </div>
+
+                        {bookCheckResult && (
+                            <>
+                                <div className="trade-book-checker-summary-grid">
+                                    <div className="trade-book-checker-summary-card">
+                                        <div className="trade-book-checker-summary-label">Parsed Manual Rows</div>
+                                        <div className="trade-book-checker-summary-value">{String(bookCheckCounts.parsed_rows ?? 0)}</div>
+                                    </div>
+                                    <div className="trade-book-checker-summary-card">
+                                        <div className="trade-book-checker-summary-label">TradeMC Rows</div>
+                                        <div className="trade-book-checker-summary-value">{String(bookCheckCounts.trademc_rows ?? 0)}</div>
+                                    </div>
+                                    <div className="trade-book-checker-summary-card">
+                                        <div className="trade-book-checker-summary-label">Exact Matches</div>
+                                        <div className="trade-book-checker-summary-value">{String(bookCheckCounts.matched_rows ?? 0)}</div>
+                                    </div>
+                                    <div className="trade-book-checker-summary-card trade-book-checker-summary-card-discrepancy">
+                                        <div className="trade-book-checker-summary-label">Total Discrepancies</div>
+                                        <div className="trade-book-checker-summary-value">
+                                            {String((Number(bookCheckCounts.manual_not_in_trademc || 0) + Number(bookCheckCounts.missing_from_manual_book || 0)))}
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {parseWarnings.length > 0 && (
+                                    <div className="trade-book-checker-warning">
+                                        {parseWarnings.join(' ')}
+                                    </div>
+                                )}
+
+                                <div className="section mt-3">
+                                    <div className="section-title">Discrepancy Diff View</div>
+                                    {discrepancyPairs.length === 0 ? (
+                                        <Empty title="None" />
+                                    ) : (
+                                        <div className="table-container">
+                                            <table className="data-table trade-book-diff-table">
+                                                <thead>
+                                                    <tr>
+                                                        <th>Row Type</th>
+                                                        <th>Supplier</th>
+                                                        <th>Weight (g)</th>
+                                                        <th>Gold Rate ($/oz)</th>
+                                                        <th>Exchange Rate</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {discrepancyPairs.map((pair, idx) => {
+                                                        const pairKey = `diff-${idx}`;
+                                                        const renderRow = (kind: 'manual' | 'correct', row: Row | undefined) => {
+                                                            if (!row) return null;
+                                                            const opposite = kind === 'manual' ? pair.correct : pair.manual;
+                                                            return (
+                                                                <tr key={`${pairKey}-${kind}`} className={kind === 'manual' ? 'diff-row-manual' : 'diff-row-correct'}>
+                                                                    <td className="trade-book-diff-type">{kind === 'manual' ? 'Trade Book (Uploaded)' : 'TradeMC (Correct)'}</td>
+                                                                    {diffKeys.map((key) => {
+                                                                        const differs = opposite ? !equalDiffValue(key, row[key], opposite[key]) : true;
+                                                                        const cls = differs
+                                                                            ? (kind === 'manual' ? 'trade-book-diff-bad' : 'trade-book-diff-good')
+                                                                            : '';
+                                                                        return (
+                                                                            <td key={`${pairKey}-${kind}-${key}`} className={cls}>
+                                                                                {formatDiffValue(key, row[key])}
+                                                                            </td>
+                                                                        );
+                                                                    })}
+                                                                </tr>
+                                                            );
+                                                        };
+                                                        return (
+                                                            <Fragment key={pairKey}>
+                                                                {renderRow('manual', pair.manual)}
+                                                                {renderRow('correct', pair.correct)}
+                                                            </Fragment>
+                                                        );
+                                                    })}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    )}
+                                </div>
+                            </>
+                        )}
+                    </div>
 
                     <div className="section mt-3">
                         <div className="section-title">PMX Trades</div>
@@ -7569,6 +7899,7 @@ const NAV_SECTIONS: NavSection[] = [
             { id: 'hedging', label: 'Hedging' },
             { id: 'forward_exposure', label: 'Forward Exposure' },
             { id: 'open_positions_reval', label: 'Open Positions Reval' },
+            { id: 'trading_worksheet', label: 'Trading Worksheet' },
         ],
     },
     {
@@ -7583,7 +7914,6 @@ const NAV_SECTIONS: NavSection[] = [
         items: [
             { id: 'export_trades', label: 'Export Trades' },
             { id: 'ticket', label: 'Trading Ticket' },
-            { id: 'trading_worksheet', label: 'Trading Worksheet' },
             { id: 'trade_breakdown', label: 'Trade Breakdown' },
         ],
     },
@@ -8067,6 +8397,7 @@ export default function App() {
     );
 }
 const cellLabel = 'Trade #';
+
 
 
 
