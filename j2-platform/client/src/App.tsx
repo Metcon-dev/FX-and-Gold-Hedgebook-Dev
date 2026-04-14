@@ -5060,6 +5060,8 @@ function TradeBreakdownTab() {
 function ProfitTab() {
     const DEFAULT_METAL_TOLERANCE_G = 32.0;
     const GRAMS_PER_TROY_OUNCE = 31.1035;
+    const MONTHLY_TARGET_RATE = 0.0015;
+    const MONTHLY_TARGET_RAND_PER_GRAM = 1.55;
     const [payload, setPayload] = useState<{ months: Row[]; summary: Row }>({ months: [], summary: {} });
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -5127,6 +5129,7 @@ function ProfitTab() {
     const months = payload.months;
     const summary = payload.summary || {};
     const monthKeyOf = (month: Row, idx: number) => asText(month.month_key, `month-${idx}`);
+    const n = (v: unknown) => typeof v === 'number' ? v : Number(v) || 0;
     const normalizeSymbol = (value: unknown): string =>
         String(value ?? '').toUpperCase().replace(/[\/\-\s]/g, '');
     const monthProfitPctWeightedAvg = (trades: Row[]): number => {
@@ -5169,6 +5172,177 @@ function ProfitTab() {
             }, 0);
             return sum + tradeAbsG;
         }, 0);
+
+    const monthlyChartData = months
+        .map((month, monthIdx) => {
+            const monthKey = monthKeyOf(month, monthIdx);
+            const monthLabel = asText(month.month_label, monthKey);
+            const trades = Array.isArray(month.trades) ? (month.trades as Row[]) : [];
+            const monthNetProfit = Number.isFinite(Number(month.total_profit_zar))
+                ? n(month.total_profit_zar)
+                : trades.reduce((sum, t) => sum + n(t.total_profit_zar), 0);
+
+            let tmBuyAbsZar = 0;
+            let tmSellAbsZar = 0;
+            let tmAbsWeightG = 0;
+
+            for (const t of trades) {
+                const tradeWeightG = n(t.client_weight_g);
+                let tradeBuyAbsZar = 0;
+                let tradeSellAbsZar = 0;
+                let tradeAbsWeightG = 0;
+
+                const tmTx = Array.isArray((t as { trademc_transactions?: Row[] }).trademc_transactions)
+                    ? ((t as { trademc_transactions: Row[] }).trademc_transactions)
+                    : [];
+                for (const tx of tmTx) {
+                    const txWeightG = n(tx['Weight (g)']);
+                    const txZarAbs = Math.abs(n(tx['ZAR Value']));
+                    if (txZarAbs <= 1e-12) continue;
+                    tradeAbsWeightG += Math.abs(txWeightG);
+                    if (txWeightG >= 0) tradeBuyAbsZar += txZarAbs;
+                    else tradeSellAbsZar += txZarAbs;
+                }
+
+                if (tradeBuyAbsZar <= 1e-12 && tradeSellAbsZar <= 1e-12) {
+                    const buySideAbs = Math.abs(n(t.buy_side_zar));
+                    const sellSideAbs = Math.abs(n(t.sell_side_zar));
+                    if (tradeWeightG >= 0) tradeBuyAbsZar = buySideAbs;
+                    else tradeSellAbsZar = sellSideAbs;
+                }
+                if (tradeAbsWeightG <= 1e-12) tradeAbsWeightG = Math.abs(tradeWeightG);
+
+                tmBuyAbsZar += tradeBuyAbsZar;
+                tmSellAbsZar += tradeSellAbsZar;
+                tmAbsWeightG += tradeAbsWeightG;
+            }
+
+            const targetBaseAbsZar = tmBuyAbsZar + tmSellAbsZar;
+            const monthlyTarget = targetBaseAbsZar * MONTHLY_TARGET_RATE;
+            const netProfitPerGram = tmAbsWeightG > 1e-9 ? monthNetProfit / tmAbsWeightG : 0;
+            return {
+                monthKey,
+                monthLabel,
+                netProfit: monthNetProfit,
+                monthlyTarget,
+                targetDelta: monthNetProfit - monthlyTarget,
+                hitTarget: monthlyTarget > 0 ? monthNetProfit >= monthlyTarget : false,
+                tmAbsWeightG,
+                netProfitPerGram,
+                monthlyTargetPerGram: MONTHLY_TARGET_RAND_PER_GRAM,
+                targetDeltaPerGram: netProfitPerGram - MONTHLY_TARGET_RAND_PER_GRAM,
+                hitTargetPerGram: netProfitPerGram >= MONTHLY_TARGET_RAND_PER_GRAM,
+            };
+        })
+        .sort((a, b) => String(a.monthKey).localeCompare(String(b.monthKey)));
+
+    const totalMonthlyNetProfit = monthlyChartData.reduce((sum, row) => sum + row.netProfit, 0);
+    const totalMonthlyTarget = monthlyChartData.reduce((sum, row) => sum + row.monthlyTarget, 0);
+    const totalMonthlyTargetGap = totalMonthlyNetProfit - totalMonthlyTarget;
+    const totalMonthlyAbsWeightG = monthlyChartData.reduce((sum, row) => sum + row.tmAbsWeightG, 0);
+    const weightedMonthlyNetProfitPerGram = totalMonthlyAbsWeightG > 1e-9 ? (totalMonthlyNetProfit / totalMonthlyAbsWeightG) : 0;
+    const totalMonthlyTargetGapPerGram = weightedMonthlyNetProfitPerGram - MONTHLY_TARGET_RAND_PER_GRAM;
+
+    const renderProfitHurdleBarShape = (props: { x?: number; y?: number; width?: number; height?: number }) => {
+        const { x, y, width, height } = props;
+        if (x == null || y == null || width == null || height == null || width <= 0 || height === 0) return null;
+        const absHeight = Math.abs(height);
+        const topY = height >= 0 ? y : y + height;
+        const widerWidth = width * 1.5;
+        const offsetX = x - ((widerWidth - width) / 2);
+        return (
+            <rect
+                x={offsetX}
+                y={topY}
+                width={widerWidth}
+                height={absHeight}
+                fill="rgba(180,114,61,0.20)"
+                stroke="#b4723d"
+                strokeWidth={1.5}
+                strokeDasharray="4 3"
+                rx={2}
+                ry={2}
+            />
+        );
+    };
+
+    const renderProfitAchievedBarShape = (props: { x?: number; y?: number; width?: number; height?: number; payload?: { netProfit?: number } }) => {
+        const { x, y, width, height, payload } = props;
+        if (x == null || y == null || width == null || height == null || width <= 0 || height === 0) return null;
+        const absHeight = Math.abs(height);
+        if (absHeight <= 0.5) return null;
+        const topY = height >= 0 ? y : y + height;
+        const innerWidth = Math.max(3, width * 0.58);
+        const innerX = x + ((width - innerWidth) / 2);
+        const netProfit = Number(payload?.netProfit ?? 0);
+        const fill = netProfit >= 0 ? "#10b981" : "#ef4444";
+        return <rect x={innerX} y={topY} width={innerWidth} height={absHeight} fill={fill} stroke={fill} strokeWidth={0} rx={1.5} ry={1.5} />;
+    };
+
+    const renderProfitPerGramAchievedBarShape = (props: { x?: number; y?: number; width?: number; height?: number; payload?: { netProfitPerGram?: number } }) => {
+        const { x, y, width, height, payload } = props;
+        if (x == null || y == null || width == null || height == null || width <= 0 || height === 0) return null;
+        const absHeight = Math.abs(height);
+        if (absHeight <= 0.5) return null;
+        const topY = height >= 0 ? y : y + height;
+        const innerWidth = Math.max(3, width * 0.58);
+        const innerX = x + ((width - innerWidth) / 2);
+        const netProfitPerGram = Number(payload?.netProfitPerGram ?? 0);
+        const fill = netProfitPerGram >= 0 ? "#10b981" : "#ef4444";
+        return <rect x={innerX} y={topY} width={innerWidth} height={absHeight} fill={fill} stroke={fill} strokeWidth={0} rx={1.5} ry={1.5} />;
+    };
+
+    const renderNetDot = (props: { cx?: number; cy?: number; payload?: { netProfit?: number; monthlyTarget?: number } }) => {
+        const { cx, cy, payload } = props;
+        if (cx == null || cy == null) return null;
+        const netProfit = Number(payload?.netProfit ?? 0);
+        const hurdle = Number(payload?.monthlyTarget ?? 0);
+        const color = netProfit >= hurdle ? '#10b981' : '#111111';
+        return <circle cx={cx} cy={cy} r={5} fill={color} stroke="#000000" strokeWidth={1.5} />;
+    };
+
+    const renderNetPerGramDot = (props: { cx?: number; cy?: number; payload?: { netProfitPerGram?: number; monthlyTargetPerGram?: number } }) => {
+        const { cx, cy, payload } = props;
+        if (cx == null || cy == null) return null;
+        const netProfitPerGram = Number(payload?.netProfitPerGram ?? 0);
+        const hurdlePerGram = Number(payload?.monthlyTargetPerGram ?? MONTHLY_TARGET_RAND_PER_GRAM);
+        const color = netProfitPerGram >= hurdlePerGram ? '#10b981' : '#111111';
+        return <circle cx={cx} cy={cy} r={5} fill={color} stroke="#000000" strokeWidth={1.5} />;
+    };
+
+    const renderMonthlyProfitTooltip = (props: any) => {
+        const active = Boolean(props?.active);
+        const payload = Array.isArray(props?.payload) ? props.payload : [];
+        if (!active || payload.length === 0) return null;
+        const row = (payload[0]?.payload || {}) as Row;
+        const monthLabel = String((row as Row).monthLabel || '--');
+        const netProfit = n((row as Row).netProfit);
+        const monthlyTarget = n((row as Row).monthlyTarget);
+        return (
+            <div className="dashboard-tooltip">
+                <div className="dashboard-tooltip-title">{monthLabel}</div>
+                <div className="dashboard-tooltip-row"><span>Net Profit</span><strong>R{fmt(netProfit, 2)}</strong></div>
+                <div className="dashboard-tooltip-row"><span>Hurdle (0.15%)</span><strong>R{fmt(monthlyTarget, 2)}</strong></div>
+            </div>
+        );
+    };
+
+    const renderMonthlyProfitPerGramTooltip = (props: any) => {
+        const active = Boolean(props?.active);
+        const payload = Array.isArray(props?.payload) ? props.payload : [];
+        if (!active || payload.length === 0) return null;
+        const row = (payload[0]?.payload || {}) as Row;
+        const monthLabel = String((row as Row).monthLabel || '--');
+        const netProfitPerGram = n((row as Row).netProfitPerGram);
+        const monthlyTargetPerGram = n((row as Row).monthlyTargetPerGram);
+        return (
+            <div className="dashboard-tooltip">
+                <div className="dashboard-tooltip-title">{monthLabel}</div>
+                <div className="dashboard-tooltip-row"><span>Net Profit (R/g)</span><strong>R{fmt(netProfitPerGram, 2)}/g</strong></div>
+                <div className="dashboard-tooltip-row"><span>Hurdle</span><strong>R{fmt(monthlyTargetPerGram, 2)}/g</strong></div>
+            </div>
+        );
+    };
 
     const toggleMonth = (monthKey: string) => {
         setExpandedMonths(prev => ({ ...prev, [monthKey]: !prev[monthKey] }));
@@ -5221,6 +5395,7 @@ function ProfitTab() {
             {months.length === 0 ? (
                 <Empty title="No monthly profit data available" />
             ) : (
+                <>
                 <div className="table-container">
                     <table className="data-table">
                         <thead>
@@ -5416,6 +5591,125 @@ function ProfitTab() {
                         </tbody>
                     </table>
                 </div>
+                <div className="section">
+                    <div className="dashboard-chart dashboard-chart-elevated" style={{ marginTop: 14 }}>
+                        <div className="dashboard-chart-head">
+                            <div>
+                                <div className="dashboard-chart-title">Net Profit vs Monthly Hurdle</div>
+                                <div className="dashboard-chart-subtitle">Monthly target = 0.15% × (|TradeMC Buy ZAR| + |TradeMC Sell ZAR|).</div>
+                            </div>
+                            <div className="dashboard-chart-kpis">
+                                <div className="dashboard-kpi">
+                                    <div className="dashboard-kpi-label">Total Net Profit</div>
+                                    <div className={`dashboard-kpi-value ${totalMonthlyNetProfit >= 0 ? 'positive' : 'negative'}`}>R{fmt(totalMonthlyNetProfit, 2)}</div>
+                                </div>
+                                <div className="dashboard-kpi">
+                                    <div className="dashboard-kpi-label">Net vs Target</div>
+                                    <div className={`dashboard-kpi-value ${totalMonthlyTargetGap >= 0 ? 'positive' : 'negative'}`}>
+                                        {totalMonthlyTargetGap >= 0 ? '+' : ''}R{fmt(totalMonthlyTargetGap, 2)}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <ResponsiveContainer width="100%" height={360}>
+                            <ComposedChart
+                                data={monthlyChartData}
+                                barSize={16}
+                                barGap={-16}
+                                margin={{ top: 5, right: 10, left: 10, bottom: 5 }}
+                            >
+                                <CartesianGrid strokeDasharray="3 3" stroke="rgba(28,28,28,0.08)" />
+                                <XAxis
+                                    dataKey="monthLabel"
+                                    tick={{ fontSize: 10, fill: 'var(--text-muted)' }}
+                                    tickLine={false}
+                                    axisLine={{ stroke: 'rgba(28,28,28,0.2)' }}
+                                    interval="preserveStartEnd"
+                                />
+                                <YAxis
+                                    tickFormatter={(v: number) => `R${fmt(v / 1000, 0)}k`}
+                                    tick={{ fontSize: 10, fill: 'var(--text-muted)' }}
+                                    tickLine={false}
+                                    axisLine={false}
+                                    width={54}
+                                />
+                                <Tooltip content={renderMonthlyProfitTooltip} cursor={{ fill: 'rgba(180,114,61,0.08)' }} />
+                                <ReferenceLine y={0} stroke="rgba(28,28,28,0.25)" strokeDasharray="2 2" />
+                                <Bar dataKey="monthlyTarget" shape={renderProfitHurdleBarShape} isAnimationActive={false} />
+                                <Bar dataKey="netProfit" shape={renderProfitAchievedBarShape} isAnimationActive={false} />
+                                <Line
+                                    type="monotone"
+                                    dataKey="netProfit"
+                                    name="Net Profit (ZAR)"
+                                    stroke="#111111"
+                                    strokeWidth={2}
+                                    dot={renderNetDot}
+                                    activeDot={renderNetDot}
+                                    isAnimationActive={false}
+                                />
+                            </ComposedChart>
+                        </ResponsiveContainer>
+                    </div>
+                    <div className="dashboard-chart dashboard-chart-elevated" style={{ marginTop: 14 }}>
+                        <div className="dashboard-chart-head">
+                            <div>
+                                <div className="dashboard-chart-title">Net Profit (R/g) vs Monthly Hurdle</div>
+                                <div className="dashboard-chart-subtitle">Monthly hurdle = R1.55/g.</div>
+                            </div>
+                            <div className="dashboard-chart-kpis">
+                                <div className="dashboard-kpi">
+                                    <div className="dashboard-kpi-label">Weighted Net R/g</div>
+                                    <div className={`dashboard-kpi-value ${weightedMonthlyNetProfitPerGram >= 0 ? 'positive' : 'negative'}`}>R{fmt(weightedMonthlyNetProfitPerGram, 2)}/g</div>
+                                </div>
+                                <div className="dashboard-kpi">
+                                    <div className="dashboard-kpi-label">R/g vs Hurdle</div>
+                                    <div className={`dashboard-kpi-value ${totalMonthlyTargetGapPerGram >= 0 ? 'positive' : 'negative'}`}>
+                                        {totalMonthlyTargetGapPerGram >= 0 ? '+' : ''}R{fmt(totalMonthlyTargetGapPerGram, 2)}/g
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <ResponsiveContainer width="100%" height={360}>
+                            <ComposedChart
+                                data={monthlyChartData}
+                                barSize={16}
+                                barGap={-16}
+                                margin={{ top: 5, right: 10, left: 10, bottom: 5 }}
+                            >
+                                <CartesianGrid strokeDasharray="3 3" stroke="rgba(28,28,28,0.08)" />
+                                <XAxis
+                                    dataKey="monthLabel"
+                                    tick={{ fontSize: 10, fill: 'var(--text-muted)' }}
+                                    tickLine={false}
+                                    axisLine={{ stroke: 'rgba(28,28,28,0.2)' }}
+                                    interval="preserveStartEnd"
+                                />
+                                <YAxis
+                                    tickFormatter={(v: number) => `R${fmt(v, 2)}/g`}
+                                    tick={{ fontSize: 10, fill: 'var(--text-muted)' }}
+                                    tickLine={false}
+                                    axisLine={false}
+                                    width={64}
+                                />
+                                <Tooltip content={renderMonthlyProfitPerGramTooltip} cursor={{ fill: 'rgba(180,114,61,0.08)' }} />
+                                <ReferenceLine y={0} stroke="rgba(28,28,28,0.25)" strokeDasharray="2 2" />
+                                <Bar dataKey="monthlyTargetPerGram" shape={renderProfitHurdleBarShape} isAnimationActive={false} />
+                                <Bar dataKey="netProfitPerGram" shape={renderProfitPerGramAchievedBarShape} isAnimationActive={false} />
+                                <Line
+                                    type="monotone"
+                                    dataKey="netProfitPerGram"
+                                    name="Net Profit (R/g)"
+                                    stroke="#111111"
+                                    strokeWidth={2}
+                                    dot={renderNetPerGramDot}
+                                    activeDot={renderNetPerGramDot}
+                                    isAnimationActive={false}
+                                />
+                            </ComposedChart>
+                        </ResponsiveContainer>
+                    </div>
+                </div>
+                </>
             )}
 
             {Toast}
@@ -6803,6 +7097,7 @@ function Dashboard() {
 
     const GRAMS_PER_TROY_OUNCE = 31.1035;
     const DAILY_TARGET_RATE = 0.0015;
+    const DAILY_TARGET_RAND_PER_GRAM = 1.55;
     const DASHBOARD_PROFIT_MIN_DATE = '2026-03-01';
 
     // --- Daily dashboard chart data ---
@@ -6812,6 +7107,7 @@ function Dashboard() {
         netProfit: number;
         tmBuyAbsZar: number;
         tmSellAbsZar: number;
+        tmAbsWeightG: number;
     }> = {};
     for (const month of profitMonths) {
         const trades = Array.isArray((month as { trades?: Row[] }).trades) ? (month as { trades: Row[] }).trades : [];
@@ -6820,7 +7116,7 @@ function Dashboard() {
             if (!date) continue;
 
             if (!dailyProfitMap[date]) {
-                dailyProfitMap[date] = { metalProfit: 0, exchangeProfit: 0, netProfit: 0, tmBuyAbsZar: 0, tmSellAbsZar: 0 };
+                dailyProfitMap[date] = { metalProfit: 0, exchangeProfit: 0, netProfit: 0, tmBuyAbsZar: 0, tmSellAbsZar: 0, tmAbsWeightG: 0 };
             }
 
             const metalProfit = n(t.metal_profit_zar);
@@ -6830,6 +7126,7 @@ function Dashboard() {
 
             let tmBuyAbsZar = 0;
             let tmSellAbsZar = 0;
+            let tmAbsWeightG = 0;
             const tmTx = Array.isArray((t as { trademc_transactions?: Row[] }).trademc_transactions)
                 ? ((t as { trademc_transactions: Row[] }).trademc_transactions)
                 : [];
@@ -6838,6 +7135,7 @@ function Dashboard() {
                 const txWeightG = n(tx['Weight (g)']);
                 const txZarAbs = Math.abs(n(tx['ZAR Value']));
                 if (txZarAbs <= 1e-12) continue;
+                tmAbsWeightG += Math.abs(txWeightG);
                 if (txWeightG >= 0) tmBuyAbsZar += txZarAbs;
                 else tmSellAbsZar += txZarAbs;
             }
@@ -6848,12 +7146,16 @@ function Dashboard() {
                 if (tmWeightG >= 0) tmBuyAbsZar = buySideAbs;
                 else tmSellAbsZar = sellSideAbs;
             }
+            if (tmAbsWeightG <= 1e-12) {
+                tmAbsWeightG = Math.abs(tmWeightG);
+            }
 
             dailyProfitMap[date].metalProfit += metalProfit;
             dailyProfitMap[date].exchangeProfit += exchangeProfit;
             dailyProfitMap[date].netProfit += netProfit;
             dailyProfitMap[date].tmBuyAbsZar += tmBuyAbsZar;
             dailyProfitMap[date].tmSellAbsZar += tmSellAbsZar;
+            dailyProfitMap[date].tmAbsWeightG += tmAbsWeightG;
         }
     }
 
@@ -6862,7 +7164,9 @@ function Dashboard() {
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([date, values]) => {
             const targetBaseAbsZar = values.tmBuyAbsZar + values.tmSellAbsZar;
+            const targetBaseAbsG = values.tmAbsWeightG;
             const dailyTarget = targetBaseAbsZar * DAILY_TARGET_RATE;
+            const netProfitPerGram = targetBaseAbsG > 1e-9 ? values.netProfit / targetBaseAbsG : 0;
             return {
                 date: date.slice(5), // MM-DD for compact x-axis labels
                 fullDate: date,
@@ -6872,9 +7176,14 @@ function Dashboard() {
                 tmBuyAbsZar: values.tmBuyAbsZar,
                 tmSellAbsZar: values.tmSellAbsZar,
                 targetBaseAbsZar,
+                targetBaseAbsG,
                 dailyTarget,
+                dailyTargetPerGram: DAILY_TARGET_RAND_PER_GRAM,
                 targetDelta: values.netProfit - dailyTarget,
                 hitTarget: dailyTarget > 0 ? values.netProfit >= dailyTarget : false,
+                netProfitPerGram,
+                targetDeltaPerGram: netProfitPerGram - DAILY_TARGET_RAND_PER_GRAM,
+                hitTargetPerGram: netProfitPerGram >= DAILY_TARGET_RAND_PER_GRAM,
             };
         });
 
@@ -6890,6 +7199,9 @@ function Dashboard() {
     const totalNetProfitDashboard = profitChartData.reduce((sum, row) => sum + row.netProfit, 0);
     const totalTargetZar = profitChartData.reduce((sum, row) => sum + row.dailyTarget, 0);
     const totalTargetGapZar = totalNetProfitDashboard - totalTargetZar;
+    const totalAbsWeightDashboardG = profitChartData.reduce((sum, row) => sum + n((row as Row).targetBaseAbsG), 0);
+    const weightedNetProfitPerGram = totalAbsWeightDashboardG > 1e-9 ? (totalNetProfitDashboard / totalAbsWeightDashboardG) : 0;
+    const totalTargetGapPerGram = weightedNetProfitPerGram - DAILY_TARGET_RAND_PER_GRAM;
 
     // --- Build trade_num → date lookup from profit data ---
     const tradeDateLookup = (() => {
@@ -7251,6 +7563,59 @@ function Dashboard() {
         );
     };
 
+    const renderNetPerGramDot = (props: { cx?: number; cy?: number; payload?: { netProfitPerGram?: number; dailyTargetPerGram?: number } }) => {
+        const { cx, cy, payload } = props;
+        if (cx == null || cy == null) return null;
+        const netProfitPerGram = Number(payload?.netProfitPerGram ?? 0);
+        const hurdlePerGram = Number(payload?.dailyTargetPerGram ?? DAILY_TARGET_RAND_PER_GRAM);
+        const color = netProfitPerGram >= hurdlePerGram ? '#10b981' : '#111111';
+        return <circle cx={cx} cy={cy} r={5} fill={color} stroke="#000000" strokeWidth={1.5} />;
+    };
+
+    const renderProfitPerGramAchievedBarShape = (
+        props: { x?: number; y?: number; width?: number; height?: number; payload?: { netProfitPerGram?: number } }
+    ) => {
+        const { x, y, width, height, payload } = props;
+        if (x == null || y == null || width == null || height == null || width <= 0 || height === 0) return null;
+        const absHeight = Math.abs(height);
+        if (absHeight <= 0.5) return null;
+        const topY = height >= 0 ? y : y + height;
+        const innerWidth = Math.max(3, width * 0.58);
+        const innerX = x + ((width - innerWidth) / 2);
+        const netProfitPerGram = Number(payload?.netProfitPerGram ?? 0);
+        const fill = netProfitPerGram >= 0 ? "#10b981" : "#ef4444";
+        return (
+            <rect
+                x={innerX}
+                y={topY}
+                width={innerWidth}
+                height={absHeight}
+                fill={fill}
+                stroke={fill}
+                strokeWidth={0}
+                rx={1.5}
+                ry={1.5}
+            />
+        );
+    };
+
+    const renderProfitPerGramTooltip = (props: any) => {
+        const active = Boolean(props?.active);
+        const payload = Array.isArray(props?.payload) ? props.payload : [];
+        if (!active || payload.length === 0) return null;
+        const row = (payload[0]?.payload || {}) as Row;
+        const fullDate = String(row.fullDate || '--');
+        const netProfitPerGram = n((row as Row).netProfitPerGram);
+        const dailyTargetPerGram = n((row as Row).dailyTargetPerGram);
+        return (
+            <div className="dashboard-tooltip">
+                <div className="dashboard-tooltip-title">{formatProfitChartDate(fullDate)}</div>
+                <div className="dashboard-tooltip-row"><span>Net Profit (R/g)</span><strong>R{fmt(netProfitPerGram, 2)}/g</strong></div>
+                <div className="dashboard-tooltip-row"><span>Hurdle</span><strong>R{fmt(dailyTargetPerGram, 2)}/g</strong></div>
+            </div>
+        );
+    };
+
     const renderHedgeTooltip = (props: any) => {
         const active = Boolean(props?.active);
         const payload = Array.isArray(props?.payload) ? props.payload : [];
@@ -7480,6 +7845,84 @@ function Dashboard() {
                     ) : (
                         <div style={{ textAlign: 'center', padding: '3rem', color: 'rgba(0,0,0,0.4)' }}>
                             No hedging data available
+                        </div>
+                    )}
+                </div>
+                <div className="dashboard-chart dashboard-chart-elevated" style={{ marginTop: 14 }}>
+                    <div className="dashboard-chart-head">
+                        <div>
+                            <div className="dashboard-chart-title">Net Profit (R/g) vs Daily Hurdle</div>
+                            <div className="dashboard-chart-subtitle">Daily hurdle = R1.55/g. Achieved bar = realized net profit per gram (green) / loss per gram (red).</div>
+                        </div>
+                        <div className="dashboard-chart-kpis">
+                            <div className="dashboard-kpi">
+                                <div className="dashboard-kpi-label">Weighted Net R/g</div>
+                                <div className={`dashboard-kpi-value ${weightedNetProfitPerGram >= 0 ? 'positive' : 'negative'}`}>R{fmt(weightedNetProfitPerGram, 2)}/g</div>
+                            </div>
+                            <div className="dashboard-kpi">
+                                <div className="dashboard-kpi-label">R/g vs Hurdle</div>
+                                <div className={`dashboard-kpi-value ${totalTargetGapPerGram >= 0 ? 'positive' : 'negative'}`}>
+                                    {totalTargetGapPerGram >= 0 ? '+' : ''}R{fmt(totalTargetGapPerGram, 2)}/g
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {profitChartData.length > 0 ? (
+                        <>
+                            <ResponsiveContainer width="100%" height={360}>
+                                <ComposedChart
+                                    data={profitChartData}
+                                    barSize={16}
+                                    barGap={-16}
+                                    margin={{ top: 5, right: 10, left: 10, bottom: 5 }}
+                                >
+                                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(28,28,28,0.08)" />
+                                    <XAxis
+                                        dataKey="fullDate"
+                                        tickFormatter={formatProfitChartDate}
+                                        tick={{ fontSize: 10, fill: 'var(--text-muted)' }}
+                                        tickLine={false}
+                                        axisLine={{ stroke: 'rgba(28,28,28,0.2)' }}
+                                        interval="preserveStartEnd"
+                                    />
+                                    <YAxis
+                                        tickFormatter={(v: number) => `R${fmt(v, 2)}/g`}
+                                        tick={{ fontSize: 10, fill: 'var(--text-muted)' }}
+                                        tickLine={false}
+                                        axisLine={false}
+                                        width={64}
+                                    />
+                                    <Tooltip content={renderProfitPerGramTooltip} cursor={{ fill: 'rgba(180,114,61,0.08)' }} />
+                                    <ReferenceLine y={0} stroke="rgba(28,28,28,0.25)" strokeDasharray="2 2" />
+                                    <Bar dataKey="dailyTargetPerGram" shape={renderProfitHurdleBarShape} isAnimationActive={false} />
+                                    <Bar dataKey="netProfitPerGram" shape={renderProfitPerGramAchievedBarShape} isAnimationActive={false} />
+                                    <Line
+                                        type="monotone"
+                                        dataKey="netProfitPerGram"
+                                        name="Net Profit (R/g)"
+                                        stroke="#111111"
+                                        strokeWidth={2}
+                                        dot={renderNetPerGramDot}
+                                        activeDot={renderNetPerGramDot}
+                                        isAnimationActive={false}
+                                    />
+                                </ComposedChart>
+                            </ResponsiveContainer>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14, marginTop: 8, fontSize: 10, color: 'var(--text-muted)' }}>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#111111', display: 'inline-block' }} /> Net Profit (R/g)
+                                </span>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ width: 10, height: 10, borderRadius: 2, background: 'linear-gradient(90deg, #10b981 0%, #10b981 50%, #ef4444 50%, #ef4444 100%)', display: 'inline-block' }} /> Achieved (P/L)
+                                </span>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                                    <span style={{ width: 10, height: 10, border: '1.5px dashed #b4723d', background: 'rgba(180,114,61,0.24)', borderRadius: 2, display: 'inline-block' }} /> Hurdle (R1.55/g)
+                                </span>
+                            </div>
+                        </>
+                    ) : (
+                        <div style={{ textAlign: 'center', padding: '3rem', color: 'rgba(0,0,0,0.4)' }}>
+                            No daily profit data available
                         </div>
                     )}
                 </div>
