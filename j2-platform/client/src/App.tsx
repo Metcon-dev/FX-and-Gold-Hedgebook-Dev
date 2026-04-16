@@ -20,6 +20,9 @@ const RECON_CACHE_UPDATED_EVENT = 'recon:cache-updated';
 const BACKGROUND_REFRESH_MS = 3 * 60 * 1000;
 const RECON_CACHE_KEY = 'recon:cached_payload';
 const RECON_DELTA_EPSILON = 1e-9;
+const PRICE_WARNING_EVENT = 'price-warning:changed';
+const PRICE_WARNING_ACK_EVENT = 'price-warning:acknowledged';
+const PRICE_WARNING_ACK_PREFIX = 'price-warning:ack:';
 const PMX_LEDGER_DEFAULT_FILTERS = {
     symbol: '',
     trade_num: '',
@@ -71,6 +74,31 @@ function usePersistentState<T>(key: string, initialValue: T) {
     }, [key, state]);
 
     return [state, setState] as const;
+}
+
+function readAckedPriceWarnings(): Record<string, boolean> {
+    if (typeof window === 'undefined') return {};
+    try {
+        const raw = window.localStorage.getItem('price-warning:acked');
+        if (!raw) return {};
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        const out: Record<string, boolean> = {};
+        for (const [key, value] of Object.entries(parsed || {})) {
+            out[key] = Boolean(value);
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+function persistAckedPriceWarnings(map: Record<string, boolean>): void {
+    if (typeof window === 'undefined') return;
+    try {
+        window.localStorage.setItem('price-warning:acked', JSON.stringify(map));
+    } catch {
+        // Ignore storage failures.
+    }
 }
 
 function fmt(val: unknown, decimals = 2): string {
@@ -2175,6 +2203,8 @@ function TradeMCTrades() {
     const [filters, setFilters] = usePersistentState('filters:trademc', TRADEMC_DEFAULT_FILTERS);
     const { show, Toast } = useToast();
     const [pageError, setPageError] = useState('');
+    const [priceWarnings, setPriceWarnings] = useState<Array<{ id: string; label: string; message: string; rowId: number }>>([]);
+    const [ackedWarnings, setAckedWarnings] = useState<Record<string, boolean>>(() => readAckedPriceWarnings());
     const hasActiveFilters = useMemo(
         () => Object.values(filters).some((value) => String(value ?? '').trim() !== ''),
         [filters]
@@ -2202,6 +2232,53 @@ function TradeMCTrades() {
         setLoading(false);
     }, [filters]);
 
+    const priceThreshold = 0.025;
+    const buildWarnings = useCallback((rows: Row[]) => {
+        const warnings: Array<{ id: string; label: string; message: string; rowId: number }> = [];
+        const sorted = [...rows].sort((a, b) => {
+            const ta = toTimestampMs(a.trade_timestamp);
+            const tb = toTimestampMs(b.trade_timestamp);
+            if (Number.isNaN(ta) && Number.isNaN(tb)) return 0;
+            if (Number.isNaN(ta)) return 1;
+            if (Number.isNaN(tb)) return -1;
+            return ta - tb;
+        });
+        let prevFx: number | null = null;
+        let prevXau: number | null = null;
+        for (const row of sorted) {
+            const rowId = toNumericId(row.id);
+            if (rowId <= 0) continue;
+            const tradeLabel = asText(row.ref_number ?? row['Ref #'] ?? rowId, String(rowId));
+            const fx = toNullableNumber(row.zar_to_usd_confirmed ?? row.zar_to_usd);
+            const xau = toNullableNumber(row.usd_per_troy_ounce_confirmed ?? row.usd_per_troy_ounce);
+            if (fx !== null && prevFx !== null) {
+                const delta = Math.abs(fx - prevFx) / Math.max(Math.abs(prevFx), 1e-12);
+                if (delta > priceThreshold) {
+                    warnings.push({
+                        id: `fx:${rowId}`,
+                        rowId,
+                        label: `TradeMC ${tradeLabel}`,
+                        message: `USD/ZAR moved ${(delta * 100).toFixed(2)}% versus the previous TradeMC price.`,
+                    });
+                }
+            }
+            if (xau !== null && prevXau !== null) {
+                const delta = Math.abs(xau - prevXau) / Math.max(Math.abs(prevXau), 1e-12);
+                if (delta > priceThreshold) {
+                    warnings.push({
+                        id: `xau:${rowId}`,
+                        rowId,
+                        label: `TradeMC ${tradeLabel}`,
+                        message: `Gold price moved ${(delta * 100).toFixed(2)}% versus the previous TradeMC price.`,
+                    });
+                }
+            }
+            if (fx !== null) prevFx = fx;
+            if (xau !== null) prevXau = xau;
+        }
+        return warnings;
+    }, []);
+
     useEffect(() => { load(); }, [load]);
     useEffect(() => {
         const onAutoSync = () => {
@@ -2210,6 +2287,27 @@ function TradeMCTrades() {
         window.addEventListener(TRADEMC_AUTO_SYNC_EVENT, onAutoSync);
         return () => window.removeEventListener(TRADEMC_AUTO_SYNC_EVENT, onAutoSync);
     }, [load]);
+
+    useEffect(() => {
+        const onAck = () => {
+            setAckedWarnings(readAckedPriceWarnings());
+        };
+        window.addEventListener(PRICE_WARNING_ACK_EVENT, onAck);
+        return () => window.removeEventListener(PRICE_WARNING_ACK_EVENT, onAck);
+    }, []);
+
+    const acknowledgeWarnings = (ids: string[]) => {
+        if (ids.length === 0) return;
+        setAckedWarnings(prev => {
+            const next = { ...prev };
+            for (const id of ids) next[id] = true;
+            persistAckedPriceWarnings(next);
+            if (typeof window !== 'undefined') {
+                window.dispatchEvent(new CustomEvent(PRICE_WARNING_ACK_EVENT));
+            }
+            return next;
+        });
+    };
 
     const sync = async () => {
         setHardSyncing(true);
@@ -2336,6 +2434,16 @@ function TradeMCTrades() {
             zar_per_gram_less_refining: zarPerGramLessRefining,
         };
     }), [data, companyRefiningRateById]);
+
+    useEffect(() => {
+        const warnings = buildWarnings(tableData);
+        const activeWarnings = warnings.filter(w => !ackedWarnings[w.id]);
+        setPriceWarnings(activeWarnings);
+        persistAckedPriceWarnings(ackedWarnings);
+        if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent(PRICE_WARNING_EVENT, { detail: { warnings: activeWarnings } }));
+        }
+    }, [ackedWarnings, buildWarnings, tableData]);
     const visibleData = tableData.slice(0, visibleCount);
     const hasMoreRows = visibleCount < tableData.length;
     useEffect(() => {
@@ -2468,6 +2576,17 @@ function TradeMCTrades() {
 
             {loading ? <Loading /> : (
                 <>
+                    {priceWarnings.length > 0 && (
+                        <div className="warning-banner warning-banner-danger">
+                            <div>
+                                <strong>Price check warning</strong>
+                                <div>One or more TradeMC prices moved more than 0.5% versus the previous trade.</div>
+                            </div>
+                            <button className="btn btn-sm" onClick={() => acknowledgeWarnings(priceWarnings.map(w => w.id))}>
+                                Ack
+                            </button>
+                        </div>
+                    )}
                     <DataTable columns={cols} data={visibleData}
                         numericCols={[
                             'weight',
@@ -2485,7 +2604,9 @@ function TradeMCTrades() {
                             const hasSageReference = String(row.notes ?? '').trim() !== '';
                             const weight = toNullableNumber(row.weight);
                             const isNegativeTrade = weight !== null && weight < 0;
-                            return (hasSageReference || isNegativeTrade) ? 'trademc-has-sage-ref' : '';
+                            const rowId = toNumericId(row.id);
+                            const hasPriceWarning = priceWarnings.some(w => w.rowId === rowId);
+                            return [hasSageReference || isNegativeTrade ? 'trademc-has-sage-ref' : '', hasPriceWarning ? 'trademc-price-warning' : ''].filter(Boolean).join(' ');
                         }}
                         renderCell={(row, key) => {
                             if (key !== 'ref_number') return undefined;
@@ -2493,24 +2614,27 @@ function TradeMCTrades() {
                             const currentRef = String(row['ref_number'] ?? '');
                             if (rowId <= 0) return currentRef || '--';
                             return (
-                                <EditableTradeNum
-                                    value={currentRef}
-                                    rowId={rowId}
-                                    label="Ref #"
-                                    onSaved={(newVal) => {
-                                        setData(prev => prev.map(r =>
-                                            toNumericId(r['id']) === rowId ? { ...r, ref_number: newVal } : r
-                                        ));
-                                        show(`Ref # updated to "${newVal}" on TradeMC`, 'success');
-                                        void load();
-                                    }}
-                                    onError={(msg) => show(msg, 'center-error')}
-                                    saveTradeNumber={async (id, tradeNumber) => {
-                                        const res = await api.updateTradeMCRefNumber(id, tradeNumber);
-                                        const savedRef = asText((res as Row).ref_number, tradeNumber);
-                                        return { ok: true, savedValue: savedRef };
-                                    }}
-                                />
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                                    <EditableTradeNum
+                                        value={currentRef}
+                                        rowId={rowId}
+                                        label="Ref #"
+                                        onSaved={(newVal) => {
+                                            setData(prev => prev.map(r =>
+                                                toNumericId(r['id']) === rowId ? { ...r, ref_number: newVal } : r
+                                            ));
+                                            show(`Ref # updated to "${newVal}" on TradeMC`, 'success');
+                                            void load();
+                                        }}
+                                        onError={(msg) => show(msg, 'center-error')}
+                                        saveTradeNumber={async (id, tradeNumber) => {
+                                            const res = await api.updateTradeMCRefNumber(id, tradeNumber);
+                                            const savedRef = asText((res as Row).ref_number, tradeNumber);
+                                            return { ok: true, savedValue: savedRef };
+                                        }}
+                                    />
+                                    {priceWarnings.some(w => w.rowId === rowId) && <span className="price-warning-pill">!</span>}
+                                </span>
                             );
                         }}
                     />
@@ -8451,6 +8575,7 @@ export default function App() {
     const [authUser, setAuthUser] = useState<AppUser | null>(null);
     const [reconDeltaAlert, setReconDeltaAlert] = useState(false);
     const [tradeMCMissingSageAlert, setTradeMCMissingSageAlert] = useState(false);
+    const [priceWarnings, setPriceWarnings] = useState<Array<{ id: string; label: string; message: string; rowId: number }>>([]);
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
     const [authError, setAuthError] = useState('');
@@ -8605,6 +8730,15 @@ export default function App() {
             window.clearInterval(timer);
         };
     }, [authUser]);
+
+    useEffect(() => {
+        const onPriceWarning = (event: Event) => {
+            const detail = (event as CustomEvent<{ warnings?: Array<{ id: string; label: string; message: string; rowId: number }> }>).detail;
+            setPriceWarnings(Array.isArray(detail?.warnings) ? detail.warnings : []);
+        };
+        window.addEventListener(PRICE_WARNING_EVENT, onPriceWarning as EventListener);
+        return () => window.removeEventListener(PRICE_WARNING_EVENT, onPriceWarning as EventListener);
+    }, []);
 
     useEffect(() => {
         if (!authUser) return;
@@ -8841,6 +8975,27 @@ export default function App() {
                                                 }}
                                             />
                                         )}
+                                        {item.id === 'trademc' && priceWarnings.length > 0 && (
+                                            <span
+                                                aria-label="price-warning-alert"
+                                                title="Price deviation warning"
+                                                style={{
+                                                    width: '14px',
+                                                    height: '14px',
+                                                    borderRadius: '50%',
+                                                    backgroundColor: '#dc3545',
+                                                    color: '#fff',
+                                                    display: 'inline-flex',
+                                                    alignItems: 'center',
+                                                    justifyContent: 'center',
+                                                    fontSize: '10px',
+                                                    fontWeight: 800,
+                                                    lineHeight: 1,
+                                                }}
+                                            >
+                                                !
+                                            </span>
+                                        )}
                                     </span>
                                 </button>
                             ))}
@@ -8868,6 +9023,28 @@ export default function App() {
                     </div>
                 </header>
                 <main className="content-body">
+                    {priceWarnings.length > 0 && (
+                        <div className="corner-warning-toast">
+                            <div style={{ fontWeight: 800, marginBottom: 4 }}>Price warning</div>
+                            <div style={{ fontSize: 12, lineHeight: 1.4, marginBottom: 8 }}>
+                                {priceWarnings[0]?.message}
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                                <button
+                                    className="btn btn-sm btn-primary"
+                                    onClick={() => {
+                                        const ids = priceWarnings.map(w => w.id);
+                                        persistAckedPriceWarnings({ ...readAckedPriceWarnings(), ...Object.fromEntries(ids.map(id => [id, true])) });
+                                        window.dispatchEvent(new CustomEvent(PRICE_WARNING_ACK_EVENT));
+                                        window.dispatchEvent(new CustomEvent(PRICE_WARNING_EVENT, { detail: { warnings: [] } }));
+                                        setPriceWarnings([]);
+                                    }}
+                                >
+                                    ✓ Ack
+                                </button>
+                            </div>
+                        </div>
+                    )}
                     <RenderGuard title={PAGE_TITLES[String(tab)] || 'Current Section'}>
                         {tab === 'dashboard' && <Dashboard />}
                         {tab === 'forecast' && <ForecastTab />}

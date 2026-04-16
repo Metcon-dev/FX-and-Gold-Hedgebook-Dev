@@ -935,6 +935,57 @@ h3 {
   background: rgba(176, 120, 64, 0.08);
 }
 
+.data-table tbody tr.trademc-price-warning,
+.data-table tbody tr.trademc-price-warning:hover {
+  background: rgba(218, 63, 55, 0.12);
+}
+
+.data-table tbody tr.trademc-price-warning td {
+  color: #8f1d1d;
+  font-weight: 600;
+}
+
+.price-warning-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 800;
+  flex-shrink: 0;
+}
+
+.warning-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin: 0.75rem 0;
+  padding: 0.8rem 0.9rem;
+  border-radius: 12px;
+  border: 1px solid rgba(218, 63, 55, 0.22);
+  background: linear-gradient(180deg, rgba(218, 63, 55, 0.12), rgba(218, 63, 55, 0.08));
+  color: #7d1c1c;
+}
+
+.corner-warning-toast {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  width: min(340px, calc(100vw - 36px));
+  background: #fff7f7;
+  border: 1px solid rgba(218, 63, 55, 0.35);
+  border-left: 5px solid var(--danger);
+  box-shadow: 0 18px 30px rgba(0, 0, 0, 0.12);
+  border-radius: 14px;
+  padding: 14px 14px 12px;
+  z-index: 1000;
+}
+
 .data-table tbody tr.trademc-summary-row td {
   border-top: 1px solid var(--border);
   color: #1C1C1C;
