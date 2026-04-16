@@ -2702,6 +2702,19 @@ h3 {
   text-align: right;
 }
 
+.worksheet-table td:nth-child(2) .worksheet-cell-input,
+.worksheet-table td:nth-child(3) .worksheet-cell-input,
+.worksheet-table td:nth-child(4) .worksheet-cell-input {
+  text-align: right;
+  padding-right: 0;
+}
+
+.worksheet-table th:nth-child(2),
+.worksheet-table th:nth-child(3),
+.worksheet-table th:nth-child(4) {
+  padding-right: calc(0.7rem + 1px);
+}
+
 .worksheet-table th:nth-child(5),
 .worksheet-table td:nth-child(5) {
   text-align: center;
@@ -2757,13 +2770,13 @@ h3 {
 }
 
 .worksheet-row-locked {
-  background: #f8fafc;
+  background: #fdfdfd;
 }
 
 .worksheet-row-locked .worksheet-cell-input {
-  background: #eef2f7;
-  color: #475569;
-  border-color: #dbe2ea;
+  background: #fafbfc;
+  color: #374151;
+  border-color: #eceff3;
   cursor: not-allowed;
 }
 

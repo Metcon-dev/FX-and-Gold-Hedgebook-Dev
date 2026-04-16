@@ -1368,5 +1368,300 @@ def parse_account_balances_response(response_body: str, content_type: str) -> li
                 
     except Exception as e:
         print(f"Error parsing account balances: {e}")
-    
+
     return balances
+
+
+def fetch_pmx_trade_activity_log(
+    start_date: str,
+    end_date: str,
+    body_overrides: Optional[Dict[str, Any]] = None,
+    host: str = "pmxapi.stonex.com",
+    path: str = "/user/rptTrdActLog",
+    authorization: str = "",
+    cookie: str = "",
+    x_auth: str = "",
+    sid: str = "",
+    username: str = "",
+    platform: str = "",
+    location: str = "",
+    cache_control: str = "",
+    content_type: str = "application/json; charset=utf-8",
+    extra_headers: Optional[Dict[str, str]] = None,
+    origin: str = "https://pmxecute.stonex.com",
+    referer: str = "https://pmxecute.stonex.com/",
+    timeout: int = 60,
+) -> Dict:
+    """POST to PMX rptTrdActLog (Trade Activity Log). Dates are DD-MM-YYYY."""
+    url = path if str(path).startswith("http") else f"https://{host}{path}"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    }
+    if origin:
+        headers["Origin"] = origin
+    if referer:
+        headers["Referer"] = referer
+    if authorization:
+        headers["Authorization"] = authorization
+    if cookie:
+        headers["Cookie"] = cookie
+    if x_auth:
+        headers["x-auth"] = x_auth
+    if sid:
+        headers["sid"] = sid
+    if username:
+        headers["username"] = username
+    if platform:
+        headers["platform"] = platform
+    if location:
+        headers["location"] = location
+    if cache_control:
+        headers["cache-control"] = cache_control
+    if content_type:
+        headers["content-type"] = content_type
+    if isinstance(extra_headers, dict):
+        for key, value in extra_headers.items():
+            if key and value is not None and str(value).strip():
+                headers[str(key)] = str(value)
+
+    # Best-guess payload shape; content-length 43 matches {"sDate":"DD-MM-YYYY","eDate":"DD-MM-YYYY"}.
+    # Fall back to alternative key shapes if PMX rejects this.
+    payload_variants: List[Dict[str, Any]] = [
+        {"sDate": start_date, "eDate": end_date},
+        {"startDate": start_date, "endDate": end_date},
+        {"fromDate": start_date, "toDate": end_date},
+    ]
+    if isinstance(body_overrides, dict) and body_overrides:
+        payload_variants.insert(0, dict(body_overrides))
+
+    last_result: Dict[str, Any] = {}
+    for body in payload_variants:
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+        except Exception as exc:
+            last_result = {"ok": False, "error": str(exc), "request_body": body}
+            continue
+
+        content_type_resp = resp.headers.get("Content-Type", "")
+        body_text = resp.text if isinstance(resp.text, str) else ""
+        parsed_json: Any = None
+        if "json" in content_type_resp.lower() or body_text.lstrip().startswith(("{", "[")):
+            try:
+                parsed_json = resp.json()
+            except Exception:
+                parsed_json = None
+
+        ok = bool(resp.ok)
+        message = ""
+        if isinstance(parsed_json, dict):
+            pmx_status = str(parsed_json.get("status", "")).strip().lower()
+            if pmx_status in {"failed", "error"}:
+                ok = False
+            message = str(parsed_json.get("message", "")).strip()
+
+        last_result = {
+            "ok": ok,
+            "status": resp.status_code,
+            "reason": resp.reason,
+            "url": resp.url,
+            "content_type": content_type_resp,
+            "body": body_text,
+            "json": parsed_json,
+            "error": "" if ok else (message or resp.reason or "PMX rptTrdActLog returned an error"),
+            "request_body": body,
+        }
+        # Success or an auth/permission failure — no point trying alternate body shapes.
+        if ok or resp.status_code in (401, 403):
+            return last_result
+
+    return last_result or {"ok": False, "error": "PMX rptTrdActLog request failed"}
+
+
+def extract_pmx_activity_log_rows(payload: Any) -> List[Dict[str, Any]]:
+    """Flexibly pull row records from the rptTrdActLog response shape."""
+    def _decode_json_like(value: Any, max_depth: int = 3) -> Any:
+        out = value
+        for _ in range(max_depth):
+            if not isinstance(out, str):
+                break
+            text = out.strip()
+            if not text.startswith(("{", "[")):
+                break
+            try:
+                out = json.loads(text)
+            except Exception:
+                break
+        return out
+
+    candidates: List[Any] = []
+    payload = _decode_json_like(payload)
+    if isinstance(payload, list):
+        candidates.append(payload)
+    elif isinstance(payload, dict):
+        for key in ("data", "rows", "result", "activities", "activityLog", "tradeActivity", "records", "list"):
+            val = _decode_json_like(payload.get(key))
+            if isinstance(val, list):
+                candidates.append(val)
+            elif isinstance(val, dict):
+                for sub in ("rows", "list", "data", "records", "items"):
+                    inner = _decode_json_like(val.get(sub))
+                    if isinstance(inner, list):
+                        candidates.append(inner)
+        if not candidates:
+            for val in payload.values():
+                val = _decode_json_like(val)
+                if isinstance(val, list) and val and isinstance(val[0], dict):
+                    candidates.append(val)
+
+    rows: List[Dict[str, Any]] = []
+    for group in candidates:
+        for rec in group:
+            if isinstance(rec, dict):
+                rows.append(rec)
+    return rows
+
+
+def fetch_pmx_online_report(
+    start_date: str,
+    end_date: str,
+    cmdty: str = "",
+    order_opt: str = "O",
+    event_time: str = "",
+    acc_opt: str = "MT0601",
+    creatby_opt: str = "2",
+    host: str = "pmxapi.stonex.com",
+    path: str = "/user/online_Report",
+    authorization: str = "",
+    cookie: str = "",
+    x_auth: str = "",
+    sid: str = "",
+    username: str = "",
+    platform: str = "",
+    location: str = "",
+    cache_control: str = "",
+    content_type: str = "application/json; charset=utf-8",
+    extra_headers: Optional[Dict[str, str]] = None,
+    origin: str = "https://pmxecute.stonex.com",
+    referer: str = "https://pmxecute.stonex.com/",
+    timeout: int = 60,
+) -> Dict:
+    """GET PMX online report endpoint (open/pending orders view)."""
+    url = path if str(path).startswith("http") else f"https://{host}{path}"
+    params = {
+        "startDate": start_date,
+        "endDate": end_date,
+        "Cmdty": cmdty or "",
+        "Order_opt": order_opt or "O",
+        "EventTime": event_time or "",
+        "Acc_opt": acc_opt or "MT0601",
+        "creatby_opt": creatby_opt or "2",
+    }
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    }
+    if origin:
+        headers["Origin"] = origin
+    if referer:
+        headers["Referer"] = referer
+    if authorization:
+        headers["Authorization"] = authorization
+    if cookie:
+        headers["Cookie"] = cookie
+    if x_auth:
+        headers["x-auth"] = x_auth
+    if sid:
+        headers["sid"] = sid
+    if username:
+        headers["username"] = username
+    if platform:
+        headers["platform"] = platform
+    if location:
+        headers["location"] = location
+    if cache_control:
+        headers["cache-control"] = cache_control
+    if content_type:
+        headers["content-type"] = content_type
+    if isinstance(extra_headers, dict):
+        for key, value in extra_headers.items():
+            if key and value is not None and str(value).strip():
+                headers[str(key)] = str(value)
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    content_type_resp = resp.headers.get("Content-Type", "")
+    body_text = resp.text if isinstance(resp.text, str) else ""
+    parsed_json: Any = None
+    if "json" in content_type_resp.lower() or body_text.lstrip().startswith(("{", "[")):
+        try:
+            parsed_json = resp.json()
+        except Exception:
+            parsed_json = None
+
+    ok = bool(resp.ok)
+    message = ""
+    if isinstance(parsed_json, dict):
+        pmx_status = str(parsed_json.get("status", "")).strip().lower()
+        if pmx_status in {"failed", "error"}:
+            ok = False
+        message = str(parsed_json.get("message", "")).strip()
+
+    return {
+        "ok": ok,
+        "status": resp.status_code,
+        "reason": resp.reason,
+        "url": resp.url,
+        "content_type": content_type_resp,
+        "body": body_text,
+        "json": parsed_json,
+        "error": "" if ok else (message or resp.reason or "PMX online_Report returned an error"),
+        "request_params": params,
+    }
+
+
+def extract_pmx_online_report_rows(payload: Any) -> List[Dict[str, Any]]:
+    """Flexibly pull row records from PMX online_Report response shape."""
+    def _decode_json_like(value: Any, max_depth: int = 3) -> Any:
+        out = value
+        for _ in range(max_depth):
+            if not isinstance(out, str):
+                break
+            text = out.strip()
+            if not text.startswith(("{", "[")):
+                break
+            try:
+                out = json.loads(text)
+            except Exception:
+                break
+        return out
+
+    candidates: List[Any] = []
+    payload = _decode_json_like(payload)
+    if isinstance(payload, list):
+        candidates.append(payload)
+    elif isinstance(payload, dict):
+        for key in ("data", "rows", "result", "list", "records", "items", "onlineReport", "report"):
+            val = _decode_json_like(payload.get(key))
+            if isinstance(val, list):
+                candidates.append(val)
+            elif isinstance(val, dict):
+                for sub in ("rows", "list", "data", "records", "items"):
+                    inner = _decode_json_like(val.get(sub))
+                    if isinstance(inner, list):
+                        candidates.append(inner)
+        if not candidates:
+            for val in payload.values():
+                val = _decode_json_like(val)
+                if isinstance(val, list) and val and isinstance(val[0], dict):
+                    candidates.append(val)
+
+    rows: List[Dict[str, Any]] = []
+    for group in candidates:
+        for rec in group:
+            if isinstance(rec, dict):
+                rows.append(rec)
+    return rows

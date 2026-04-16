@@ -80,6 +80,13 @@ function fmt(val: unknown, decimals = 2): string {
     return n.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
 
+function fmtFullPrecision(val: unknown): string {
+    if (val === '' || val === null || val === undefined) return '--';
+    const n = Number(val);
+    if (isNaN(n)) return String(val);
+    return n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 20 });
+}
+
 function fmtDate(val: unknown): string {
     if (!val) return '--';
     const s = String(val);
@@ -3531,18 +3538,37 @@ function WeightedAverage() {
             const xauRows = ((res?.xau_usd as Row[] | undefined) || []);
             const zarRows = ((res?.usd_zar as Row[] | undefined) || []);
             const pickFirst = (row: Row, keys: string[]): unknown => keys.map((k) => row[k]).find((v) => v !== undefined && v !== null && String(v).trim() !== '');
+            const withThousands = (raw: string): string => {
+                if (!raw) return raw;
+                const [intPart, decPart] = raw.split('.');
+                const intNum = Number(intPart.replace(/,/g, ''));
+                if (!Number.isFinite(intNum)) return raw;
+                const fmtInt = intNum.toLocaleString('en-US');
+                return decPart !== undefined ? `${fmtInt}.${decPart}` : fmtInt;
+            };
             const mapToSheet = (rows: Row[], weightKeys: string[], rateKeys: string[], totalKeys: string[]): SheetRow[] => {
                 const mapped = rows.map((row) => {
                     const weightVal = pickFirst(row, weightKeys);
                     const rateVal = pickFirst(row, rateKeys);
                     const totalVal = pickFirst(row, totalKeys);
-                    const sideRaw = String(pickFirst(row, ['side', 'trade_side', 'deal_side']) ?? '').trim().toUpperCase();
+                    const weightNum = weightVal !== undefined && weightVal !== null ? Number(weightVal) : NaN;
+                    const sideFromSign = Number.isFinite(weightNum) && weightNum !== 0
+                        ? (weightNum < 0 ? 'SELL' : 'BUY')
+                        : '';
+                    const totalNum = totalVal !== undefined && totalVal !== null ? Number(totalVal) : NaN;
+                    const totalStr = Number.isFinite(totalNum)
+                        ? Math.abs(totalNum).toFixed(2)
+                        : (totalVal !== undefined && totalVal !== null ? String(totalVal) : '');
+                    const weightStr = Number.isFinite(weightNum)
+                        ? String(Math.abs(weightNum))
+                        : (weightVal !== undefined && weightVal !== null ? String(weightVal) : '');
+                    const rateStr = rateVal !== undefined && rateVal !== null ? String(rateVal) : '';
                     return {
                         id: `${Date.now()}-${Math.random()}`,
-                        side: sideRaw === 'BUY' || sideRaw === 'SELL' ? sideRaw : '',
-                        weight: weightVal !== undefined && weightVal !== null ? String(weightVal) : '',
-                        rate: rateVal !== undefined && rateVal !== null ? String(rateVal) : '',
-                        total: totalVal !== undefined && totalVal !== null ? String(totalVal) : '',
+                        side: sideFromSign,
+                        weight: withThousands(weightStr),
+                        rate: withThousands(rateStr),
+                        total: withThousands(totalStr),
                         locked: true,
                     };
                 });
@@ -3581,7 +3607,16 @@ function WeightedAverage() {
         setRows((prev) => prev.map((r) => {
             if (r.id !== rowId) return r;
             if (r.locked) return r;
-            return { ...r, [field]: value };
+            const next = { ...r, [field]: value };
+            if (field === 'weight') {
+                const n = Number(String(value).replace(/,/g, '').trim());
+                if (Number.isFinite(n) && n !== 0) {
+                    next.side = n < 0 ? 'SELL' : 'BUY';
+                } else if (String(value).trim() === '') {
+                    next.side = '';
+                }
+            }
+            return next;
         }));
     };
     const addRow = (setRows: React.Dispatch<React.SetStateAction<SheetRow[]>>) =>
@@ -3596,7 +3631,6 @@ function WeightedAverage() {
         weightLabel: string,
         rateLabel: string,
         totalPrefix: string,
-        rateDecimals: number,
         totals: {
             totalTraded: number;
             weightedRate: number | null;
@@ -3608,7 +3642,7 @@ function WeightedAverage() {
             <div className="worksheet-table-wrap">
                 <div className="worksheet-summary-bar">
                     <div className="worksheet-summary-cell">{`Total Traded: ${fmt(totals.totalTraded, 4)}`}</div>
-                    <div className="worksheet-summary-cell">{`Weighted Rate: ${totals.weightedRate !== null ? fmt(totals.weightedRate, rateDecimals) : '--'}`}</div>
+                    <div className="worksheet-summary-cell">{fmtFullPrecision(totals.weightedRate)}</div>
                     <div className="worksheet-summary-cell">{`Product: ${totalPrefix}${fmt(totals.product, 2)}`}</div>
                 </div>
                 <table className="data-table worksheet-table">
@@ -3730,7 +3764,6 @@ function WeightedAverage() {
                     'Weight (oz)',
                     'PM Price ($/oz)',
                     '$',
-                    2,
                     {
                         totalTraded: goldTotals.totalWeight,
                         weightedRate: goldTotals.wa,
@@ -3744,7 +3777,6 @@ function WeightedAverage() {
                     'Weight (USD)',
                     'FX Rate (USD/ZAR)',
                     'R',
-                    4,
                     {
                         totalTraded: fxTotals.totalWeight,
                         weightedRate: fxTotals.wa,
@@ -5061,7 +5093,7 @@ function ProfitTab() {
     const DEFAULT_METAL_TOLERANCE_G = 32.0;
     const GRAMS_PER_TROY_OUNCE = 31.1035;
     const MONTHLY_TARGET_RATE = 0.0015;
-    const MONTHLY_TARGET_RAND_PER_GRAM = 1.55;
+    const MONTHLY_TARGET_RAND_PER_GRAM = 1.3;
     const [payload, setPayload] = useState<{ months: Row[]; summary: Row }>({ months: [], summary: {} });
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -5071,6 +5103,7 @@ function ProfitTab() {
     const [hedgeStatusByTrade, setHedgeStatusByTrade] = useState<Record<string, string>>({});
     const [metalTolerance] = usePersistentState('filters:hedging:metal_tolerance', DEFAULT_METAL_TOLERANCE_G);
     const [usdTolerance] = usePersistentState('filters:hedging:usd_tolerance', 1.0);
+    const [monthlyProfitPeriod, setMonthlyProfitPeriod] = usePersistentState<string>('filters:profit:monthly_period', 'all');
     const { show, Toast } = useToast();
 
     const load = useCallback(async (isRefresh = false) => {
@@ -5161,7 +5194,7 @@ function ProfitTab() {
             return sum + tradeNetG;
         }, 0);
 
-    const monthlyChartData = months
+    const monthlyChartDataAll = months
         .map((month, monthIdx) => {
             const monthKey = monthKeyOf(month, monthIdx);
             const monthLabel = asText(month.month_label, monthKey);
@@ -5224,12 +5257,20 @@ function ProfitTab() {
         })
         .sort((a, b) => String(a.monthKey).localeCompare(String(b.monthKey)));
 
+    const monthlyChartData = (() => {
+        if (monthlyProfitPeriod === 'all') return monthlyChartDataAll;
+        const monthsCount = parseInt(monthlyProfitPeriod, 10) || 6;
+        return monthlyChartDataAll.slice(-monthsCount);
+    })();
+
     const totalMonthlyNetProfit = monthlyChartData.reduce((sum, row) => sum + row.netProfit, 0);
     const totalMonthlyTarget = monthlyChartData.reduce((sum, row) => sum + row.monthlyTarget, 0);
     const totalMonthlyTargetGap = totalMonthlyNetProfit - totalMonthlyTarget;
     const totalMonthlyAbsWeightG = monthlyChartData.reduce((sum, row) => sum + row.tmAbsWeightG, 0);
     const weightedMonthlyNetProfitPerGram = totalMonthlyAbsWeightG > 1e-9 ? (totalMonthlyNetProfit / totalMonthlyAbsWeightG) : 0;
     const totalMonthlyTargetGapPerGram = weightedMonthlyNetProfitPerGram - MONTHLY_TARGET_RAND_PER_GRAM;
+    const totalMonthlyPerGramTargetZar = MONTHLY_TARGET_RAND_PER_GRAM * totalMonthlyAbsWeightG;
+    const totalMonthlyPerGramGapZar = totalMonthlyNetProfit - totalMonthlyPerGramTargetZar;
 
     const renderProfitHurdleBarShape = (props: { x?: number; y?: number; width?: number; height?: number }) => {
         const { x, y, width, height } = props;
@@ -5582,15 +5623,29 @@ function ProfitTab() {
                                 <div className="dashboard-chart-title">Net Profit vs Monthly Hurdle</div>
                                 <div className="dashboard-chart-subtitle">Monthly target = 0.15% × (|TradeMC Buy ZAR| + |TradeMC Sell ZAR|).</div>
                             </div>
-                            <div className="dashboard-chart-kpis">
-                                <div className="dashboard-kpi">
-                                    <div className="dashboard-kpi-label">Total Net Profit</div>
-                                    <div className={`dashboard-kpi-value ${totalMonthlyNetProfit >= 0 ? 'positive' : 'negative'}`}>R{fmt(totalMonthlyNetProfit, 2)}</div>
-                                </div>
-                                <div className="dashboard-kpi">
-                                    <div className="dashboard-kpi-label">Net vs Target</div>
-                                    <div className={`dashboard-kpi-value ${totalMonthlyTargetGap >= 0 ? 'positive' : 'negative'}`}>
-                                        {totalMonthlyTargetGap >= 0 ? '+' : ''}R{fmt(totalMonthlyTargetGap, 2)}
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                                <select
+                                    value={monthlyProfitPeriod}
+                                    onChange={e => setMonthlyProfitPeriod(e.target.value)}
+                                    className="input"
+                                    style={{ width: 'auto', minWidth: 130, fontSize: 12, padding: '4px 8px', margin: 0 }}
+                                >
+                                    <option value="3">Last 3 months</option>
+                                    <option value="6">Last 6 months</option>
+                                    <option value="12">Last 12 months</option>
+                                    <option value="24">Last 24 months</option>
+                                    <option value="all">All time</option>
+                                </select>
+                                <div className="dashboard-chart-kpis">
+                                    <div className="dashboard-kpi">
+                                        <div className="dashboard-kpi-label">Total Net Profit</div>
+                                        <div className={`dashboard-kpi-value ${totalMonthlyNetProfit >= 0 ? 'positive' : 'negative'}`}>R{fmt(totalMonthlyNetProfit, 2)}</div>
+                                    </div>
+                                    <div className="dashboard-kpi">
+                                        <div className="dashboard-kpi-label">Net vs Target</div>
+                                        <div className={`dashboard-kpi-value ${totalMonthlyTargetGap >= 0 ? 'positive' : 'negative'}`}>
+                                            {totalMonthlyTargetGap >= 0 ? '+' : ''}R{fmt(totalMonthlyTargetGap, 2)}
+                                        </div>
                                     </div>
                                 </div>
                             </div>
@@ -5638,9 +5693,13 @@ function ProfitTab() {
                         <div className="dashboard-chart-head">
                             <div>
                                 <div className="dashboard-chart-title">Net Profit (R/g) vs Monthly Hurdle</div>
-                                <div className="dashboard-chart-subtitle">Monthly hurdle = R1.55/g.</div>
+                                <div className="dashboard-chart-subtitle">Monthly hurdle = R1.3/g.</div>
                             </div>
                             <div className="dashboard-chart-kpis">
+                                <div className="dashboard-kpi">
+                                    <div className="dashboard-kpi-label">Total Net Profit</div>
+                                    <div className={`dashboard-kpi-value ${totalMonthlyNetProfit >= 0 ? 'positive' : 'negative'}`}>R{fmt(totalMonthlyNetProfit, 2)}</div>
+                                </div>
                                 <div className="dashboard-kpi">
                                     <div className="dashboard-kpi-label">Weighted Net R/g</div>
                                     <div className={`dashboard-kpi-value ${weightedMonthlyNetProfitPerGram >= 0 ? 'positive' : 'negative'}`}>R{fmt(weightedMonthlyNetProfitPerGram, 2)}/g</div>
@@ -5649,6 +5708,12 @@ function ProfitTab() {
                                     <div className="dashboard-kpi-label">R/g vs Hurdle</div>
                                     <div className={`dashboard-kpi-value ${totalMonthlyTargetGapPerGram >= 0 ? 'positive' : 'negative'}`}>
                                         {totalMonthlyTargetGapPerGram >= 0 ? '+' : ''}R{fmt(totalMonthlyTargetGapPerGram, 2)}/g
+                                    </div>
+                                </div>
+                                <div className="dashboard-kpi">
+                                    <div className="dashboard-kpi-label">Net Over R/g Target</div>
+                                    <div className={`dashboard-kpi-value ${totalMonthlyPerGramGapZar >= 0 ? 'positive' : 'negative'}`}>
+                                        {totalMonthlyPerGramGapZar >= 0 ? '+' : ''}R{fmt(totalMonthlyPerGramGapZar, 2)}
                                     </div>
                                 </div>
                             </div>
@@ -7081,7 +7146,7 @@ function Dashboard() {
 
     const GRAMS_PER_TROY_OUNCE = 31.1035;
     const DAILY_TARGET_RATE = 0.0015;
-    const DAILY_TARGET_RAND_PER_GRAM = 1.55;
+    const DAILY_TARGET_RAND_PER_GRAM = 1.3;
     const DASHBOARD_PROFIT_MIN_DATE = '2026-03-01';
 
     // --- Daily dashboard chart data ---
@@ -7186,6 +7251,8 @@ function Dashboard() {
     const totalAbsWeightDashboardG = profitChartData.reduce((sum, row) => sum + n((row as Row).targetBaseAbsG), 0);
     const weightedNetProfitPerGram = totalAbsWeightDashboardG > 1e-9 ? (totalNetProfitDashboard / totalAbsWeightDashboardG) : 0;
     const totalTargetGapPerGram = weightedNetProfitPerGram - DAILY_TARGET_RAND_PER_GRAM;
+    const totalPerGramTargetZar = DAILY_TARGET_RAND_PER_GRAM * totalAbsWeightDashboardG;
+    const totalPerGramGapZar = totalNetProfitDashboard - totalPerGramTargetZar;
 
     // --- Build trade_num → date lookup from profit data ---
     const tradeDateLookup = (() => {
@@ -7836,18 +7903,18 @@ function Dashboard() {
                     <div className="dashboard-chart-head">
                         <div>
                             <div className="dashboard-chart-title">Net Profit (R/g) vs Daily Hurdle</div>
-                            <div className="dashboard-chart-subtitle">Daily hurdle = R1.55/g. Achieved bar = realized net profit per gram (green) / loss per gram (red).</div>
+                            <div className="dashboard-chart-subtitle">Daily hurdle = R1.3/g. Achieved bar = realized net profit per gram (green) / loss per gram (red).</div>
                         </div>
-                        <div className="dashboard-chart-kpis">
-                            <div className="dashboard-kpi">
-                                <div className="dashboard-kpi-label">Weighted Net R/g</div>
-                                <div className={`dashboard-kpi-value ${weightedNetProfitPerGram >= 0 ? 'positive' : 'negative'}`}>R{fmt(weightedNetProfitPerGram, 2)}/g</div>
-                            </div>
-                            <div className="dashboard-kpi">
-                                <div className="dashboard-kpi-label">R/g vs Hurdle</div>
-                                <div className={`dashboard-kpi-value ${totalTargetGapPerGram >= 0 ? 'positive' : 'negative'}`}>
-                                    {totalTargetGapPerGram >= 0 ? '+' : ''}R{fmt(totalTargetGapPerGram, 2)}/g
+                            <div className="dashboard-chart-kpis">
+                                <div className="dashboard-kpi">
+                                    <div className="dashboard-kpi-label">Total Net Profit</div>
+                                    <div className={`dashboard-kpi-value ${totalNetProfitDashboard >= 0 ? 'positive' : 'negative'}`}>R{fmt(totalNetProfitDashboard, 2)}</div>
                                 </div>
+                                <div className="dashboard-kpi">
+                                    <div className="dashboard-kpi-label">Net Over R/g Target</div>
+                                    <div className={`dashboard-kpi-value ${totalPerGramGapZar >= 0 ? 'positive' : 'negative'}`}>
+                                        {totalPerGramGapZar >= 0 ? '+' : ''}R{fmt(totalPerGramGapZar, 2)}
+                                    </div>
                             </div>
                         </div>
                     </div>
@@ -7900,7 +7967,7 @@ function Dashboard() {
                                     <span style={{ width: 10, height: 10, borderRadius: 2, background: 'linear-gradient(90deg, #10b981 0%, #10b981 50%, #ef4444 50%, #ef4444 100%)', display: 'inline-block' }} /> Achieved (P/L)
                                 </span>
                                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-                                    <span style={{ width: 10, height: 10, border: '1.5px dashed #b4723d', background: 'rgba(180,114,61,0.24)', borderRadius: 2, display: 'inline-block' }} /> Hurdle (R1.55/g)
+                                    <span style={{ width: 10, height: 10, border: '1.5px dashed #b4723d', background: 'rgba(180,114,61,0.24)', borderRadius: 2, display: 'inline-block' }} /> Hurdle (R1.3/g)
                                 </span>
                             </div>
                         </>

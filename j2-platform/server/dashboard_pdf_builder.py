@@ -186,6 +186,15 @@ def send_email(
     use_starttls: bool = True,
 ) -> Dict[str, Any]:
     """Send the dashboard PDF via email."""
+    allow_send = os.environ.get("ENABLE_DASHBOARD_TRADING_SUMMARY_EMAIL", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if not allow_send:
+        return {
+            "ok": False,
+            "error": (
+                "Dashboard Trading Summary email sending is disabled. "
+                "Set ENABLE_DASHBOARD_TRADING_SUMMARY_EMAIL=true to allow this legacy path."
+            ),
+        }
     cc_list = cc_list or []
     if not to_list:
         return {"ok": False, "error": "No recipients."}

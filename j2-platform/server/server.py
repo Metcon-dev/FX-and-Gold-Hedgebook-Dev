@@ -132,6 +132,10 @@ from services.rest_service import (
     fetch_pmx_account_statement_report,
     fetch_pmx_load_account,
     fetch_pmx_fixinvoice_pdf,
+    fetch_pmx_trade_activity_log,
+    extract_pmx_activity_log_rows,
+    fetch_pmx_online_report,
+    extract_pmx_online_report_rows,
     extract_pmx_report_rows,
     extract_pmx_statement_report_rows,
 )
@@ -186,8 +190,8 @@ LEDGER_DB_PATH = FORCED_LEDGER_DB_PATH
 PMX_SUPPORT_DOC_PATTERN = re.compile(r"(?:FNC|SWT|FCT)/[^\s,;]+", re.IGNORECASE)
 # Hardcoded PMX session defaults per user request.
 # Note: x-auth/sid can expire and may need to be replaced.
-PMX_HARDCODED_X_AUTH = "3f4d9533-9e8e-43e1-b95c-ec7a1b9490a1"
-PMX_HARDCODED_SID = "505775"
+PMX_HARDCODED_X_AUTH = "6dbb7c15-a87d-4067-999b-25e6cef60587"
+PMX_HARDCODED_SID = "534731"
 PMX_HARDCODED_USERNAME = "TL1671"
 PMX_HARDCODED_PLATFORM = "Desktop"
 PMX_HARDCODED_LOCATION = "LD"
@@ -4608,6 +4612,68 @@ def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict
                 if isinstance(tr, dict):
                     all_trades.append(tr)
 
+    def _to_day(value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        raw = raw[:10] if len(raw) >= 10 else raw
+        try:
+            dt = pd.to_datetime(raw, errors="coerce")
+            if pd.isna(dt):
+                return ""
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
+    def _trade_abs_xau_traded_g(trade: Dict[str, Any]) -> float:
+        tx = trade.get("pmx_transactions")
+        if not isinstance(tx, list):
+            return abs(float(trade.get("stonex_traded_g") or 0.0))
+        total_g = 0.0
+        for row in tx:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("Symbol") or "").upper().replace("/", "").replace("-", "").replace(" ", "")
+            if symbol != "XAUUSD":
+                continue
+            try:
+                qty = float(row.get("Quantity") or 0.0)
+            except Exception:
+                qty = 0.0
+            if math.isfinite(qty):
+                total_g += abs(qty) * GRAMS_PER_TROY_OUNCE
+        if total_g <= 1e-12:
+            try:
+                fallback = abs(float(trade.get("stonex_traded_g") or 0.0))
+                return fallback if math.isfinite(fallback) else 0.0
+            except Exception:
+                return 0.0
+        return total_g
+
+    def _trade_open_close_day(trade: Dict[str, Any]) -> Tuple[str, str]:
+        tx = trade.get("pmx_transactions")
+        if not isinstance(tx, list):
+            d = _to_day(trade.get("trade_date"))
+            return (d, d) if d else ("", "")
+        days: List[str] = []
+        for row in tx:
+            if not isinstance(row, dict):
+                continue
+            d = (
+                _to_day(row.get("Trade Date"))
+                or _to_day(row.get("trade_date"))
+                or _to_day(row.get("TradeDate"))
+                or _to_day(row.get("date"))
+                or _to_day(row.get("DocDate"))
+                or _to_day(row.get("docdate"))
+            )
+            if d:
+                days.append(d)
+        if not days:
+            d = _to_day(trade.get("trade_date"))
+            return (d, d) if d else ("", "")
+        return (min(days), max(days))
+
     day_profit_map: Dict[str, float] = {}
     day_trade_count_map: Dict[str, int] = {}
     normalized_profit_rows: List[Tuple[str, float, Optional[float]]] = []
@@ -4634,20 +4700,67 @@ def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict
         day_profit_map[d] = float(day_profit_map.get(d, 0.0)) + pv
         day_trade_count_map[d] = int(day_trade_count_map.get(d, 0)) + 1
 
-    # Strict Profit-tab style aggregation:
-    # - Daily = sum for run_date only
-    # - MTD = sum from month start up to run_date
+    # Daily/MTD aggregation aligned to Profit tab trade rows:
+    # - Daily = rows where trade_date == run_date
+    # - MTD = rows where trade_date month == run_date month and trade_date <= run_date
     selected_day = run_date
-    daily_profit = float(day_profit_map.get(run_date, 0.0))
-    daily_trades = int(day_trade_count_map.get(run_date, 0))
+    daily_profit = 0.0
+    daily_trades = 0
+    daily_abs_traded_g = 0.0
+    daily_pct_weighted_sum = 0.0
+    daily_pct_weight = 0.0
+    for tr in all_trades:
+        if not isinstance(tr, dict):
+            continue
+        trade_day = _to_day(tr.get("trade_date"))
+        if trade_day != run_date:
+            continue
+        try:
+            pv = float(tr.get("total_profit_zar") or 0.0)
+            if not math.isfinite(pv):
+                continue
+        except Exception:
+            continue
+        traded_g = _trade_abs_xau_traded_g(tr)
+        daily_profit += float(pv)
+        daily_trades += 1
+        daily_abs_traded_g += traded_g
+        try:
+            pct = tr.get("profit_pct")
+            if pct is not None and str(pct).strip() != "":
+                pct_v = float(str(pct).replace("%", "").strip())
+                # Profit tab weighted margin uses abs(stonex_traded_g) as weight.
+                pct_weight = abs(float(tr.get("stonex_traded_g") or 0.0))
+                if not math.isfinite(pct_weight) or pct_weight <= 1e-12:
+                    pct_weight = traded_g
+                if math.isfinite(pct_v) and pct_weight > 1e-12:
+                    daily_pct_weighted_sum += (pct_v * pct_weight)
+                    daily_pct_weight += pct_weight
+        except Exception:
+            pass
+    daily_profit_per_g = (daily_profit / daily_abs_traded_g) if daily_abs_traded_g > 1e-12 else 0.0
+    daily_profit_pct = (daily_pct_weighted_sum / daily_pct_weight) if daily_pct_weight > 1e-12 else 0.0
 
     month_key = run_date[:7]
     mtd_profit = 0.0
     mtd_trades = 0
-    for d, pv, _pct in normalized_profit_rows:
-        if d.startswith(month_key) and d <= run_date:
-            mtd_profit += float(pv)
-            mtd_trades += 1
+    mtd_abs_traded_g = 0.0
+    for tr in all_trades:
+        if not isinstance(tr, dict):
+            continue
+        trade_day = _to_day(tr.get("trade_date"))
+        if not trade_day or not trade_day.startswith(month_key) or trade_day > run_date:
+            continue
+        try:
+            pv = float(tr.get("total_profit_zar") or 0.0)
+            if not math.isfinite(pv):
+                continue
+        except Exception:
+            continue
+        mtd_profit += float(pv)
+        mtd_trades += 1
+        mtd_abs_traded_g += _trade_abs_xau_traded_g(tr)
+    mtd_profit_per_g = (mtd_profit / mtd_abs_traded_g) if mtd_abs_traded_g > 1e-12 else 0.0
 
     hedging_rows = build_hedging_comparison(source="pmx") or []
     if not isinstance(hedging_rows, list):
@@ -4713,8 +4826,11 @@ def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict
         "selected_day": selected_day,
         "daily_profit": daily_profit,
         "daily_trades": daily_trades,
+        "daily_profit_per_g": daily_profit_per_g,
+        "daily_profit_pct": daily_profit_pct,
         "month_to_date_profit": mtd_profit,
         "month_to_date_trades": mtd_trades,
+        "month_to_date_profit_per_g": mtd_profit_per_g,
         "total_profit_all": total_profit_all,
         "total_trades_all": total_trades_all,
         "overall_profit_pct": overall_profit_pct,
@@ -4730,6 +4846,7 @@ def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict
 def _daily_trading_report_build_payload(run_date_iso: Optional[str] = None) -> Dict[str, Any]:
     dash = _build_dashboard_summary_payload(run_date_iso)
     run_date = str(dash.get("run_date") or (run_date_iso or datetime.now().strftime("%Y-%m-%d"))).strip()
+    pending_orders = _daily_trading_report_fetch_pending_limit_orders(run_date)
 
     reval = build_open_positions_reval({}, None) or {}
     reval_summary = reval.get("summary", {}) if isinstance(reval, dict) else {}
@@ -4744,8 +4861,11 @@ def _daily_trading_report_build_payload(run_date_iso: Optional[str] = None) -> D
         "source": "local:rule-based",
         "daily_profit": float(dash.get("daily_profit") or 0.0),
         "daily_trades": int(dash.get("daily_trades") or 0),
+        "daily_profit_per_g": float(dash.get("daily_profit_per_g") or 0.0),
+        "daily_profit_pct": float(dash.get("daily_profit_pct") or 0.0),
         "month_to_date_profit": float(dash.get("month_to_date_profit") or 0.0),
         "month_to_date_trades": int(dash.get("month_to_date_trades") or 0),
+        "month_to_date_profit_per_g": float(dash.get("month_to_date_profit_per_g") or 0.0),
         "open_positions_pnl": open_positions_pnl,
         "open_positions_trades": open_trades,
         "total_grams_to_hedge": float(dash.get("total_grams_to_hedge") or 0.0),
@@ -4757,30 +4877,247 @@ def _daily_trading_report_build_payload(run_date_iso: Optional[str] = None) -> D
         "total_trades_all": int(dash.get("total_trades_all") or 0),
         "month_plot_rows": list(dash.get("month_plot_rows") or []),
         "daily_plot_rows": list(dash.get("daily_plot_rows") or []),
+        "pending_limit_orders": list(pending_orders.get("rows") or []),
+        "pending_limit_orders_ok": bool(pending_orders.get("ok")),
+        "pending_limit_orders_error": str(pending_orders.get("error") or ""),
+    }
+
+
+def _daily_trading_report_fetch_pending_limit_orders(run_date_iso: str) -> Dict[str, Any]:
+    try:
+        run_dt = datetime.strptime(str(run_date_iso).strip(), "%Y-%m-%d")
+    except Exception:
+        return {"ok": False, "rows": [], "error": f"Invalid report date: {run_date_iso}"}
+    run_day = run_dt.strftime("%Y-%m-%d")
+
+    start_end = run_dt.strftime("%d-%m-%Y")
+    account_code = str(os.getenv("PMX_ACC_OPT_KEY", "MT0601") or "MT0601").strip() or "MT0601"
+
+    def _fetch_with_headers(resolved_headers: Dict[str, Any]) -> Dict[str, Any]:
+        return fetch_pmx_online_report(
+            start_date=start_end,
+            end_date=start_end,
+            cmdty="",
+            order_opt="O",
+            event_time="",
+            acc_opt=account_code,
+            creatby_opt="2",
+            x_auth=str(resolved_headers.get("x_auth") or ""),
+            sid=str(resolved_headers.get("sid") or ""),
+            username=str(resolved_headers.get("username") or ""),
+            platform=str(resolved_headers.get("platform") or ""),
+            location=str(resolved_headers.get("location") or ""),
+            cache_control=str(resolved_headers.get("cache_control") or ""),
+            content_type=str(resolved_headers.get("content_type") or "application/json; charset=utf-8"),
+        )
+
+    try:
+        resolved_headers = _pmx_resolve_headers({}, None, auto_login=True)
+    except Exception as exc:
+        return {"ok": False, "rows": [], "error": f"PMX header resolution failed: {exc}"}
+
+    try:
+        resp = _fetch_with_headers(resolved_headers)
+    except Exception as exc:
+        return {"ok": False, "rows": [], "error": f"PMX pending orders fetch failed: {exc}"}
+
+    # PMX often returns 500 with expired x-auth/sid; force a fresh login and retry.
+    if not bool(resp.get("ok")) and _pmx_result_is_auth_failure(resp, resp.get("json")):
+        try:
+            refreshed_headers = _pmx_resolve_headers({"force_pmx_relogin": True}, None, auto_login=True)
+            retry_resp = _fetch_with_headers(refreshed_headers)
+            if bool(retry_resp.get("ok")):
+                resp = retry_resp
+        except Exception:
+            pass
+
+    if not bool(resp.get("ok")):
+        return {"ok": False, "rows": [], "error": str(resp.get("error") or "PMX online report request failed")}
+
+    try:
+        raw_rows = extract_pmx_online_report_rows(resp.get("json") if resp.get("json") is not None else resp.get("body"))
+    except Exception as exc:
+        return {"ok": False, "rows": [], "error": f"Failed to parse PMX online report rows: {exc}"}
+
+    def _pick(row: Dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            value = row.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return ""
+
+    def _format_pmx_ts(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            epoch_ms = int(float(text))
+            return datetime.fromtimestamp(epoch_ms / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            for fmt in ("%d-%b-%Y", "%d/%m/%Y", "%Y-%m-%d", "%Y/%m/%d"):
+                try:
+                    return datetime.strptime(text, fmt).strftime("%Y-%m-%d 00:00:00")
+                except Exception:
+                    continue
+            return text
+
+    def _format_qty(value: Any) -> str:
+        try:
+            return f"{float(value):,.3f}"
+        except Exception:
+            return str(value or "").strip()
+
+    def _format_price(value: Any) -> str:
+        try:
+            return f"{float(value):,.5f}"
+        except Exception:
+            return str(value or "").strip()
+
+    def _format_pmx_activity(row: Dict[str, Any]) -> str:
+        explicit = _pick(row, "Activity", "activity", "description", "message", "details", "text")
+        if explicit:
+            return explicit
+        side = _pick(row, "Deal", "deal", "deal_type", "DealType", "Side", "side", "DT").upper()
+        if side in {"0", "BUY0"}:
+            side = "BUY"
+        elif side in {"1", "SELL1"}:
+            side = "SELL"
+        qty = _pick(row, "Pending Qty", "pendingQty", "out_qty", "pcs_qty", "PQ", "qty", "Qty")
+        unit = _pick(row, "Unit", "unit", "ord_stk_code", "SC", "Validity Unit")
+        pair = _pick(row, "Pair", "pair", "stk_desc", "IID", "inst_id", "CurrencyPair", "cmdty")
+        price = _pick(row, "Price", "price", "price1", "R", "rate")
+        validity = _pick(row, "Validity", "validity", "val_code", "VT")
+        comments = _pick(row, "Comments", "comments", "remarks", "RMK", "BRMK")
+        parts: List[str] = []
+        if side:
+            parts.append(side)
+        if qty:
+            qty_txt = _format_qty(qty)
+            if unit:
+                qty_txt = f"{qty_txt} {unit}"
+            parts.append(qty_txt)
+        if pair:
+            parts.append(pair.replace("-", "/"))
+        if price:
+            parts.append(f"@ {_format_price(price)}")
+        if validity:
+            parts.append(str(validity))
+        text = " ".join(parts).strip()
+        if comments:
+            text = f"{text} (Comments: {comments})".strip()
+        return text or "PMX pending limit order"
+
+    normalized_rows: List[Dict[str, str]] = []
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        doc_number = _pick(
+            row,
+            "Order #",
+            "Order#",
+            "orderNo",
+            "orderNumber",
+            "docno",
+            "DocNo",
+            "Doc #",
+            "Doc#",
+            "docNo",
+            "docNumber",
+            "doc_num",
+            "document",
+            "documentNo",
+            "DN",
+            "NOD",
+        )
+        if not doc_number.upper().startswith("ONG/"):
+            continue
+        activity_time = _format_pmx_ts(
+            _pick(row, "Trade Date", "tradeDate", "docdate", "date", "Date", "Activity Time", "activityTime", "time", "timestamp", "dateTime", "createdAt", "TS", "TIME", "OTIME")
+        )
+        if not activity_time.startswith(run_day):
+            continue
+        normalized_rows.append({
+            "activity_time": activity_time,
+            "doc_number": doc_number,
+            "activity": _format_pmx_activity(row),
+        })
+
+    normalized_rows = sorted(normalized_rows, key=lambda item: str(item.get("activity_time") or ""), reverse=True)
+    return {"ok": True, "rows": normalized_rows, "error": ""}
+
+
+def _daily_trading_report_payload_debug_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "date": str(payload.get("date") or ""),
+        "daily_profit": float(payload.get("daily_profit") or 0.0),
+        "daily_trades": int(payload.get("daily_trades") or 0),
+        "daily_profit_pct": float(payload.get("daily_profit_pct") or 0.0),
+        "daily_profit_per_g": float(payload.get("daily_profit_per_g") or 0.0),
+        "month_to_date_profit": float(payload.get("month_to_date_profit") or 0.0),
+        "month_to_date_trades": int(payload.get("month_to_date_trades") or 0),
+        "month_to_date_profit_per_g": float(payload.get("month_to_date_profit_per_g") or 0.0),
+        "open_positions_pnl": float(payload.get("open_positions_pnl") or 0.0),
+        "open_positions_trades": int(payload.get("open_positions_trades") or 0),
+        "total_grams_to_hedge": float(payload.get("total_grams_to_hedge") or 0.0),
+        "hedged_rows": int(payload.get("hedged_rows") or 0),
+        "unhedged_rows": int(payload.get("unhedged_rows") or 0),
+        "pending_limit_orders_count": len(list(payload.get("pending_limit_orders") or [])),
+        "pending_limit_orders_ok": bool(payload.get("pending_limit_orders_ok")),
+        "pending_limit_orders_error": str(payload.get("pending_limit_orders_error") or ""),
     }
 
 
 def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
     def _bar_rows(rows: List[Dict[str, Any]], currency_prefix: str = "R", units: str = "") -> str:
         if not rows:
-            return "<tr><td colspan='3' style='padding:8px 0;color:#738095;'>No data</td></tr>"
+            return "<tr><td colspan='2' style='padding:8px 0;color:#738095;'>No data</td></tr>"
         max_abs = max(max(abs(float(r.get("value") or 0.0)) for r in rows), 1.0)
         out = []
         for r in rows:
             label = _daily_trading_report_html_escape(r.get("label", ""))
             value = float(r.get("value") or 0.0)
-            width = max(2.0, min(100.0, (abs(value) / max_abs) * 100.0))
+            bar_px = max(12, min(360, int(round(360.0 * (abs(value) / max_abs)))))
+            gap_px = max(0, 360 - bar_px)
             color = "#1f8b4c" if value >= 0 else "#d83b2d"
             val_txt = f"{currency_prefix}{value:,.2f}{units}"
             out.append(
                 "<tr>"
-                f"<td style='padding:4px 0; width:86px; color:#34445d; font-size:12px;'>{label}</td>"
-                "<td style='padding:4px 8px;'>"
-                "<div style='height:10px;background:#dce3ee;border-radius:999px;overflow:hidden;'>"
-                f"<div style='width:{width:.2f}%;height:100%;background:{color};'></div>"
-                "</div>"
+                f"<td colspan='2' style='padding:7px 0 2px;color:#34445d;font-size:12px;font-weight:400;line-height:1.2;'>{label}</td>"
+                "</tr>"
+                "<tr>"
+                f"<td style='padding:0 10px 6px 0;width:360px;' width='360'>"
+                f"<table role='presentation' cellpadding='0' cellspacing='0' border='0' width='360' style='width:360px;border-collapse:collapse;'><tr>"
+                f"<td width='{bar_px}' style='width:{bar_px}px;height:12px;background:{color};font-size:0;line-height:0;'>&nbsp;</td>"
+                f"<td width='{gap_px}' style='width:{gap_px}px;height:12px;background:#dce3ee;font-size:0;line-height:0;'>&nbsp;</td>"
+                "</tr></table>"
                 "</td>"
-                f"<td style='padding:4px 0; width:120px; text-align:right; font-weight:700; color:#1f2a3d; font-size:12px;'>{_daily_trading_report_html_escape(val_txt)}</td>"
+                f"<td style='padding:0 0 6px 10px;width:140px;min-width:140px;text-align:right;font-weight:700;color:#1f2a3d;font-size:12px;white-space:nowrap;vertical-align:middle;'>{_daily_trading_report_html_escape(val_txt)}</td>"
+                "</tr>"
+            )
+        return "".join(out)
+
+    def _pending_orders_rows(rows: List[Dict[str, Any]]) -> str:
+        if not rows:
+            return (
+                "<tr>"
+                "<td colspan='3' style='padding:10px 8px;color:#738095;font-size:13px;'>"
+                "No pending limit orders found for the day."
+                "</td>"
+                "</tr>"
+            )
+        out = []
+        for row in rows:
+            activity_time = _daily_trading_report_html_escape(row.get("activity_time", ""))
+            doc_number = _daily_trading_report_html_escape(row.get("doc_number", ""))
+            activity = _daily_trading_report_html_escape(row.get("activity", ""))
+            out.append(
+                "<tr>"
+                f"<td style='padding:8px;border-top:1px solid #e1e7f0;color:#34445d;font-size:12px;vertical-align:top;'>{activity_time}</td>"
+                f"<td style='padding:8px;border-top:1px solid #e1e7f0;color:#1f2a3d;font-size:12px;font-weight:700;vertical-align:top;white-space:nowrap;'>{doc_number}</td>"
+                f"<td style='padding:8px;border-top:1px solid #e1e7f0;color:#1f2b3c;font-size:12px;line-height:1.5;vertical-align:top;'>{activity}</td>"
                 "</tr>"
             )
         return "".join(out)
@@ -4804,6 +5141,9 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
         "",
         "g",
     )
+    pending_orders_rows_html = _pending_orders_rows(list(payload.get("pending_limit_orders") or []))
+    pending_orders_error = str(payload.get("pending_limit_orders_error") or "").strip()
+    pending_orders_count = len(list(payload.get("pending_limit_orders") or []))
 
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -4815,6 +5155,11 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
     .main-title {{ font-size:20px !important; }}
     .main-subtitle {{ font-size:14px !important; }}
     .main-meta {{ font-size:12px !important; }}
+    .plot-table td {{ font-size:11px !important; }}
+    .plot-bar-wrap {{ min-width:0 !important; }}
+  }}
+  @media only screen and (min-width: 641px) {{
+    .plot-table {{ table-layout: fixed; }}
   }}
 </style>
 </head>
@@ -4831,12 +5176,12 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
         <td width="50%" style="padding:4px;"><div style="border:1px solid {daily_card_bd};background:{daily_card_bg};border-radius:10px;padding:10px;">
           <div class="kpi-title" style="font-size:20px;color:{daily_card_tx};font-weight:700;">Daily Profit{ " (LOSS)" if daily_is_loss else ""}</div>
           <div class="kpi-value" style="font-size:50px;line-height:1.05;color:{daily_card_tx};font-weight:800;">{_daily_trading_report_money(payload.get("daily_profit"), "R", 2)}</div>
-          <div class="kpi-sub" style="font-size:22px;color:{daily_card_tx};">Trades: {int(payload.get("daily_trades") or 0)} | Profit %: {_daily_trading_report_pct(payload.get("overall_profit_pct"), 2)}</div>
+          <div class="kpi-sub" style="font-size:22px;color:{daily_card_tx};">Trades: {int(payload.get("daily_trades") or 0)} | Profit %: {_daily_trading_report_pct(payload.get("daily_profit_pct"), 2)} | Profit/gram: R{float(payload.get("daily_profit_per_g") or 0.0):,.2f}/g</div>
         </div></td>
         <td width="50%" style="padding:4px;"><div style="border:1px solid #9fd2ad;background:#e9f6ec;border-radius:10px;padding:10px;">
           <div class="kpi-title" style="font-size:20px;color:#1f7a46;font-weight:700;">Month-to-date Profit</div>
           <div class="kpi-value" style="font-size:50px;line-height:1.05;color:#1f7a46;font-weight:800;">{_daily_trading_report_money(payload.get("month_to_date_profit"), "R", 2)}</div>
-          <div class="kpi-sub" style="font-size:22px;color:#1f7a46;">Trades: {int(payload.get("month_to_date_trades") or 0)} | Profit %: {_daily_trading_report_pct(payload.get("overall_profit_pct"), 2)}</div>
+          <div class="kpi-sub" style="font-size:22px;color:#1f7a46;">Trades: {int(payload.get("month_to_date_trades") or 0)} | Profit %: {_daily_trading_report_pct(payload.get("overall_profit_pct"), 2)} | Profit/gram: R{float(payload.get("month_to_date_profit_per_g") or 0.0):,.2f}/g</div>
         </div></td>
       </tr><tr>
         <td width="50%" style="padding:4px;"><div style="border:1px solid #9db2e5;background:#edf2fc;border-radius:10px;padding:10px;">
@@ -4858,14 +5203,26 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
         <li>Hedge coverage tracks {int(payload.get("hedged_rows") or 0)} hedged rows with {_daily_trading_report_num(payload.get("total_grams_to_hedge"), 2)}g remaining to hedge.</li>
       </ul>
 
+      <div style="margin-top:10px;border-left:4px solid #8a5a16;background:#fdf4e8;padding:8px 10px;font-size:15px;font-weight:700;color:#7a4a10;">Pending Limit Orders (PMX Activity Log)</div>
+      <div style="padding:8px 2px 4px;color:#1f2b3c;font-size:14px;">ONG orders found for {date_txt}: <strong>{pending_orders_count}</strong></div>
+      {f"<div style='padding:0 2px 8px;color:#9c4a1a;font-size:12px;'>PMX activity log warning: {_daily_trading_report_html_escape(pending_orders_error)}</div>" if pending_orders_error else ""}
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:4px;border:1px solid #e1e7f0;border-radius:8px;overflow:hidden;">
+        <tr style="background:#f7f9fc;">
+          <td style="padding:8px;color:#51627c;font-size:12px;font-weight:700;">Activity Time</td>
+          <td style="padding:8px;color:#51627c;font-size:12px;font-weight:700;">Doc #</td>
+          <td style="padding:8px;color:#51627c;font-size:12px;font-weight:700;">Activity</td>
+        </tr>
+        {pending_orders_rows_html}
+      </table>
+
       <div style="margin-top:8px;border-left:4px solid #5f8f28;background:#eef6df;padding:8px 10px;font-size:15px;font-weight:700;color:#4a6b1f;">Monthly Profit Plot (ZAR)</div>
-      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:6px;">{month_rows_html}</table>
+      <table class="plot-table" role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:6px;table-layout:fixed;">{month_rows_html}</table>
 
       <div style="margin-top:10px;border-left:4px solid #2f68b2;background:#e8f2ff;padding:8px 10px;font-size:15px;font-weight:700;color:#21508d;">Daily Profit Plot (ZAR)</div>
-      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:6px;">{daily_rows_html}</table>
+      <table class="plot-table" role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:6px;table-layout:fixed;">{daily_rows_html}</table>
 
       <div style="margin-top:10px;border-left:4px solid #bd7a2f;background:#fbf3e8;padding:8px 10px;font-size:15px;font-weight:700;color:#9a5d1d;">Hedging Plot (grams)</div>
-      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:6px;">{hedge_rows_html}</table>
+      <table class="plot-table" role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:6px;table-layout:fixed;">{hedge_rows_html}</table>
       <div style="color:#364860;font-size:12px;margin-top:6px;">Rows: Hedged {int(payload.get("hedged_rows") or 0)} | Unhedged {int(payload.get("unhedged_rows") or 0)} | To hedge {_daily_trading_report_num(payload.get("total_grams_to_hedge"), 2)}g</div>
 
       <div style="margin-top:10px;border-left:4px solid #cc4f86;background:#fdeff6;padding:8px 10px;font-size:15px;font-weight:700;color:#a42f64;">Open Positions Revaluation Detail</div>
@@ -4956,7 +5313,9 @@ def _daily_trading_report_run_once_for_date(
         html_body = _daily_trading_report_render_html(payload)
     except Exception as exc:
         return {"ok": False, "error": f"Failed to build report payload: {exc}"}
-    return _daily_trading_report_send_html(run_date_iso, html_body, recipients_override=recipients_override)
+    result = _daily_trading_report_send_html(run_date_iso, html_body, recipients_override=recipients_override)
+    result["payload_debug"] = _daily_trading_report_payload_debug_summary(payload)
+    return result
 
 
 def _daily_trading_report_scheduler_loop() -> None:
@@ -12604,6 +12963,20 @@ def send_daily_trading_report_test():
     )
     status = 200 if result.get("ok") else 500
     return jsonify(_json_safe(result)), status
+
+
+@app.route("/api/reports/daily-trading/pending-limit-orders", methods=["GET"])
+def get_daily_trading_report_pending_limit_orders():
+    run_date = str(request.args.get("date") or datetime.now().strftime("%Y-%m-%d")).strip()
+    result = _daily_trading_report_fetch_pending_limit_orders(run_date)
+    status = 200 if result.get("ok") else 500
+    return jsonify(_json_safe({
+        "ok": bool(result.get("ok")),
+        "date": run_date,
+        "count": len(list(result.get("rows") or [])),
+        "rows": list(result.get("rows") or []),
+        "error": str(result.get("error") or ""),
+    })), status
 
 
 @app.route("/api/export-trades/save", methods=["POST"])
