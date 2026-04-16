@@ -632,6 +632,7 @@ function PMXLedger() {
     const [selectedAllocatedByRowId, setSelectedAllocatedByRowId] = useState<Record<number, boolean>>({});
     const [bulkAllocateTradeNum, setBulkAllocateTradeNum] = useState('');
     const [allocatingSelected, setAllocatingSelected] = useState(false);
+    const [reassigningSelected, setReassigningSelected] = useState(false);
     const [deallocatingSelected, setDeallocatingSelected] = useState(false);
     const hasActiveFilters = useMemo(
         () => Object.values(filters).some((value) => String(value ?? '').trim() !== ''),
@@ -823,6 +824,7 @@ function PMXLedger() {
     };
 
     const numericSortCols = new Set(['Debit USD', 'Credit USD', 'Balance USD', 'Net XAU g', 'Oz', 'Debit ZAR', 'Credit ZAR', 'Balance ZAR']);
+    const pmxSortableCols = new Set(['Debit USD', 'Credit USD', 'Balance USD', 'Net XAU g', 'Oz', 'Debit ZAR', 'Credit ZAR', 'Balance ZAR']);
     const sortedData = useMemo(() => {
         return [...data].sort((a, b) => {
             const aRaw = sort.key === 'Oz' ? getPmxSignedOz(a) : a[sort.key];
@@ -840,7 +842,30 @@ function PMXLedger() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [data, sort]);
 
-    const allocatedData = sortedData.filter(row => normalizeTradeNumberValue(row['Trade #']) !== '');
+    const sortDateDesc = (row: Row): number => {
+        const candidates = [
+            toTimestampMs(row.allocated_at),
+            toTimestampMs(row['Trade Date']),
+            toTimestampMs(row['Value Date']),
+            toTimestampMs(row.trade_timestamp),
+            toTimestampMs(row.trade_date),
+            toTimestampMs(row.created_at),
+            toTimestampMs(row.updated_at),
+        ].filter(v => Number.isFinite(v));
+        return candidates.length > 0 ? Math.max(...candidates) : Number.NaN;
+    };
+    const allocatedData = sortedData
+        .filter(row => normalizeTradeNumberValue(row['Trade #']) !== '')
+        .sort((a, b) => {
+            const aTs = sortDateDesc(a);
+            const bTs = sortDateDesc(b);
+            if (Number.isFinite(aTs) && Number.isFinite(bTs) && aTs !== bTs) return bTs - aTs;
+            if (Number.isFinite(bTs)) return 1;
+            if (Number.isFinite(aTs)) return -1;
+            const aTrade = normalizeTradeNumberValue(a['Trade #']);
+            const bTrade = normalizeTradeNumberValue(b['Trade #']);
+            return bTrade.localeCompare(aTrade, undefined, { numeric: true, sensitivity: 'base' });
+        });
     const unallocatedData = sortedData.filter(row => normalizeTradeNumberValue(row['Trade #']) === '');
     const visibleAllocatedData = allocatedData.slice(0, visibleAllocatedCount);
     const visibleUnallocatedData = unallocatedData.slice(0, visibleUnallocatedCount);
@@ -902,6 +927,50 @@ function PMXLedger() {
             await load(filters);
         } finally {
             setAllocatingSelected(false);
+        }
+    };
+
+    const reassignSelectedTrades = async () => {
+        const targetTradeNum = normalizeTradeNumberValue(bulkAllocateTradeNum);
+        if (!targetTradeNum) {
+            show('Enter a Trade # first.', 'center-error');
+            return;
+        }
+
+        const selectedRows = allocatedData.filter((row) => {
+            const rowId = toNumericId(row['id']);
+            return rowId > 0 && selectedAllocatedByRowId[rowId];
+        });
+        if (selectedRows.length === 0) {
+            show('Select at least one allocated trade.', 'center-error');
+            return;
+        }
+
+        setReassigningSelected(true);
+        try {
+            let okCount = 0;
+            let failCount = 0;
+            let firstError = '';
+            for (const row of selectedRows) {
+                const rowId = toNumericId(row['id']);
+                if (rowId <= 0) continue;
+                try {
+                    await api.updatePmxTradeNumber(rowId, targetTradeNum);
+                    okCount += 1;
+                } catch (e: unknown) {
+                    failCount += 1;
+                    if (!firstError) firstError = String(e);
+                }
+            }
+
+            if (okCount > 0) show(`Reassigned ${okCount.toLocaleString()} trade(s) to ${targetTradeNum}.`, 'success');
+            if (failCount > 0) show(`Failed on ${failCount.toLocaleString()} row(s): ${firstError}`, 'center-error');
+
+            setBulkAllocateTradeNum('');
+            setSelectedAllocatedByRowId({});
+            await load(filters);
+        } finally {
+            setReassigningSelected(false);
         }
     };
 
@@ -1013,16 +1082,17 @@ function PMXLedger() {
                         )}
                         {cols.map(c => {
                             const isSorted = sort.key === c.key;
+                            const canSort = pmxSortableCols.has(c.key);
                             return (
                                 <th
                                     key={c.key}
-                                    onClick={() => setSort(prev =>
+                                    onClick={canSort ? () => setSort(prev =>
                                         prev.key === c.key
                                             ? { key: c.key, dir: prev.dir === 'asc' ? 'desc' : 'asc' }
                                             : { key: c.key, dir: 'asc' }
-                                    )}
-                                    style={{ cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}
-                                    title={`Sort by ${c.label}`}
+                                    ) : undefined}
+                                    style={{ cursor: canSort ? 'pointer' : 'default', userSelect: 'none', whiteSpace: 'nowrap' }}
+                                    title={canSort ? `Sort by ${c.label}` : c.label}
                                 >
                                     {c.label}{isSorted ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : ''}
                                 </th>
@@ -1217,6 +1287,16 @@ function PMXLedger() {
                         disabled={allocatingSelected || selectedUnallocatedCount === 0 || !normalizeTradeNumberValue(bulkAllocateTradeNum)}
                     >
                         {allocatingSelected ? 'Allocating...' : `Allocate Selected (${selectedUnallocatedCount})`}
+                    </button>
+                </div>
+                <div className="filter-group">
+                    <label>&nbsp;</label>
+                    <button
+                        className="btn btn-sm btn-primary"
+                        onClick={() => { void reassignSelectedTrades(); }}
+                        disabled={reassigningSelected || selectedAllocatedCount === 0 || !normalizeTradeNumberValue(bulkAllocateTradeNum)}
+                    >
+                        {reassigningSelected ? 'Reassigning...' : `Reassign Selected (${selectedAllocatedCount})`}
                     </button>
                 </div>
                 <div className="filter-group">
@@ -2896,6 +2976,11 @@ function GoldHedging() {
     const fullyHedged = computedView.filter(r => r.hedged);
     const totalMetalGapG = computedView.reduce((sum, r) => sum + Math.abs(Number(r.hedge_need_g) || 0), 0);
     const totalMetalGapOz = totalMetalGapG / GRAMS_PER_TROY_OUNCE;
+    const controlAccountG = computedView.reduce((sum, r) => {
+        if (!r.hedged) return sum;
+        return sum + (Number(r.hedge_need_g) || 0);
+    }, 0);
+    const controlAccountOz = controlAccountG / GRAMS_PER_TROY_OUNCE;
     const totalUsdGap = computedView.reduce((sum, r) => sum + (r.usd_hedged ? 0 : Math.abs(Number(r.usd_to_cut) || 0)), 0);
     const hasMetalGap = Number.isFinite(totalMetalGapG) && totalMetalGapG > (metalTol + 1e-9);
     const hasUsdGap = Number.isFinite(totalUsdGap) && totalUsdGap > (usdTol + 1e-9);
@@ -2931,6 +3016,12 @@ function GoldHedging() {
                 <div className="stat-card">
                     <div className="stat-label">Fully Hedged</div>
                     <div className="stat-value positive">{fullyHedged.length}</div>
+                </div>
+                <div className="stat-card">
+                    <div className="stat-label">Control Account</div>
+                    <div className={`stat-value ${controlAccountG >= 0 ? 'positive' : 'negative'}`}>
+                        {`${fmt(controlAccountOz, 3)} oz / ${fmt(controlAccountG, 2)} g`}
+                    </div>
                 </div>
                 <div className="stat-card">
                     <div className="stat-label">Metal Gap Total (oz / g)</div>

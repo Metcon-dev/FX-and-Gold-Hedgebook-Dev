@@ -1785,8 +1785,20 @@ def initialize_pmx_database():
             source_system TEXT,
             trader_name TEXT,
             raw_payload TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            allocated_at TIMESTAMP
         )
+        """
+    )
+    cur.execute("PRAGMA table_info(trades)")
+    existing_columns = {str(row[1]) for row in cur.fetchall()}
+    if "allocated_at" not in existing_columns:
+        cur.execute("ALTER TABLE trades ADD COLUMN allocated_at TIMESTAMP")
+    cur.execute(
+        """
+        UPDATE trades
+        SET allocated_at = COALESCE(allocated_at, created_at)
+        WHERE COALESCE(TRIM(order_id), '') <> '' AND allocated_at IS NULL
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pmx_symbol ON trades(symbol)")
@@ -2463,14 +2475,25 @@ def update_pmx_trade_order_id(trade_id: int, order_id: str) -> bool:
     cursor = conn.cursor()
     try:
         order_id_value = normalize_trade_number(order_id) if order_id and str(order_id).strip() else None
-        cursor.execute(
-            """
-            UPDATE trades
-            SET order_id = ?
-            WHERE id = ?
-            """,
-            (order_id_value, trade_id),
-        )
+        if order_id_value:
+            cursor.execute(
+                """
+                UPDATE trades
+                SET order_id = ?,
+                    allocated_at = COALESCE(allocated_at, CURRENT_TIMESTAMP)
+                WHERE id = ?
+                """,
+                (order_id_value, trade_id),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE trades
+                SET order_id = ?
+                WHERE id = ?
+                """,
+                (order_id_value, trade_id),
+            )
         if cursor.rowcount == 0:
             cursor.execute("SELECT 1 FROM trades WHERE id = ?", (trade_id,))
             if cursor.fetchone() is None:
