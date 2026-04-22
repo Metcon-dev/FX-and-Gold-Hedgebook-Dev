@@ -4778,6 +4778,48 @@ def _daily_trading_report_pct(value: Any, decimals: int = 2) -> str:
         return "--"
 
 
+def _daily_trading_report_build_classification_daily_grams(run_date_iso: str) -> Dict[str, float]:
+    run_date = str(run_date_iso or "").strip()
+    out: Dict[str, float] = {
+        "Prop": 0.0,
+        "Internal": 0.0,
+        "Supplier Hedges": 0.0,
+        "Flow Management": 0.0,
+    }
+    canonical_to_label = {
+        "PROP": "Prop",
+        "METCON SALES": "Internal",
+        "HEDGE": "Supplier Hedges",
+        "FLOW MANAGEMENT": "Flow Management",
+    }
+    try:
+        pmx_df = load_all_pmx_trades({"start_date": run_date, "end_date": run_date})
+        if not isinstance(pmx_df, pd.DataFrame) or pmx_df.empty:
+            return out
+        work = pmx_df.copy()
+        groupings = work.get("Grouping", pd.Series([""] * len(work), index=work.index)).fillna("").astype(str).str.strip()
+        narrations = work.get("Narration", pd.Series([""] * len(work), index=work.index)).fillna("").astype(str)
+        for idx in work.index:
+            group_raw = str(groupings.loc[idx] or "").strip().upper()
+            label = canonical_to_label.get(group_raw)
+            if not label:
+                continue
+            narration = str(narrations.loc[idx] or "")
+            oz_match = re.search(r"([+-]?\d[\d,]*(?:\.\d+)?)\s*OZ\b", narration, flags=re.IGNORECASE)
+            if not oz_match:
+                continue
+            try:
+                oz = float(str(oz_match.group(1)).replace(",", ""))
+            except Exception:
+                continue
+            if not math.isfinite(oz):
+                continue
+            out[label] += abs(oz) * GRAMS_PER_TROY_OUNCE
+    except Exception:
+        return out
+    return {k: round(float(v), 2) for k, v in out.items()}
+
+
 def _daily_trading_report_build_transaction_summaries(run_date_iso: str) -> Dict[str, Any]:
     run_date = str(run_date_iso or "").strip()
     pmx_summary = {
@@ -4928,6 +4970,38 @@ def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict
                 return 0.0
         return total_g
 
+    def _trade_abs_xau_traded_g_for_day(trade: Dict[str, Any], target_day: str) -> float:
+        tx = trade.get("pmx_transactions")
+        if not isinstance(tx, list):
+            trade_day = _to_day(trade.get("trade_date"))
+            if trade_day == target_day:
+                return _trade_abs_xau_traded_g(trade)
+            return 0.0
+        total_g = 0.0
+        for row in tx:
+            if not isinstance(row, dict):
+                continue
+            d = (
+                _to_day(row.get("Trade Date"))
+                or _to_day(row.get("trade_date"))
+                or _to_day(row.get("TradeDate"))
+                or _to_day(row.get("date"))
+                or _to_day(row.get("DocDate"))
+                or _to_day(row.get("docdate"))
+            )
+            if d != target_day:
+                continue
+            symbol = str(row.get("Symbol") or "").upper().replace("/", "").replace("-", "").replace(" ", "")
+            if symbol != "XAUUSD":
+                continue
+            try:
+                qty = float(row.get("Quantity") or 0.0)
+            except Exception:
+                qty = 0.0
+            if math.isfinite(qty):
+                total_g += abs(qty) * GRAMS_PER_TROY_OUNCE
+        return total_g
+
     def _trade_open_close_day(trade: Dict[str, Any]) -> Tuple[str, str]:
         tx = trade.get("pmx_transactions")
         if not isinstance(tx, list):
@@ -4978,9 +5052,10 @@ def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict
         day_profit_map[d] = float(day_profit_map.get(d, 0.0)) + pv
         day_trade_count_map[d] = int(day_trade_count_map.get(d, 0)) + 1
 
-    # Daily/MTD aggregation aligned to Profit tab trade rows:
-    # - Daily = rows where trade_date == run_date
-    # - MTD = rows where trade_date month == run_date month and trade_date <= run_date
+    # Daily aggregation:
+    # - include only grams traded on run_date per trade (from PMX XAU rows)
+    # - allocate each trade's total profit proportionally by (today_g / total_trade_g)
+    # This prevents multi-day trades from contributing full-lifecycle profit to one day.
     selected_day = run_date
     daily_profit = 0.0
     daily_trades = 0
@@ -4990,8 +5065,8 @@ def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict
     for tr in all_trades:
         if not isinstance(tr, dict):
             continue
-        trade_day = _to_day(tr.get("trade_date"))
-        if trade_day != run_date:
+        today_traded_g = _trade_abs_xau_traded_g_for_day(tr, run_date)
+        if not math.isfinite(today_traded_g) or today_traded_g <= 1e-12:
             continue
         try:
             pv = float(tr.get("total_profit_zar") or 0.0)
@@ -5000,17 +5075,18 @@ def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict
         except Exception:
             continue
         traded_g = _trade_abs_xau_traded_g(tr)
-        daily_profit += float(pv)
+        alloc_ratio = (today_traded_g / traded_g) if (math.isfinite(traded_g) and traded_g > 1e-12) else 1.0
+        if not math.isfinite(alloc_ratio):
+            alloc_ratio = 0.0
+        alloc_ratio = max(0.0, min(1.0, alloc_ratio))
+        daily_profit += float(pv) * alloc_ratio
         daily_trades += 1
-        daily_abs_traded_g += traded_g
+        daily_abs_traded_g += today_traded_g
         try:
             pct = tr.get("profit_pct")
             if pct is not None and str(pct).strip() != "":
                 pct_v = float(str(pct).replace("%", "").strip())
-                # Profit tab weighted margin uses abs(stonex_traded_g) as weight.
-                pct_weight = abs(float(tr.get("stonex_traded_g") or 0.0))
-                if not math.isfinite(pct_weight) or pct_weight <= 1e-12:
-                    pct_weight = traded_g
+                pct_weight = today_traded_g
                 if math.isfinite(pct_v) and pct_weight > 1e-12:
                     daily_pct_weighted_sum += (pct_v * pct_weight)
                     daily_pct_weight += pct_weight
@@ -5121,257 +5197,12 @@ def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict
     }
 
 
-_DAILY_TRADING_AI_AUDIT_PROMPT_PATH = os.path.join(_SERVER_DIR, "prompts", "daily_trading_ai_audit_prompt.md")
-_DAILY_TRADING_AI_AUDIT_MODEL = str(
-    os.getenv("DAILY_TRADING_AI_AUDIT_MODEL", "claude-sonnet-4-5-20250929") or "claude-sonnet-4-5-20250929"
-).strip() or "claude-sonnet-4-5-20250929"
-try:
-    _DAILY_TRADING_AI_AUDIT_MAX_TOKENS = max(
-        512, int(os.getenv("DAILY_TRADING_AI_AUDIT_MAX_TOKENS", "2000") or 2000)
-    )
-except Exception:
-    _DAILY_TRADING_AI_AUDIT_MAX_TOKENS = 2000
-try:
-    _DAILY_TRADING_AI_AUDIT_TIMEOUT = max(
-        15, int(os.getenv("DAILY_TRADING_AI_AUDIT_TIMEOUT_SECONDS", "60") or 60)
-    )
-except Exception:
-    _DAILY_TRADING_AI_AUDIT_TIMEOUT = 60
-_DAILY_TRADING_AI_AUDIT_ENABLED = str(
-    os.getenv("DAILY_TRADING_AI_AUDIT_ENABLED", "true") or "true"
-).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _daily_trading_ai_audit_context(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Compact, AI-friendly view of the daily report payload.
-
-    Keeps every number Anthropic needs to comment on desk activity, hedging,
-    exposure, PMX vs TradeMC reconciliation and anomalies, while dropping
-    fields that are only useful for the HTML renderer (plot rows, etc).
-    """
-    pmx_tx = dict(payload.get("pmx_transaction_summary") or {})
-    tm_tx = dict(payload.get("trademc_transaction_summary") or {})
-
-    def _f(value: Any) -> float:
-        try:
-            out = float(value)
-            return out if math.isfinite(out) else 0.0
-        except Exception:
-            return 0.0
-
-    def _pct_diff(a: float, b: float) -> Optional[float]:
-        denom = max(abs(a), abs(b))
-        if denom <= 1e-9:
-            return None
-        return round(((a - b) / denom) * 100.0, 2)
-
-    pmx_grams = _f(pmx_tx.get("total_grams_booked_g"))
-    tm_grams = _f(tm_tx.get("total_trade_volume_g"))
-    pmx_usd = _f(pmx_tx.get("total_dollar_flow_usd"))
-    tm_usd = _f(tm_tx.get("total_dollar_flow_usd"))
-    pmx_zar = _f(pmx_tx.get("total_zar_flow"))
-    tm_zar = _f(tm_tx.get("total_zar_flow"))
-
-    reconciliation = {
-        "grams_pmx_minus_tm_g": round(pmx_grams - tm_grams, 3),
-        "grams_pct_diff": _pct_diff(pmx_grams, tm_grams),
-        "usd_pmx_minus_tm": round(pmx_usd - tm_usd, 2),
-        "usd_pct_diff": _pct_diff(pmx_usd, tm_usd),
-        "zar_pmx_minus_tm": round(pmx_zar - tm_zar, 2),
-        "zar_pct_diff": _pct_diff(pmx_zar, tm_zar),
-    }
-
-    total_g_for_coverage = _f(payload.get("covered_g")) + _f(payload.get("total_grams_to_hedge"))
-    coverage_pct: Optional[float] = None
-    if total_g_for_coverage > 1e-9:
-        coverage_pct = round((_f(payload.get("covered_g")) / total_g_for_coverage) * 100.0, 2)
-
-    open_rows_raw = list(payload.get("open_positions_rows") or [])
-    open_rows = open_rows_raw[:25]
-    pending_rows_raw = list(payload.get("pending_limit_orders") or [])
-    pending_rows = pending_rows_raw[:25]
-
-    return {
-        "date": str(payload.get("date") or ""),
-        "daily_profit_zar": _f(payload.get("daily_profit")),
-        "daily_trades": int(payload.get("daily_trades") or 0),
-        "daily_profit_per_g_zar": _f(payload.get("daily_profit_per_g")),
-        "daily_profit_pct": _f(payload.get("daily_profit_pct")),
-        "month_to_date_profit_zar": _f(payload.get("month_to_date_profit")),
-        "month_to_date_trades": int(payload.get("month_to_date_trades") or 0),
-        "month_to_date_profit_per_g_zar": _f(payload.get("month_to_date_profit_per_g")),
-        "total_profit_all_zar": _f(payload.get("total_profit_all")),
-        "total_trades_all": int(payload.get("total_trades_all") or 0),
-        "overall_profit_pct": _f(payload.get("overall_profit_pct")),
-        "hedging": {
-            "hedged_rows": int(payload.get("hedged_rows") or 0),
-            "unhedged_rows": int(payload.get("unhedged_rows") or 0),
-            "covered_g": _f(payload.get("covered_g")),
-            "total_grams_to_hedge_g": _f(payload.get("total_grams_to_hedge")),
-            "coverage_pct": coverage_pct,
-        },
-        "open_positions": {
-            "unallocated_pnl_zar": _f(payload.get("open_positions_pnl")),
-            "unallocated_trades": int(payload.get("open_positions_trades") or 0),
-            "materially_open_rows_count": int(payload.get("open_positions_rows_count") or 0),
-            "materially_open_total_g": _f(payload.get("open_positions_total_g")),
-            "materially_open_total_usd": _f(payload.get("open_positions_total_usd")),
-            "rows_truncated": len(open_rows_raw) > len(open_rows),
-            "rows": open_rows,
-        },
-        "pmx_transaction_summary": {
-            "total_grams_booked_g": pmx_grams,
-            "total_dollar_flow_usd": pmx_usd,
-            "total_exposure_usd": _f(pmx_tx.get("total_exposure_usd")),
-            "total_zar_flow": pmx_zar,
-        },
-        "trademc_transaction_summary": {
-            "total_trade_volume_g": tm_grams,
-            "total_dollar_flow_usd": tm_usd,
-            "total_exposure_usd": _f(tm_tx.get("total_exposure_usd")),
-            "total_zar_flow": tm_zar,
-        },
-        "pmx_vs_trademc": reconciliation,
-        "pending_limit_orders": {
-            "count": len(pending_rows_raw),
-            "ok": bool(payload.get("pending_limit_orders_ok")),
-            "error": str(payload.get("pending_limit_orders_error") or ""),
-            "rows_truncated": len(pending_rows_raw) > len(pending_rows),
-            "rows": pending_rows,
-        },
-    }
-
-
-def _daily_trading_ai_audit_load_prompt() -> str:
-    try:
-        with open(_DAILY_TRADING_AI_AUDIT_PROMPT_PATH, "r", encoding="utf-8") as fh:
-            return fh.read()
-    except Exception:
-        return (
-            "You are the daily auditor for a bullion and FX trading desk. "
-            "Produce a concise HTML fragment (no <html>/<head>/<body>/<style> tags, "
-            "inline CSS only) with six sections: Desk Activity, Hedging, Exposure, "
-            "PMX vs TradeMC, Risks, Overall Assessment. "
-            "Use only facts in the JSON.\n\n"
-            "Run date: {{RUN_DATE}}\nReport data JSON:\n{{REPORT_JSON}}"
-        )
-
-
-def _daily_trading_ai_audit_fallback_html(reason: str) -> str:
-    note = _daily_trading_report_html_escape(reason or "AI audit unavailable")
-    return (
-        "<div style=\"border:1px solid #d6d0c0;border-radius:10px;background:#fbf7ec;"
-        "padding:10px 12px;margin-top:10px;font-family:Segoe UI,Arial,sans-serif;"
-        "color:#5a4a1a;font-size:13px;line-height:1.5;\">"
-        "<div style=\"font-weight:800;font-size:14px;margin-bottom:2px;color:#5a4a1a;\">Daily AI Audit</div>"
-        f"<div style=\"font-size:12px;color:#6f5a1f;\">Not generated for this run: {note}. "
-        "Hard numbers elsewhere in this email remain authoritative.</div>"
-        "</div>"
-    )
-
-
-_AI_AUDIT_STRIP_FENCE_RE = re.compile(r"^\s*```(?:html)?\s*|\s*```\s*$", re.IGNORECASE)
-
-
-def _daily_trading_ai_audit_clean_html(text: str) -> str:
-    raw = str(text or "").strip()
-    if not raw:
-        return ""
-    # Strip accidental markdown code fences the model may wrap around the HTML.
-    raw = _AI_AUDIT_STRIP_FENCE_RE.sub("", raw).strip()
-    # Remove a stray DOCTYPE / html / head / body / style wrappers if the model
-    # ignored the fragment-only rule. Keep the inner content.
-    for pat in (
-        r"<!doctype[^>]*>",
-        r"</?html[^>]*>",
-        r"</?head[^>]*>",
-        r"</?body[^>]*>",
-        r"<style[\s\S]*?</style>",
-        r"<script[\s\S]*?</script>",
-    ):
-        raw = re.sub(pat, "", raw, flags=re.IGNORECASE).strip()
-    return raw
-
-
-def _daily_trading_ai_audit_call_anthropic(
-    prompt: str, run_date: str, context_json: str
-) -> Tuple[bool, str, str]:
-    api_key = str(os.getenv("ANTHROPIC_API_KEY", "") or "").strip()
-    if not api_key:
-        return False, "", "ANTHROPIC_API_KEY not configured"
-
-    filled = prompt.replace("{{RUN_DATE}}", run_date).replace("{{REPORT_JSON}}", context_json)
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    body = {
-        "model": _DAILY_TRADING_AI_AUDIT_MODEL,
-        "max_tokens": _DAILY_TRADING_AI_AUDIT_MAX_TOKENS,
-        "messages": [{"role": "user", "content": filled}],
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=body, timeout=_DAILY_TRADING_AI_AUDIT_TIMEOUT)
-    except Exception as exc:
-        return False, "", f"Anthropic request failed: {exc}"
-    if resp.status_code != 200:
-        snippet = (resp.text or "")[:300].replace("\n", " ")
-        return False, "", f"Anthropic HTTP {resp.status_code}: {snippet}"
-    try:
-        data = resp.json()
-    except Exception as exc:
-        return False, "", f"Anthropic response not JSON: {exc}"
-    content = data.get("content") or []
-    text_parts: List[str] = []
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "text":
-            text_parts.append(str(block.get("text") or ""))
-    text = "".join(text_parts).strip()
-    if not text:
-        return False, "", "Anthropic returned empty content"
-    cleaned = _daily_trading_ai_audit_clean_html(text)
-    if "<" not in cleaned or ">" not in cleaned:
-        return False, "", "Anthropic output was not HTML"
-    return True, cleaned, ""
-
-
-def _daily_trading_report_generate_ai_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Generate the AI audit section. Returns {ok, html, error, context}."""
-    run_date = str(payload.get("date") or datetime.now().strftime("%Y-%m-%d")).strip()
-    if not _DAILY_TRADING_AI_AUDIT_ENABLED:
-        return {
-            "ok": False,
-            "html": _daily_trading_ai_audit_fallback_html("Disabled via DAILY_TRADING_AI_AUDIT_ENABLED"),
-            "error": "AI audit disabled by config",
-        }
-    try:
-        context = _daily_trading_ai_audit_context(payload)
-        context_json = json.dumps(context, ensure_ascii=False, indent=2, default=str)
-    except Exception as exc:
-        return {
-            "ok": False,
-            "html": _daily_trading_ai_audit_fallback_html(f"Context build failed: {exc}"),
-            "error": f"Context build failed: {exc}",
-        }
-    prompt = _daily_trading_ai_audit_load_prompt()
-    ok, html_fragment, err = _daily_trading_ai_audit_call_anthropic(prompt, run_date, context_json)
-    if not ok:
-        print(f"[AI-AUDIT] Failed for {run_date}: {err}")
-        return {
-            "ok": False,
-            "html": _daily_trading_ai_audit_fallback_html(err or "AI audit failed"),
-            "error": err,
-        }
-    return {"ok": True, "html": html_fragment, "error": "", "model": _DAILY_TRADING_AI_AUDIT_MODEL}
-
-
 def _daily_trading_report_build_payload(run_date_iso: Optional[str] = None) -> Dict[str, Any]:
     dash = _build_dashboard_summary_payload(run_date_iso)
     run_date = str(dash.get("run_date") or (run_date_iso or datetime.now().strftime("%Y-%m-%d"))).strip()
     pending_orders = _daily_trading_report_fetch_pending_limit_orders(run_date)
     tx_summary = _daily_trading_report_build_transaction_summaries(run_date)
+    classification_daily_grams = _daily_trading_report_build_classification_daily_grams(run_date)
     hedging_rows = build_hedging_comparison(source="pmx") or []
     if not isinstance(hedging_rows, list):
         hedging_rows = []
@@ -5450,6 +5281,7 @@ def _daily_trading_report_build_payload(run_date_iso: Optional[str] = None) -> D
         "pending_limit_orders_error": str(pending_orders.get("error") or ""),
         "pmx_transaction_summary": dict(tx_summary.get("pmx") or {}),
         "trademc_transaction_summary": dict(tx_summary.get("trademc") or {}),
+        "classification_daily_grams": dict(classification_daily_grams or {}),
         "open_positions_rows": open_positions_rows,
         "open_positions_rows_count": len(open_positions_rows),
         "open_positions_total_g": open_positions_total_g,
@@ -5643,6 +5475,7 @@ def _daily_trading_report_payload_debug_summary(payload: Dict[str, Any]) -> Dict
         "pending_limit_orders_error": str(payload.get("pending_limit_orders_error") or ""),
         "pmx_transaction_summary": dict(payload.get("pmx_transaction_summary") or {}),
         "trademc_transaction_summary": dict(payload.get("trademc_transaction_summary") or {}),
+        "classification_daily_grams": dict(payload.get("classification_daily_grams") or {}),
         "open_positions_rows_count": int(payload.get("open_positions_rows_count") or 0),
         "open_positions_total_g": float(payload.get("open_positions_total_g") or 0.0),
         "open_positions_total_usd": float(payload.get("open_positions_total_usd") or 0.0),
@@ -5733,9 +5566,9 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
     source = _daily_trading_report_html_escape(payload.get("source", ""))
     daily_profit = float(payload.get("daily_profit") or 0.0)
     daily_is_loss = daily_profit < 0
-    daily_card_bg = "#f7e6e8" if daily_is_loss else "#e9f6ec"
-    daily_card_bd = "#d95a66" if daily_is_loss else "#9fd2ad"
-    daily_card_tx = "#8b1220" if daily_is_loss else "#1f7a46"
+    daily_card_bg = "#eaf7ef" if daily_is_loss else "#eaf7ef"
+    daily_card_bd = "#7ecb97" if daily_is_loss else "#7ecb97"
+    daily_card_tx = "#1f7a46" if daily_is_loss else "#1f7a46"
 
     month_rows_html = _bar_rows(payload.get("month_plot_rows", []), "R")
     daily_rows_html = _bar_rows(payload.get("daily_plot_rows", []), "R")
@@ -5751,19 +5584,31 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
     open_positions_rows_html = _open_positions_rows(list(payload.get("open_positions_rows") or []))
     pmx_tx = dict(payload.get("pmx_transaction_summary") or {})
     tm_tx = dict(payload.get("trademc_transaction_summary") or {})
+    class_grams = dict(payload.get("classification_daily_grams") or {})
+    class_cards: List[Tuple[str, str, str]] = [
+        ("Prop", "#7c3aed", "#f3ebff"),
+        ("Internal", "#2563eb", "#eaf2ff"),
+        ("Supplier Hedges", "#c26f1a", "#fff5e9"),
+        ("Flow Management", "#0f8a83", "#e9fbf8"),
+    ]
     pending_orders_error = str(payload.get("pending_limit_orders_error") or "").strip()
     pending_orders_count = len(list(payload.get("pending_limit_orders") or []))
 
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <style>
+  .kpi-card {{ min-height: 148px; box-sizing: border-box; }}
+  .classification-card .kpi-card {{ min-height: 128px; }}
   @media only screen and (max-width: 640px) {{
     .kpi-title {{ font-size:16px !important; }}
-    .kpi-value {{ font-size:38px !important; }}
-    .kpi-sub {{ font-size:16px !important; }}
+    .kpi-value {{ font-size:32px !important; }}
+    .kpi-sub {{ font-size:13px !important; }}
     .main-title {{ font-size:20px !important; }}
     .main-subtitle {{ font-size:14px !important; }}
     .main-meta {{ font-size:12px !important; }}
+    .classification-card {{ display:table-cell !important; width:50% !important; vertical-align:top !important; }}
+    .kpi-card {{ min-height: 132px !important; padding: 9px !important; }}
+    .classification-card .kpi-card {{ min-height: 112px !important; }}
     .plot-table td {{ font-size:11px !important; }}
     .plot-bar-wrap {{ min-width:0 !important; }}
   }}
@@ -5782,29 +5627,57 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
     </td></tr>
     <tr><td style="padding:10px;">
       <table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>
-        <td width="50%" style="padding:4px;"><div style="border:1px solid {daily_card_bd};background:{daily_card_bg};border-radius:10px;padding:10px;">
+        <td width="50%" style="padding:4px;"><div class="kpi-card" style="border:1px solid {daily_card_bd};background:{daily_card_bg};border-radius:10px;padding:10px;">
           <div class="kpi-title" style="font-size:20px;color:{daily_card_tx};font-weight:700;">Daily Profit{ " (LOSS)" if daily_is_loss else ""}</div>
           <div class="kpi-value" style="font-size:50px;line-height:1.05;color:{daily_card_tx};font-weight:800;">{_daily_trading_report_money(payload.get("daily_profit"), "R", 2)}</div>
           <div class="kpi-sub" style="font-size:22px;color:{daily_card_tx};">Trades: {int(payload.get("daily_trades") or 0)} | Profit %: {_daily_trading_report_pct(payload.get("daily_profit_pct"), 2)} | Profit/gram: R{float(payload.get("daily_profit_per_g") or 0.0):,.2f}/g</div>
         </div></td>
-        <td width="50%" style="padding:4px;"><div style="border:1px solid #9fd2ad;background:#e9f6ec;border-radius:10px;padding:10px;">
+        <td width="50%" style="padding:4px;"><div class="kpi-card" style="border:1px solid #7ecb97;background:#eaf7ef;border-radius:10px;padding:10px;">
           <div class="kpi-title" style="font-size:20px;color:#1f7a46;font-weight:700;">Month-to-date Profit</div>
           <div class="kpi-value" style="font-size:50px;line-height:1.05;color:#1f7a46;font-weight:800;">{_daily_trading_report_money(payload.get("month_to_date_profit"), "R", 2)}</div>
           <div class="kpi-sub" style="font-size:22px;color:#1f7a46;">Trades: {int(payload.get("month_to_date_trades") or 0)} | Profit %: {_daily_trading_report_pct(payload.get("overall_profit_pct"), 2)} | Profit/gram: R{float(payload.get("month_to_date_profit_per_g") or 0.0):,.2f}/g</div>
         </div></td>
       </tr><tr>
-        <td width="50%" style="padding:4px;"><div style="border:1px solid #9db2e5;background:#edf2fc;border-radius:10px;padding:10px;">
+        <td width="50%" style="padding:4px;"><div class="kpi-card" style="border:1px solid #9db2e5;background:#edf2fc;border-radius:10px;padding:10px;">
           <div class="kpi-title" style="font-size:20px;color:#2753bc;font-weight:700;">Unallocated Trades Revaluation</div>
           <div class="kpi-value" style="font-size:50px;line-height:1.05;color:#2753bc;font-weight:800;">{_daily_trading_report_money(payload.get("open_positions_pnl"), "R", 2)}</div>
           <div class="kpi-sub" style="font-size:22px;color:#2753bc;">Unallocated trades: {int(payload.get("open_positions_trades") or 0)} | Overall Profit %: {_daily_trading_report_pct(payload.get("overall_profit_pct"), 2)}</div>
         </div></td>
-        <td width="50%" style="padding:4px;"><div style="border:1px solid #e7bea6;background:#fcf3eb;border-radius:10px;padding:10px;">
-          <div class="kpi-title" style="font-size:20px;color:#a74917;font-weight:700;">Total Grams To Hedge</div>
+        <td width="50%" style="padding:4px;"><div class="kpi-card" style="border:1px solid #e7bea6;background:#fcf3eb;border-radius:10px;padding:10px;">
+          <div class="kpi-title" style="font-size:19px;color:#a74917;font-weight:700;">Total Grams To Hedge</div>
           <div class="kpi-value" style="font-size:50px;line-height:1.05;color:#c01e1e;font-weight:800;">{_daily_trading_report_num(payload.get("total_grams_to_hedge"), 2)}g</div>
-          <div class="kpi-sub" style="font-size:22px;color:#a74917;">Hedged rows: {int(payload.get("hedged_rows") or 0)} | Unhedged rows: {int(payload.get("unhedged_rows") or 0)}</div>
+          <div class="kpi-sub" style="font-size:20px;color:#a74917;">Hedged rows: {int(payload.get("hedged_rows") or 0)} | Unhedged rows: {int(payload.get("unhedged_rows") or 0)}</div>
         </div></td>
       </tr><tr>
-        <td colspan="2" style="padding:4px;"><div style="border:1px solid #9cc9d8;background:#eaf7fb;border-radius:10px;padding:10px;">
+        {''.join(
+            [
+                (
+                    f"<td width='50%' class='classification-card' style='padding:4px;'>"
+                    f"<div class='kpi-card' style='border:1px solid {border};background:{bg};border-radius:10px;padding:10px;'>"
+                    f"<div class='kpi-title' style='font-size:18px;color:{border};font-weight:700;'>{_daily_trading_report_html_escape(label)} (g)</div>"
+                    f"<div class='kpi-value' style='font-size:42px;line-height:1.05;color:{border};font-weight:800;'>{_daily_trading_report_num(class_grams.get(label), 2)}g</div>"
+                    f"<div class='kpi-sub' style='font-size:16px;color:{border};'>Daily total</div>"
+                    f"</div></td>"
+                )
+                for (label, border, bg) in class_cards[:2]
+            ]
+        )}
+      </tr><tr>
+        {''.join(
+            [
+                (
+                    f"<td width='50%' class='classification-card' style='padding:4px;'>"
+                    f"<div class='kpi-card' style='border:1px solid {border};background:{bg};border-radius:10px;padding:10px;'>"
+                    f"<div class='kpi-title' style='font-size:18px;color:{border};font-weight:700;'>{_daily_trading_report_html_escape(label)} (g)</div>"
+                    f"<div class='kpi-value' style='font-size:42px;line-height:1.05;color:{border};font-weight:800;'>{_daily_trading_report_num(class_grams.get(label), 2)}g</div>"
+                    f"<div class='kpi-sub' style='font-size:16px;color:{border};'>Daily total</div>"
+                    f"</div></td>"
+                )
+                for (label, border, bg) in class_cards[2:]
+            ]
+        )}
+      </tr><tr>
+        <td colspan="2" style="padding:4px;"><div class="kpi-card" style="border:1px solid #9cc9d8;background:#eaf7fb;border-radius:10px;padding:10px;">
           <div class="kpi-title" style="font-size:20px;color:#1a566b;font-weight:700;">Open Positions Totals</div>
           <div class="kpi-value" style="font-size:44px;line-height:1.05;color:#1a566b;font-weight:800;">{_daily_trading_report_num(payload.get("open_positions_total_g"), 2)}g <span style="color:#3d7a8e;">|</span> USD {_daily_trading_report_num(payload.get("open_positions_total_usd"), 2)}</div>
           <div class="kpi-sub" style="font-size:20px;color:#1a566b;">Open lines: {int(payload.get("open_positions_rows_count") or 0)}</div>
@@ -5817,8 +5690,6 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
         <li>Total cumulative profit stands at {_daily_trading_report_money(payload.get("total_profit_all"), "R", 2)} across {int(payload.get("total_trades_all") or 0)} trades.</li>
         <li>Hedge coverage tracks {int(payload.get("hedged_rows") or 0)} hedged rows with {_daily_trading_report_num(payload.get("total_grams_to_hedge"), 2)}g remaining to hedge.</li>
       </ul>
-
-      {str(payload.get("ai_audit_html") or "")}
 
       <div style="margin-top:10px;border-left:4px solid #8a5a16;background:#fdf4e8;padding:8px 10px;font-size:15px;font-weight:700;color:#7a4a10;">Pending Limit Orders (PMX Activity Log)</div>
       <div style="padding:8px 2px 4px;color:#1f2b3c;font-size:14px;">ONG orders found for {date_txt}: <strong>{pending_orders_count}</strong></div>
@@ -5975,22 +5846,12 @@ def _daily_trading_report_run_once_for_date(
         except Exception:
             pass
         payload = _daily_trading_report_build_payload(run_date_iso)
-        ai_audit = _daily_trading_report_generate_ai_audit(payload)
-        payload["ai_audit_html"] = str(ai_audit.get("html") or "")
-        payload["ai_audit_ok"] = bool(ai_audit.get("ok"))
-        payload["ai_audit_error"] = str(ai_audit.get("error") or "")
-        payload["ai_audit_model"] = str(ai_audit.get("model") or "")
         html_body = _daily_trading_report_render_html(payload)
     except Exception as exc:
         return {"ok": False, "error": f"Failed to build report payload: {exc}", "pmx_sync": pmx_sync_note}
     result = _daily_trading_report_send_html(run_date_iso, html_body, recipients_override=recipients_override)
     result["payload_debug"] = _daily_trading_report_payload_debug_summary(payload)
     result["pmx_sync"] = pmx_sync_note
-    result["ai_audit"] = {
-        "ok": bool(ai_audit.get("ok")),
-        "error": str(ai_audit.get("error") or ""),
-        "model": str(ai_audit.get("model") or ""),
-    }
     return result
 
 
@@ -7168,6 +7029,13 @@ def build_profit_monthly_report() -> Dict[str, Any]:
         except Exception:
             return key
 
+    def _tx_day_string(row: Dict[str, Any]) -> str:
+        for key in ("Trade Date", "trade_date", "TradeDate", "date", "DocDate", "docdate", "Value Date"):
+            dt = _to_dt(row.get(key))
+            if dt is not None:
+                return dt.strftime("%Y-%m-%d")
+        return ""
+
     tm_df = load_trademc_trades_with_companies(status="confirmed")
     pmx_df = load_all_pmx_trades()
     if tm_df is None:
@@ -7529,8 +7397,62 @@ def build_profit_monthly_report() -> Dict[str, Any]:
             }
         )
 
-    months_map: Dict[str, Dict[str, Any]] = {}
+    # Allocate each trade's total profit into day-slices based on PMX XAU grams traded per day.
+    # This keeps dashboard/profit graphs aligned with day-accurate trading activity.
+    trade_rows_sliced: List[Dict[str, Any]] = []
     for row in trade_rows:
+        pmx_tx = row.get("pmx_transactions")
+        if not isinstance(pmx_tx, list):
+            trade_rows_sliced.append(row)
+            continue
+
+        day_grams: Dict[str, float] = {}
+        for tx in pmx_tx:
+            if not isinstance(tx, dict):
+                continue
+            symbol = _sym_norm(tx.get("Symbol"))
+            if symbol != "XAUUSD":
+                continue
+            qty = _to_num(tx.get("Quantity"))
+            if qty is None:
+                continue
+            day = _tx_day_string(tx)
+            if not day:
+                continue
+            day_grams[day] = float(day_grams.get(day, 0.0)) + (abs(float(qty)) * GRAMS_PER_TROY_OUNCE)
+
+        total_day_g = float(sum(day_grams.values()))
+        total_trade_g = abs(float(_to_num(row.get("stonex_traded_g")) or 0.0))
+        if total_day_g <= 1e-12:
+            trade_rows_sliced.append(row)
+            continue
+        if total_trade_g <= 1e-12:
+            total_trade_g = total_day_g
+
+        for day, g_day in sorted(day_grams.items()):
+            if g_day <= 1e-12:
+                continue
+            ratio = g_day / total_trade_g if total_trade_g > 1e-12 else 0.0
+            ratio = max(0.0, min(1.0, float(ratio)))
+            sliced = dict(row)
+            sliced["trade_date"] = day
+            sliced["month_key"] = day[:7] if len(day) >= 7 else "Unknown"
+            sliced["month_label"] = _month_label(str(sliced["month_key"]))
+            sliced["stonex_traded_g"] = g_day
+
+            for key in ("exchange_profit_zar", "metal_profit_zar", "total_profit_zar", "sell_side_zar", "buy_side_zar", "stonex_zar_flow"):
+                base_val = _to_num(row.get(key))
+                sliced[key] = (float(base_val) * ratio) if base_val is not None else None
+
+            buy_side = _to_num(sliced.get("buy_side_zar"))
+            total_profit = _to_num(sliced.get("total_profit_zar"))
+            if buy_side is not None and abs(float(buy_side)) > 1e-12 and total_profit is not None:
+                sliced["profit_pct"] = (float(total_profit) / abs(float(buy_side))) * 100.0
+
+            trade_rows_sliced.append(sliced)
+
+    months_map: Dict[str, Dict[str, Any]] = {}
+    for row in trade_rows_sliced:
         mk = str(row.get("month_key") or "Unknown")
         month_state = months_map.setdefault(
             mk,
@@ -7541,10 +7463,13 @@ def build_profit_monthly_report() -> Dict[str, Any]:
                 "metal_profit_zar": 0.0,
                 "total_profit_zar": 0.0,
                 "trade_count": 0,
+                "trade_nums": set(),
                 "trades": [],
             },
         )
-        month_state["trade_count"] += 1
+        tn = normalize_trade_number(row.get("trade_num"))
+        if tn:
+            month_state["trade_nums"].add(tn)
         month_state["exchange_profit_zar"] += float(_to_num(row.get("exchange_profit_zar")) or 0.0)
         month_state["metal_profit_zar"] += float(_to_num(row.get("metal_profit_zar")) or 0.0)
         month_state["total_profit_zar"] += float(_to_num(row.get("total_profit_zar")) or 0.0)
@@ -7561,6 +7486,8 @@ def build_profit_monthly_report() -> Dict[str, Any]:
 
     months = sorted(months_map.values(), key=_month_sort_key, reverse=True)
     for month in months:
+        month["trade_count"] = len(month.get("trade_nums", set()))
+        month.pop("trade_nums", None)
         month["trades"] = sorted(
             month.get("trades", []),
             key=lambda r: (str(r.get("trade_date") or ""), str(r.get("trade_num") or "")),
@@ -7568,7 +7495,7 @@ def build_profit_monthly_report() -> Dict[str, Any]:
         )
 
     profit_pct_values: List[float] = []
-    for row in trade_rows:
+    for row in trade_rows_sliced:
         pct = _to_num(row.get("profit_pct"))
         if pct is not None:
             profit_pct_values.append(float(pct))
@@ -10488,6 +10415,7 @@ def _apply_ledger_filters(ledger: pd.DataFrame, args) -> pd.DataFrame:
         return ledger if isinstance(ledger, pd.DataFrame) else pd.DataFrame()
 
     symbol = args.get("symbol")
+    grouping = args.get("grouping") or args.get("classification")
     trade_num = args.get("trade_num")
     fnc_number = args.get("fnc_number")
     narration = args.get("narration")
@@ -10499,6 +10427,13 @@ def _apply_ledger_filters(ledger: pd.DataFrame, args) -> pd.DataFrame:
         symbol_norm = str(symbol).replace("/", "").upper()
         ledger_symbol_norm = ledger["Symbol"].astype(str).str.replace("/", "").str.upper()
         ledger = ledger[ledger_symbol_norm == symbol_norm]
+    if grouping and grouping != "All" and "Grouping" in ledger.columns:
+        grouping_norm = str(grouping).strip().upper()
+        ledger_grouping_norm = ledger["Grouping"].fillna("").astype(str).str.strip().str.upper()
+        if grouping_norm == "UNALLOCATED":
+            ledger = ledger[ledger_grouping_norm == ""]
+        else:
+            ledger = ledger[ledger_grouping_norm == grouping_norm]
     if trade_num and "Trade #" in ledger.columns:
         ledger = ledger[ledger["Trade #"].astype(str).str.contains(trade_num, case=False, na=False, regex=False)]
     if fnc_number and "FNC #" in ledger.columns:
@@ -14031,3 +13966,4 @@ if __name__ == "__main__":
     _start_daily_trading_report_email_scheduler()
     start_hedging_listener()
     app.run(host="0.0.0.0", port=server_port, debug=True, use_reloader=False)
+

@@ -25,6 +25,7 @@ const PRICE_WARNING_ACK_EVENT = 'price-warning:acknowledged';
 const PRICE_WARNING_ACK_PREFIX = 'price-warning:ack:';
 const PMX_LEDGER_DEFAULT_FILTERS = {
     symbol: '',
+    grouping: '',
     trade_num: '',
     narration: '',
     start_date: '',
@@ -688,6 +689,7 @@ function PMXLedger() {
         try {
             const params: Record<string, string> = {};
             if (activeFilters.symbol) params.symbol = activeFilters.symbol;
+            if (activeFilters.grouping) params.grouping = activeFilters.grouping;
             if (activeFilters.trade_num) params.trade_num = activeFilters.trade_num;
             if (activeFilters.narration) params.narration = activeFilters.narration;
             if (activeFilters.start_date) params.start_date = activeFilters.start_date;
@@ -844,10 +846,17 @@ function PMXLedger() {
     ];
     const cols = [
         baseCols[0],
-        { key: 'Grouping', label: 'Grouping' },
+        { key: 'Grouping', label: 'Classification' },
         ...baseCols.slice(1),
     ];
     const GROUPING_OPTIONS = ['MetCon Sales', 'Hedge', 'Prop', 'Flow Management'];
+    const GROUPING_LABELS: Record<string, string> = {
+        'MetCon Sales': 'Internal',
+        'Hedge': 'Supplier Hedge',
+        'Prop': 'Prop',
+        'Flow Management': 'Flow Management',
+    };
+    const groupingLabel = (value: string): string => GROUPING_LABELS[value] || value;
 
     const getPmxSignedOz = (row: Row): number | null => {
         const symbol = String(row['Symbol'] ?? '').toUpperCase().replace(/[\/\-\s]/g, '');
@@ -1082,7 +1091,7 @@ function PMXLedger() {
     const assignGroupToSelected = async () => {
         const groupChoice = bulkAssignGrouping;
         if (!groupChoice) {
-            show('Choose a group first.', 'center-error');
+            show('Choose a classification first.', 'center-error');
             return;
         }
         const payload = groupChoice === '__CLEAR__' ? '' : groupChoice;
@@ -1118,7 +1127,7 @@ function PMXLedger() {
                     if (!firstError) firstError = String(e);
                 }
             }
-            const label = payload === '' ? 'cleared grouping on' : `assigned to ${payload}:`;
+            const label = payload === '' ? 'cleared classification on' : `assigned to ${groupingLabel(payload)}:`;
             if (okCount > 0) show(`${label.replace(':', '')} ${okCount.toLocaleString()} trade(s).`, 'success');
             if (failCount > 0) show(`Failed on ${failCount.toLocaleString()} row(s): ${firstError}`, 'center-error');
             setBulkAssignGrouping('');
@@ -1283,7 +1292,7 @@ function PMXLedger() {
                                             >
                                                 <option value="">—</option>
                                                 {GROUPING_OPTIONS.map(opt => (
-                                                    <option key={opt} value={opt}>{opt}</option>
+                                                    <option key={opt} value={opt}>{groupingLabel(opt)}</option>
                                                 ))}
                                             </select>
                                         </td>
@@ -1414,6 +1423,17 @@ function PMXLedger() {
                     </select>
                 </div>
                 <div className="filter-group">
+                    <label>Classification</label>
+                    <select value={filters.grouping} onChange={e => setFilters(f => ({ ...f, grouping: e.target.value }))}>
+                        <option value="">All</option>
+                        <option value="MetCon Sales">Internal</option>
+                        <option value="Hedge">Supplier Hedge</option>
+                        <option value="Prop">Prop</option>
+                        <option value="Flow Management">Flow Management</option>
+                        <option value="Unallocated">Unallocated</option>
+                    </select>
+                </div>
+                <div className="filter-group">
                     <label>Trade #</label>
                     <input placeholder="e.g. P1019" value={filters.trade_num} onChange={e => setFilters(f => ({ ...f, trade_num: e.target.value }))} />
                 </div>
@@ -1469,14 +1489,14 @@ function PMXLedger() {
                     </button>
                 </div>
                 <div className="filter-group">
-                    <label>Assign Group</label>
+                    <label>Assign Classification</label>
                     <select value={bulkAssignGrouping} onChange={e => setBulkAssignGrouping(e.target.value)}>
                         <option value="">-- choose --</option>
-                        <option value="MetCon Sales">MetCon Sales</option>
-                        <option value="Hedge">Hedge</option>
+                        <option value="MetCon Sales">Internal</option>
+                        <option value="Hedge">Supplier Hedge</option>
                         <option value="Prop">Prop</option>
                         <option value="Flow Management">Flow Management</option>
-                        <option value="__CLEAR__">— Clear grouping —</option>
+                        <option value="__CLEAR__">— Clear classification —</option>
                     </select>
                 </div>
                 <div className="filter-group">
@@ -1486,7 +1506,7 @@ function PMXLedger() {
                         onClick={() => { void assignGroupToSelected(); }}
                         disabled={assigningGroup || !bulkAssignGrouping || (selectedUnallocatedCount + selectedAllocatedCount) === 0}
                     >
-                        {assigningGroup ? 'Assigning...' : `Assign Group (${selectedUnallocatedCount + selectedAllocatedCount})`}
+                        {assigningGroup ? 'Assigning...' : `Assign Classification (${selectedUnallocatedCount + selectedAllocatedCount})`}
                     </button>
                 </div>
                 <div className="filter-group">
@@ -6167,7 +6187,6 @@ function ProfitTab() {
 // ===================================================================
 function TradeGroupingsTab() {
     const GROUPING_ORDER = ['MetCon Sales', 'Hedge', 'Prop', 'Flow Management', 'Unallocated'];
-    const PROFIT_GROUPS = new Set(['Prop', 'MetCon Sales']);
     const GROUP_COLORS: Record<string, string> = {
         'MetCon Sales': '#2563eb',
         'Hedge': '#f59e0b',
@@ -6175,6 +6194,14 @@ function TradeGroupingsTab() {
         'Flow Management': '#14b8a6',
         'Unallocated': '#6b7280',
     };
+    const GROUP_LABELS: Record<string, string> = {
+        'MetCon Sales': 'Internal',
+        'Hedge': 'Supplier Hedge',
+        'Prop': 'Prop',
+        'Flow Management': 'Flow Management',
+        'Unallocated': 'Unallocated',
+    };
+    const groupLabel = (key: string): string => GROUP_LABELS[key] || key;
     const colorFor = (key: string) => GROUP_COLORS[key] || '#64748b';
     const cardStyle = (accent: string): CSSProperties => ({
         borderTop: `4px solid ${accent}`,
@@ -6184,6 +6211,7 @@ function TradeGroupingsTab() {
     const valueStyle = (accent: string): CSSProperties => ({ color: accent });
 
     const [rows, setRows] = useState<Row[]>([]);
+    const [profitRows, setProfitRows] = useState<Row[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [loadError, setLoadError] = useState('');
@@ -6194,12 +6222,27 @@ function TradeGroupingsTab() {
         if (isRefresh) setRefreshing(true);
         else setLoading(true);
         try {
-            const res = await api.getPmxLedger();
-            setRows(Array.isArray(res) ? (res as Row[]) : []);
+            const [ledgerRes, profitRes] = await Promise.all([
+                api.getPmxLedger(),
+                api.getProfitMonthly().catch(() => ({ months: [] as Row[] })),
+            ]);
+            setRows(Array.isArray(ledgerRes) ? (ledgerRes as Row[]) : []);
+            const months = Array.isArray((profitRes as { months?: unknown[] })?.months)
+                ? ((profitRes as { months: Row[] }).months)
+                : [];
+            const trades: Row[] = [];
+            for (const month of months) {
+                const monthTrades = Array.isArray((month as { trades?: unknown[] }).trades)
+                    ? ((month as { trades: Row[] }).trades)
+                    : [];
+                for (const t of monthTrades) trades.push(t);
+            }
+            setProfitRows(trades);
             setLoadError('');
         } catch (e: unknown) {
             const msg = String(e);
             setRows([]);
+            setProfitRows([]);
             setLoadError(msg);
             show(`Failed to load ledger: ${msg}`, 'error');
         } finally {
@@ -6218,6 +6261,31 @@ function TradeGroupingsTab() {
             if (!buckets[key]) buckets[key] = [];
             buckets[key].push(row);
         }
+        const tradeToGrouping = new Map<string, string>();
+        for (const key of Object.keys(buckets)) {
+            const groupRows = buckets[key];
+            for (const r of groupRows) {
+                const tn = normalizeTradeNumberValue((r as Row)['Trade #']);
+                if (!tn) continue;
+                if (!tradeToGrouping.has(tn)) tradeToGrouping.set(tn, key);
+            }
+        }
+        const tradeMetricsByGroup: Record<string, { gramsAbs: number; profitZar: number; tradeNums: Set<string> }> = {};
+        const seenTrades = new Set<string>();
+        for (const tr of profitRows) {
+            const tn = normalizeTradeNumberValue((tr as Row).trade_num ?? (tr as Row)['Trade #']);
+            if (!tn || seenTrades.has(tn)) continue;
+            seenTrades.add(tn);
+            const groupKey = tradeToGrouping.get(tn) || 'Unallocated';
+            if (!tradeMetricsByGroup[groupKey]) {
+                tradeMetricsByGroup[groupKey] = { gramsAbs: 0, profitZar: 0, tradeNums: new Set<string>() };
+            }
+            const g = toNullableNumber((tr as Row).stonex_traded_g);
+            if (g !== null) tradeMetricsByGroup[groupKey].gramsAbs += Math.abs(g);
+            const p = toNullableNumber((tr as Row).total_profit_zar);
+            if (p !== null) tradeMetricsByGroup[groupKey].profitZar += p;
+            tradeMetricsByGroup[groupKey].tradeNums.add(tn);
+        }
         const known = new Set(GROUPING_ORDER);
         const orderedKeys = [
             ...GROUPING_ORDER.filter(k => buckets[k] && buckets[k].length > 0),
@@ -6225,35 +6293,37 @@ function TradeGroupingsTab() {
         ];
         return orderedKeys.map(key => {
             const groupRows = buckets[key];
-            let gramsAbs = 0;
-            let netZar = 0;
+            const tradeStats = tradeMetricsByGroup[key];
+            const tradeNums = new Set<string>();
+            let gramsAbsNet = 0;
             for (const r of groupRows) {
-                const g = toNullableNumber((r as Row)['Net XAU g']);
-                if (g !== null) gramsAbs += Math.abs(g);
-                const dZar = toNullableNumber((r as Row)['Debit ZAR']) ?? 0;
-                const cZar = toNullableNumber((r as Row)['Credit ZAR']) ?? 0;
-                netZar += cZar - dZar;
+                const tn = normalizeTradeNumberValue((r as Row)['Trade #']);
+                if (!tn) continue;
+                tradeNums.add(tn);
+
+                // Grams traded must come from PMX narration OZ per row.
+                const narration = String((r as Row)['Narration'] ?? '');
+                const ozMatch = narration.match(/([+-]?\d[\d,]*(?:\.\d+)?)\s*OZ\b/i);
+                if (!ozMatch) continue;
+                const oz = Number(String(ozMatch[1]).replace(/,/g, ''));
+                if (!Number.isFinite(oz)) continue;
+                gramsAbsNet += Math.abs(oz) * 31.1035;
             }
             return {
                 key,
                 rows: groupRows,
-                count: groupRows.length,
-                gramsAbs,
-                netZar,
+                count: tradeNums.size,
+                gramsAbsNet,
+                netZar: tradeStats ? tradeStats.profitZar : 0,
             };
         });
-    }, [rows]);
+    }, [rows, profitRows]);
 
     const profitByGroup = useMemo(() => {
         const out: Record<string, number> = {};
         for (const g of groups) out[g.key] = g.netZar;
         return out;
     }, [groups]);
-
-    const totalEntries = useMemo(
-        () => groups.reduce((sum, g) => sum + g.count, 0),
-        [groups]
-    );
 
     const toggleGroup = (key: string) => {
         setExpandedGroups(prev => ({ ...prev, [key]: !prev[key] }));
@@ -6276,18 +6346,15 @@ function TradeGroupingsTab() {
     const dateKeys = new Set(['Trade Date']);
 
     const propProfit = profitByGroup['Prop'] ?? 0;
-    const metconProfit = profitByGroup['MetCon Sales'] ?? 0;
-    const profitCards = [
-        { key: 'MetCon Sales', label: 'MetCon Sales Profit (ZAR)', value: metconProfit },
-        { key: 'Prop', label: 'Prop Profit (ZAR)', value: propProfit },
-    ];
+    const propGroupGrams = groups.find(g => g.key === 'Prop')?.gramsAbsNet ?? 0;
+    const visibleGroups = groups.filter(g => g.key !== 'Unallocated');
 
     return (
         <div>
             <div className="page-header">
                 <div>
-                    <h2>Trade Groupings</h2>
-                    <div className="page-subtitle">Volume by trade grouping. Prop and MetCon Sales carry separate profit calculations.</div>
+                    <h2>Trade Classification</h2>
+                    <div className="page-subtitle">Volume by trade classification.</div>
                 </div>
                 <div className="btn-group">
                     <button className="btn btn-sm" onClick={() => { void load(true); }} disabled={refreshing}>
@@ -6296,52 +6363,44 @@ function TradeGroupingsTab() {
                 </div>
             </div>
 
-            <div className="stat-grid">
-                <div className="stat-card" style={cardStyle('#0f172a')}>
-                    <div className="stat-label">Groups</div>
-                    <div className="stat-value" style={valueStyle('#0f172a')}>{fmt(groups.length, 0)}</div>
+            <div className="stat-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '0.65rem' }}>
+                <div className="stat-card" style={cardStyle(colorFor('Prop'))}>
+                    <div className="stat-label">Prop Groups Grams</div>
+                    <div className="stat-value" style={valueStyle(colorFor('Prop'))}>{fmt(propGroupGrams, 2)}</div>
                 </div>
-                <div className="stat-card" style={cardStyle('#475569')}>
-                    <div className="stat-label">Entries</div>
-                    <div className="stat-value" style={valueStyle('#475569')}>{fmt(totalEntries, 0)}</div>
-                </div>
-                {groups.map(group => (
+                {visibleGroups.filter(group => group.key !== 'Prop').map(group => (
                     <div key={`grams-${group.key}`} className="stat-card" style={cardStyle(colorFor(group.key))}>
-                        <div className="stat-label">{group.key} — Grams</div>
-                        <div className="stat-value" style={valueStyle(colorFor(group.key))}>{fmt(group.gramsAbs, 2)}</div>
+                        <div className="stat-label">{groupLabel(group.key)} — Grams</div>
+                        <div className="stat-value" style={valueStyle(colorFor(group.key))}>{fmt(group.gramsAbsNet, 2)}</div>
                     </div>
                 ))}
-                {profitCards.map(card => (
-                    <div key={`profit-${card.key}`} className="stat-card" style={cardStyle(colorFor(card.key))}>
-                        <div className="stat-label">{card.label}</div>
-                        <div
-                            className={`stat-value ${numClass(card.value).replace('num ', '')}`}
-                            style={card.value === 0 ? valueStyle(colorFor(card.key)) : undefined}
-                        >
-                            R{fmt(card.value)}
-                        </div>
+                <div className="stat-card" style={cardStyle(colorFor('Prop'))}>
+                    <div className="stat-label">Prop Profit (ZAR)</div>
+                    <div
+                        className={`stat-value ${numClass(propProfit).replace('num ', '')}`}
+                        style={propProfit === 0 ? valueStyle(colorFor('Prop')) : undefined}
+                    >
+                        R{fmt(propProfit)}
                     </div>
-                ))}
+                </div>
             </div>
 
-            {groups.length === 0 ? (
-                <Empty title="No trades to group" sub="Once trades have a Grouping assigned on the PMX Ledger, they will appear here." />
+            {visibleGroups.length === 0 ? (
+                <Empty title="No trades to classify" sub="Once trades have a Classification assigned on the PMX Ledger, they will appear here." />
             ) : (
                 <div className="table-container">
                     <table className="data-table">
                         <thead>
                             <tr>
-                                <th>Grouping</th>
+                                <th>Classification</th>
                                 <th>Entries</th>
-                                <th>Grams Traded (abs)</th>
-                                <th>Profit (ZAR)</th>
+                                <th>Grams Traded (abs net)</th>
                                 <th>Details</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {groups.map(group => {
+                            {visibleGroups.map(group => {
                                 const expanded = Boolean(expandedGroups[group.key]);
-                                const showsProfit = PROFIT_GROUPS.has(group.key);
                                 return (
                                     <Fragment key={group.key}>
                                         <tr>
@@ -6355,13 +6414,10 @@ function TradeGroupingsTab() {
                                                     marginRight: '0.5rem',
                                                     verticalAlign: 'middle',
                                                 }} />
-                                                {group.key}
+                                                {groupLabel(group.key)}
                                             </td>
                                             <td className="num">{fmt(group.count, 0)}</td>
-                                            <td className="num">{fmt(group.gramsAbs, 2)}</td>
-                                            <td className={showsProfit ? numClass(group.netZar) : ''}>
-                                                {showsProfit ? `R${fmt(group.netZar)}` : <span style={{ color: 'var(--text-muted)' }}>&mdash;</span>}
-                                            </td>
+                                            <td className="num">{fmt(group.gramsAbsNet, 2)}</td>
                                             <td>
                                                 <button className="btn btn-sm" onClick={() => toggleGroup(group.key)}>
                                                     {expanded ? 'Collapse' : 'Expand'}
@@ -6370,7 +6426,7 @@ function TradeGroupingsTab() {
                                         </tr>
                                         {expanded && (
                                             <tr>
-                                                <td colSpan={5} style={{ padding: '0.75rem' }}>
+                                                <td colSpan={4} style={{ padding: '0.75rem' }}>
                                                     <DataTable
                                                         columns={detailCols}
                                                         data={group.rows}
@@ -6390,10 +6446,6 @@ function TradeGroupingsTab() {
                     </table>
                 </div>
             )}
-
-            <div className="stat-sub" style={{ marginTop: '1rem', color: 'var(--text-muted)' }}>
-                Profit is calculated as Σ(Credit ZAR − Debit ZAR) across each group&apos;s ledger entries. Only Prop and MetCon Sales report a profit figure here; other groups show a dash.
-            </div>
 
             {Toast}
         </div>
@@ -9018,7 +9070,7 @@ const NAV_SECTIONS: NavSection[] = [
             { id: 'dashboard', label: 'Dashboard' },
             { id: 'forecast', label: 'Forecasts' },
             { id: 'profit', label: 'Profit' },
-            { id: 'trade_groupings', label: 'Trade Groupings' },
+            { id: 'trade_groupings', label: 'Trade Classification' },
         ],
     },
     {
@@ -9069,7 +9121,7 @@ const PAGE_TITLES: Record<string, string> = {
     trading_worksheet: 'Trading Worksheet',
     trade_breakdown: 'Trade Breakdown',
     forecast: 'Forecasts',
-    trade_groupings: 'Trade Groupings',
+    trade_groupings: 'Trade Classification',
     user_management: 'User Management',
 };
 
