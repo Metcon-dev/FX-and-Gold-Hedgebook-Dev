@@ -1,4 +1,4 @@
-﻿import { Fragment, useState, useEffect, useCallback, useMemo, useRef, Component, type ErrorInfo, type FormEvent, type ReactNode, type ChangeEvent } from 'react'
+﻿import { Fragment, useState, useEffect, useCallback, useMemo, useRef, Component, type ErrorInfo, type FormEvent, type ReactNode, type ChangeEvent, type CSSProperties } from 'react'
 import { api, type AppUser, type AdminUser } from './api/client'
 import { ResponsiveContainer, ComposedChart, Bar, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, Scatter } from 'recharts'
 
@@ -538,12 +538,25 @@ function useToast() {
 // ===================================================================
 // EDITABLE TRADE # CELL
 // ===================================================================
+type TradeNumSaveResult = {
+    ok: boolean;
+    savedValue?: string;
+    message?: string;
+    requiresConfirmation?: boolean;
+    warning?: string;
+};
+type TradeNumSaveFn = (
+    id: number,
+    tradeNumber: string,
+    options?: { overrideValidation?: boolean },
+) => Promise<TradeNumSaveResult>;
+
 function EditableTradeNum({ value, rowId, onSaved, onError, saveTradeNumber, label = 'Trade #' }: {
     value: string;
     rowId: number;
     onSaved: (newVal: string) => void;
     onError: (msg: string) => void;
-    saveTradeNumber?: (id: number, tradeNumber: string) => Promise<{ ok: boolean; savedValue?: string; message?: string }>;
+    saveTradeNumber?: TradeNumSaveFn;
     label?: string;
 }) {
     const [editing, setEditing] = useState(false);
@@ -560,13 +573,30 @@ function EditableTradeNum({ value, rowId, onSaved, onError, saveTradeNumber, lab
         if (normalizedDraft === normalizedValue) { setEditing(false); return; }
         setSaving(true);
         try {
-            const saveFn: (id: number, tradeNumber: string) => Promise<{ ok: boolean; savedValue?: string; message?: string }> =
+            const saveFn: TradeNumSaveFn =
                 saveTradeNumber
-                || (async (id: number, tradeNumber: string) => {
-                    const base = await api.updateTradeNumber(id, tradeNumber);
-                    return { ok: Boolean((base as Row).ok) };
+                || (async (id, tradeNumber, options) => {
+                    const base = await api.updateTradeNumber(id, tradeNumber, options);
+                    return base as TradeNumSaveResult;
                 });
-            const result = await saveFn(rowId, normalizedDraft);
+            let result = await saveFn(rowId, normalizedDraft);
+
+            // Soft-warning path: the trade number has no recent TradeMC
+            // booking. Prompt the user; on accept, retry with override.
+            if (result?.requiresConfirmation) {
+                const accepted = window.confirm(
+                    (result.warning || `${cellLabel}: no recent TradeMC booking found.`)
+                    + '\n\nClick OK to assign anyway, or Cancel to revert.',
+                );
+                if (!accepted) {
+                    setDraft(value);
+                    setEditing(false);
+                    setSaving(false);
+                    return;
+                }
+                result = await saveFn(rowId, normalizedDraft, { overrideValidation: true });
+            }
+
             if (!result?.ok) {
                 throw new Error(asText(result?.message, `${cellLabel} update failed`));
             }
@@ -634,6 +664,8 @@ function PMXLedger() {
     const [allocatingSelected, setAllocatingSelected] = useState(false);
     const [reassigningSelected, setReassigningSelected] = useState(false);
     const [deallocatingSelected, setDeallocatingSelected] = useState(false);
+    const [bulkAssignGrouping, setBulkAssignGrouping] = useState('');
+    const [assigningGroup, setAssigningGroup] = useState(false);
     const hasActiveFilters = useMemo(
         () => Object.values(filters).some((value) => String(value ?? '').trim() !== ''),
         [filters]
@@ -793,7 +825,7 @@ function PMXLedger() {
         { key: 'fx', label: 'USD/ZAR', value: liveUsdZar, decimals: 4 },
     ];
 
-    const cols = [
+    const baseCols = [
         { key: 'Trade #', label: 'Trade #' },
         { key: 'FNC #', label: 'FNC #' },
         { key: 'Trade Date', label: 'Trade Date' },
@@ -809,8 +841,13 @@ function PMXLedger() {
         { key: 'Debit ZAR', label: 'Debit ZAR' },
         { key: 'Credit ZAR', label: 'Credit ZAR' },
         { key: 'Balance ZAR', label: 'Balance ZAR' },
-        { key: 'Trader', label: 'Trade Name' },
     ];
+    const cols = [
+        baseCols[0],
+        { key: 'Grouping', label: 'Grouping' },
+        ...baseCols.slice(1),
+    ];
+    const GROUPING_OPTIONS = ['MetCon Sales', 'Hedge', 'Prop', 'Flow Management'];
 
     const getPmxSignedOz = (row: Row): number | null => {
         const symbol = String(row['Symbol'] ?? '').toUpperCase().replace(/[\/\-\s]/g, '');
@@ -907,18 +944,36 @@ function PMXLedger() {
             let okCount = 0;
             let failCount = 0;
             let firstError = '';
+            // TradeMC warning is asked at most ONCE per bulk run. If the user
+            // accepts, every remaining row gets override=true; if they cancel,
+            // the whole bulk run is aborted (nothing has been written yet
+            // since 409 responses do not commit).
+            let overrideValidation = false;
+            let userCancelled = false;
             for (const row of selectedRows) {
+                if (userCancelled) break;
                 const rowId = toNumericId(row['id']);
                 if (rowId <= 0) continue;
                 try {
-                    await api.updatePmxTradeNumber(rowId, targetTradeNum);
-                    okCount += 1;
+                    let r = await api.updatePmxTradeNumber(rowId, targetTradeNum, { overrideValidation });
+                    if (r && 'requiresConfirmation' in r && r.requiresConfirmation) {
+                        const accepted = window.confirm(
+                            String(r.warning || `Trade ${targetTradeNum} has no recent TradeMC booking.`)
+                            + '\n\nClick OK to proceed with all selected rows, or Cancel to abort the allocation.',
+                        );
+                        if (!accepted) { userCancelled = true; break; }
+                        overrideValidation = true;
+                        r = await api.updatePmxTradeNumber(rowId, targetTradeNum, { overrideValidation: true });
+                    }
+                    if (r && r.ok) okCount += 1;
+                    else { failCount += 1; if (!firstError) firstError = String(r?.warning || 'update failed'); }
                 } catch (e: unknown) {
                     failCount += 1;
                     if (!firstError) firstError = String(e);
                 }
             }
 
+            if (userCancelled) show('Allocation cancelled — no rows changed.', 'center-error');
             if (okCount > 0) show(`Allocated ${okCount.toLocaleString()} trade(s) to ${targetTradeNum}.`, 'success');
             if (failCount > 0) show(`Failed on ${failCount.toLocaleString()} row(s): ${firstError}`, 'center-error');
 
@@ -951,17 +1006,32 @@ function PMXLedger() {
             let okCount = 0;
             let failCount = 0;
             let firstError = '';
+            let overrideValidation = false;
+            let userCancelled = false;
             for (const row of selectedRows) {
+                if (userCancelled) break;
                 const rowId = toNumericId(row['id']);
                 if (rowId <= 0) continue;
                 try {
-                    await api.updatePmxTradeNumber(rowId, targetTradeNum);
-                    okCount += 1;
+                    let r = await api.updatePmxTradeNumber(rowId, targetTradeNum, { overrideValidation });
+                    if (r && 'requiresConfirmation' in r && r.requiresConfirmation) {
+                        const accepted = window.confirm(
+                            String(r.warning || `Trade ${targetTradeNum} has no recent TradeMC booking.`)
+                            + '\n\nClick OK to proceed with all selected rows, or Cancel to abort the reassignment.',
+                        );
+                        if (!accepted) { userCancelled = true; break; }
+                        overrideValidation = true;
+                        r = await api.updatePmxTradeNumber(rowId, targetTradeNum, { overrideValidation: true });
+                    }
+                    if (r && r.ok) okCount += 1;
+                    else { failCount += 1; if (!firstError) firstError = String(r?.warning || 'update failed'); }
                 } catch (e: unknown) {
                     failCount += 1;
                     if (!firstError) firstError = String(e);
                 }
             }
+
+            if (userCancelled) show('Reassignment cancelled — no rows changed.', 'center-error');
 
             if (okCount > 0) show(`Reassigned ${okCount.toLocaleString()} trade(s) to ${targetTradeNum}.`, 'success');
             if (failCount > 0) show(`Failed on ${failCount.toLocaleString()} row(s): ${firstError}`, 'center-error');
@@ -1009,6 +1079,57 @@ function PMXLedger() {
         }
     };
 
+    const assignGroupToSelected = async () => {
+        const groupChoice = bulkAssignGrouping;
+        if (!groupChoice) {
+            show('Choose a group first.', 'center-error');
+            return;
+        }
+        const payload = groupChoice === '__CLEAR__' ? '' : groupChoice;
+
+        const collected: Row[] = [];
+        for (const row of unallocatedData) {
+            const rowId = toNumericId(row['id']);
+            if (rowId > 0 && selectedUnallocatedByRowId[rowId]) collected.push(row);
+        }
+        for (const row of allocatedData) {
+            const rowId = toNumericId(row['id']);
+            if (rowId > 0 && selectedAllocatedByRowId[rowId]) collected.push(row);
+        }
+        if (collected.length === 0) {
+            show('Select at least one trade.', 'center-error');
+            return;
+        }
+
+        setAssigningGroup(true);
+        try {
+            let okCount = 0;
+            let failCount = 0;
+            let firstError = '';
+            for (const row of collected) {
+                const rowId = toNumericId(row['id']);
+                if (rowId <= 0) continue;
+                try {
+                    const r = await api.updatePmxGrouping(rowId, payload);
+                    if (r && r.ok) okCount += 1;
+                    else { failCount += 1; if (!firstError) firstError = 'update failed'; }
+                } catch (e: unknown) {
+                    failCount += 1;
+                    if (!firstError) firstError = String(e);
+                }
+            }
+            const label = payload === '' ? 'cleared grouping on' : `assigned to ${payload}:`;
+            if (okCount > 0) show(`${label.replace(':', '')} ${okCount.toLocaleString()} trade(s).`, 'success');
+            if (failCount > 0) show(`Failed on ${failCount.toLocaleString()} row(s): ${firstError}`, 'center-error');
+            setBulkAssignGrouping('');
+            setSelectedUnallocatedByRowId({});
+            setSelectedAllocatedByRowId({});
+            await load(filters);
+        } finally {
+            setAssigningGroup(false);
+        }
+    };
+
     const downloadFilteredCsv = async () => {
         const params: Record<string, string> = {};
         // Full statement export: include allocated + unallocated rows.
@@ -1034,7 +1155,9 @@ function PMXLedger() {
         }
     };
 
-    const renderLedgerTable = (rows: Row[], emptyMessage: string, containerClassName = '', selectionMode: 'unallocated' | 'allocated' | null = null) => (
+    const renderLedgerTable = (rows: Row[], emptyMessage: string, containerClassName = '', selectionMode: 'unallocated' | 'allocated' | null = null) => {
+        const effectiveCols = cols;
+        return (
         <div className={`table-container ${containerClassName}`.trim()}>
             <table className="data-table">
                 <thead>
@@ -1080,7 +1203,7 @@ function PMXLedger() {
                                 />
                             </th>
                         )}
-                        {cols.map(c => {
+                        {effectiveCols.map(c => {
                             const isSorted = sort.key === c.key;
                             const canSort = pmxSortableCols.has(c.key);
                             return (
@@ -1102,7 +1225,7 @@ function PMXLedger() {
                 </thead>
                 <tbody>
                     {rows.length === 0 && (
-                        <tr><td colSpan={cols.length + (selectionMode ? 1 : 0)} style={{ textAlign: 'left', padding: '2.5rem', color: 'var(--text-muted)' }}>{emptyMessage}</td></tr>
+                        <tr><td colSpan={effectiveCols.length + (selectionMode ? 1 : 0)} style={{ textAlign: 'left', padding: '2.5rem', color: 'var(--text-muted)' }}>{emptyMessage}</td></tr>
                     )}
                     {rows.map((row, i) => (
                         <tr key={`${String(row['id'] ?? '')}-${i}`}>
@@ -1128,10 +1251,44 @@ function PMXLedger() {
                                     )}
                                 </td>
                             )}
-                            {cols.map(c => {
+                            {effectiveCols.map(c => {
                                 const val = c.key === 'Oz' ? getPmxSignedOz(row) : row[c.key];
                                 const isNum = ['Debit USD', 'Credit USD', 'Balance USD', 'Net XAU g', 'Oz', 'Debit ZAR', 'Credit ZAR', 'Balance ZAR'].includes(c.key);
                                 const isDate = ['Trade Date', 'Value Date'].includes(c.key);
+
+                                if (c.key === 'Grouping') {
+                                    const groupRowId = toNumericId(row['id']);
+                                    const current = String(val ?? '');
+                                    return (
+                                        <td key={c.key}>
+                                            <select
+                                                className="pmx-grouping-select"
+                                                value={current}
+                                                disabled={groupRowId <= 0}
+                                                onChange={async (e) => {
+                                                    const next = e.target.value;
+                                                    const prev = current;
+                                                    setData(cur => cur.map(r =>
+                                                        r['id'] === row['id'] ? { ...r, 'Grouping': next } : r
+                                                    ));
+                                                    try {
+                                                        await api.updatePmxGrouping(groupRowId, next);
+                                                    } catch (err: unknown) {
+                                                        setData(cur => cur.map(r =>
+                                                            r['id'] === row['id'] ? { ...r, 'Grouping': prev } : r
+                                                        ));
+                                                        show(String(err), 'error');
+                                                    }
+                                                }}
+                                            >
+                                                <option value="">—</option>
+                                                {GROUPING_OPTIONS.map(opt => (
+                                                    <option key={opt} value={opt}>{opt}</option>
+                                                ))}
+                                            </select>
+                                        </td>
+                                    );
+                                }
 
                                 if (c.key === 'Trade #') {
                                     const editRowId = toNumericId(row['id']);
@@ -1204,7 +1361,8 @@ function PMXLedger() {
                 </tbody>
             </table>
         </div>
-    );
+        );
+    };
 
     return (
         <div>
@@ -1308,6 +1466,27 @@ function PMXLedger() {
                         disabled={deallocatingSelected || selectedAllocatedCount === 0}
                     >
                         {deallocatingSelected ? 'Deallocating...' : `Deallocate Selected (${selectedAllocatedCount})`}
+                    </button>
+                </div>
+                <div className="filter-group">
+                    <label>Assign Group</label>
+                    <select value={bulkAssignGrouping} onChange={e => setBulkAssignGrouping(e.target.value)}>
+                        <option value="">-- choose --</option>
+                        <option value="MetCon Sales">MetCon Sales</option>
+                        <option value="Hedge">Hedge</option>
+                        <option value="Prop">Prop</option>
+                        <option value="Flow Management">Flow Management</option>
+                        <option value="__CLEAR__">— Clear grouping —</option>
+                    </select>
+                </div>
+                <div className="filter-group">
+                    <label>&nbsp;</label>
+                    <button
+                        className="btn btn-sm btn-primary"
+                        onClick={() => { void assignGroupToSelected(); }}
+                        disabled={assigningGroup || !bulkAssignGrouping || (selectedUnallocatedCount + selectedAllocatedCount) === 0}
+                    >
+                        {assigningGroup ? 'Assigning...' : `Assign Group (${selectedUnallocatedCount + selectedAllocatedCount})`}
                     </button>
                 </div>
                 <div className="filter-group">
@@ -3710,13 +3889,14 @@ function WeightedAverage() {
             const w = toNum(r.weight);
             const rate = toNum(r.rate);
             const total = toNum(r.total);
-            if (w !== null) totalWeight += w;
-            if (w !== null && rate !== null) calculatedTotal += w * rate;
+            const sign = String(r.side || '').trim().toUpperCase() === 'SELL' ? -1 : 1;
+            if (w !== null) totalWeight += sign * Math.abs(w);
+            if (w !== null && rate !== null) calculatedTotal += sign * Math.abs(w) * rate;
             if (total !== null) {
-                enteredTotal += total;
+                enteredTotal += sign * Math.abs(total);
                 enteredRowsCount += 1;
                 if (r.locked) {
-                    loadedReferenceTotal += total;
+                    loadedReferenceTotal += sign * Math.abs(total);
                     loadedRowsCount += 1;
                 }
             }
@@ -4372,6 +4552,7 @@ function TradingTicket() {
         { key: 'Gold WA $/oz', label: 'Gold WA $/oz', decimals: 4, headerClass: 'highlight-gold' },
         { key: 'FX WA USD/ZAR', label: 'FX WA USD/ZAR', decimals: 4, headerClass: 'highlight-fx' },
         { key: 'Total Traded (g)', label: 'PMX Total (g)', decimals: 2 },
+        { key: 'Total Traded (oz)', label: 'PMX Total (oz)', decimals: 4 },
         { key: 'Control Account (g)', label: 'Control Account (g)', decimals: 2 },
         { key: 'Control Account (ZAR)', label: 'Control Account (ZAR)', decimals: 2 },
         { key: 'Spot ZAR/g', label: 'Spot ZAR/g', decimals: 4 },
@@ -5975,6 +6156,244 @@ function ProfitTab() {
                 </div>
                 </>
             )}
+
+            {Toast}
+        </div>
+    );
+}
+
+// ===================================================================
+// TAB: TRADE GROUPINGS
+// ===================================================================
+function TradeGroupingsTab() {
+    const GROUPING_ORDER = ['MetCon Sales', 'Hedge', 'Prop', 'Flow Management', 'Unallocated'];
+    const PROFIT_GROUPS = new Set(['Prop', 'MetCon Sales']);
+    const GROUP_COLORS: Record<string, string> = {
+        'MetCon Sales': '#2563eb',
+        'Hedge': '#f59e0b',
+        'Prop': '#8b5cf6',
+        'Flow Management': '#14b8a6',
+        'Unallocated': '#6b7280',
+    };
+    const colorFor = (key: string) => GROUP_COLORS[key] || '#64748b';
+    const cardStyle = (accent: string): CSSProperties => ({
+        borderTop: `4px solid ${accent}`,
+        borderTopLeftRadius: 'var(--radius)',
+        borderTopRightRadius: 'var(--radius)',
+    });
+    const valueStyle = (accent: string): CSSProperties => ({ color: accent });
+
+    const [rows, setRows] = useState<Row[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [refreshing, setRefreshing] = useState(false);
+    const [loadError, setLoadError] = useState('');
+    const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+    const { show, Toast } = useToast();
+
+    const load = useCallback(async (isRefresh = false) => {
+        if (isRefresh) setRefreshing(true);
+        else setLoading(true);
+        try {
+            const res = await api.getPmxLedger();
+            setRows(Array.isArray(res) ? (res as Row[]) : []);
+            setLoadError('');
+        } catch (e: unknown) {
+            const msg = String(e);
+            setRows([]);
+            setLoadError(msg);
+            show(`Failed to load ledger: ${msg}`, 'error');
+        } finally {
+            if (isRefresh) setRefreshing(false);
+            else setLoading(false);
+        }
+    }, [show]);
+
+    useEffect(() => { void load(false); }, [load]);
+
+    const groups = useMemo(() => {
+        const buckets: Record<string, Row[]> = {};
+        for (const row of rows) {
+            const raw = String((row as Row)['Grouping'] ?? '').trim();
+            const key = raw || 'Unallocated';
+            if (!buckets[key]) buckets[key] = [];
+            buckets[key].push(row);
+        }
+        const known = new Set(GROUPING_ORDER);
+        const orderedKeys = [
+            ...GROUPING_ORDER.filter(k => buckets[k] && buckets[k].length > 0),
+            ...Object.keys(buckets).filter(k => !known.has(k)).sort(),
+        ];
+        return orderedKeys.map(key => {
+            const groupRows = buckets[key];
+            let gramsAbs = 0;
+            let netZar = 0;
+            for (const r of groupRows) {
+                const g = toNullableNumber((r as Row)['Net XAU g']);
+                if (g !== null) gramsAbs += Math.abs(g);
+                const dZar = toNullableNumber((r as Row)['Debit ZAR']) ?? 0;
+                const cZar = toNullableNumber((r as Row)['Credit ZAR']) ?? 0;
+                netZar += cZar - dZar;
+            }
+            return {
+                key,
+                rows: groupRows,
+                count: groupRows.length,
+                gramsAbs,
+                netZar,
+            };
+        });
+    }, [rows]);
+
+    const profitByGroup = useMemo(() => {
+        const out: Record<string, number> = {};
+        for (const g of groups) out[g.key] = g.netZar;
+        return out;
+    }, [groups]);
+
+    const totalEntries = useMemo(
+        () => groups.reduce((sum, g) => sum + g.count, 0),
+        [groups]
+    );
+
+    const toggleGroup = (key: string) => {
+        setExpandedGroups(prev => ({ ...prev, [key]: !prev[key] }));
+    };
+
+    if (loading) return <><Loading text="Loading trade groupings..." />{Toast}</>;
+    if (loadError) return <><Empty title="Could not load trade groupings" sub={loadError} />{Toast}</>;
+
+    const detailCols = [
+        { key: 'Trade #', label: 'Trade #' },
+        { key: 'FNC #', label: 'FNC #' },
+        { key: 'Trade Date', label: 'Trade Date' },
+        { key: 'Symbol', label: 'Symbol' },
+        { key: 'Side', label: 'Side' },
+        { key: 'Net XAU g', label: 'Net Au g' },
+        { key: 'Debit ZAR', label: 'Debit ZAR' },
+        { key: 'Credit ZAR', label: 'Credit ZAR' },
+    ];
+    const numericKeys = new Set(['Net XAU g', 'Debit ZAR', 'Credit ZAR']);
+    const dateKeys = new Set(['Trade Date']);
+
+    const propProfit = profitByGroup['Prop'] ?? 0;
+    const metconProfit = profitByGroup['MetCon Sales'] ?? 0;
+    const profitCards = [
+        { key: 'MetCon Sales', label: 'MetCon Sales Profit (ZAR)', value: metconProfit },
+        { key: 'Prop', label: 'Prop Profit (ZAR)', value: propProfit },
+    ];
+
+    return (
+        <div>
+            <div className="page-header">
+                <div>
+                    <h2>Trade Groupings</h2>
+                    <div className="page-subtitle">Volume by trade grouping. Prop and MetCon Sales carry separate profit calculations.</div>
+                </div>
+                <div className="btn-group">
+                    <button className="btn btn-sm" onClick={() => { void load(true); }} disabled={refreshing}>
+                        {refreshing ? 'Refreshing...' : 'Refresh'}
+                    </button>
+                </div>
+            </div>
+
+            <div className="stat-grid">
+                <div className="stat-card" style={cardStyle('#0f172a')}>
+                    <div className="stat-label">Groups</div>
+                    <div className="stat-value" style={valueStyle('#0f172a')}>{fmt(groups.length, 0)}</div>
+                </div>
+                <div className="stat-card" style={cardStyle('#475569')}>
+                    <div className="stat-label">Entries</div>
+                    <div className="stat-value" style={valueStyle('#475569')}>{fmt(totalEntries, 0)}</div>
+                </div>
+                {groups.map(group => (
+                    <div key={`grams-${group.key}`} className="stat-card" style={cardStyle(colorFor(group.key))}>
+                        <div className="stat-label">{group.key} — Grams</div>
+                        <div className="stat-value" style={valueStyle(colorFor(group.key))}>{fmt(group.gramsAbs, 2)}</div>
+                    </div>
+                ))}
+                {profitCards.map(card => (
+                    <div key={`profit-${card.key}`} className="stat-card" style={cardStyle(colorFor(card.key))}>
+                        <div className="stat-label">{card.label}</div>
+                        <div
+                            className={`stat-value ${numClass(card.value).replace('num ', '')}`}
+                            style={card.value === 0 ? valueStyle(colorFor(card.key)) : undefined}
+                        >
+                            R{fmt(card.value)}
+                        </div>
+                    </div>
+                ))}
+            </div>
+
+            {groups.length === 0 ? (
+                <Empty title="No trades to group" sub="Once trades have a Grouping assigned on the PMX Ledger, they will appear here." />
+            ) : (
+                <div className="table-container">
+                    <table className="data-table">
+                        <thead>
+                            <tr>
+                                <th>Grouping</th>
+                                <th>Entries</th>
+                                <th>Grams Traded (abs)</th>
+                                <th>Profit (ZAR)</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {groups.map(group => {
+                                const expanded = Boolean(expandedGroups[group.key]);
+                                const showsProfit = PROFIT_GROUPS.has(group.key);
+                                return (
+                                    <Fragment key={group.key}>
+                                        <tr>
+                                            <td>
+                                                <span style={{
+                                                    display: 'inline-block',
+                                                    width: '8px',
+                                                    height: '8px',
+                                                    borderRadius: '50%',
+                                                    backgroundColor: colorFor(group.key),
+                                                    marginRight: '0.5rem',
+                                                    verticalAlign: 'middle',
+                                                }} />
+                                                {group.key}
+                                            </td>
+                                            <td className="num">{fmt(group.count, 0)}</td>
+                                            <td className="num">{fmt(group.gramsAbs, 2)}</td>
+                                            <td className={showsProfit ? numClass(group.netZar) : ''}>
+                                                {showsProfit ? `R${fmt(group.netZar)}` : <span style={{ color: 'var(--text-muted)' }}>&mdash;</span>}
+                                            </td>
+                                            <td>
+                                                <button className="btn btn-sm" onClick={() => toggleGroup(group.key)}>
+                                                    {expanded ? 'Collapse' : 'Expand'}
+                                                </button>
+                                            </td>
+                                        </tr>
+                                        {expanded && (
+                                            <tr>
+                                                <td colSpan={5} style={{ padding: '0.75rem' }}>
+                                                    <DataTable
+                                                        columns={detailCols}
+                                                        data={group.rows}
+                                                        numericCols={Array.from(numericKeys)}
+                                                        dateCols={Array.from(dateKeys)}
+                                                        formatters={{
+                                                            'Net XAU g': { decimals: 2 },
+                                                        }}
+                                                    />
+                                                </td>
+                                            </tr>
+                                        )}
+                                    </Fragment>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
+            )}
+
+            <div className="stat-sub" style={{ marginTop: '1rem', color: 'var(--text-muted)' }}>
+                Profit is calculated as Σ(Credit ZAR − Debit ZAR) across each group&apos;s ledger entries. Only Prop and MetCon Sales report a profit figure here; other groups show a dash.
+            </div>
 
             {Toast}
         </div>
@@ -8599,6 +9018,7 @@ const NAV_SECTIONS: NavSection[] = [
             { id: 'dashboard', label: 'Dashboard' },
             { id: 'forecast', label: 'Forecasts' },
             { id: 'profit', label: 'Profit' },
+            { id: 'trade_groupings', label: 'Trade Groupings' },
         ],
     },
     {
@@ -8649,6 +9069,7 @@ const PAGE_TITLES: Record<string, string> = {
     trading_worksheet: 'Trading Worksheet',
     trade_breakdown: 'Trade Breakdown',
     forecast: 'Forecasts',
+    trade_groupings: 'Trade Groupings',
     user_management: 'User Management',
 };
 
@@ -8693,7 +9114,7 @@ export default function App() {
     }, [refreshAuth]);
 
     useEffect(() => {
-        if (!authUser) return;
+        if (!authUser || tab !== 'dashboard') return;
 
         const syncPmxInBackground = async () => {
             if (pmxAutoSyncInFlightRef.current) return;
@@ -8714,10 +9135,10 @@ export default function App() {
         }, BACKGROUND_REFRESH_MS);
 
         return () => window.clearInterval(timer);
-    }, [authUser]);
+    }, [authUser, tab]);
 
     useEffect(() => {
-        if (!authUser) {
+        if (!authUser || tab !== 'dashboard') {
             setReconDeltaAlert(false);
             return;
         }
@@ -8770,10 +9191,10 @@ export default function App() {
             window.removeEventListener(PMX_AUTO_SYNC_EVENT, onPmxAutoSync);
             window.clearInterval(timer);
         };
-    }, [authUser, reconEndDate]);
+    }, [authUser, reconEndDate, tab]);
 
     useEffect(() => {
-        if (!authUser) {
+        if (!authUser || tab !== 'dashboard') {
             setTradeMCMissingSageAlert(false);
             return;
         }
@@ -8820,7 +9241,7 @@ export default function App() {
             window.removeEventListener(TRADEMC_MISSING_SAGE_EVENT, onTradeMCMissingSage as EventListener);
             window.clearInterval(timer);
         };
-    }, [authUser]);
+    }, [authUser, tab]);
 
     useEffect(() => {
         const onPriceWarning = (event: Event) => {
@@ -8832,7 +9253,7 @@ export default function App() {
     }, []);
 
     useEffect(() => {
-        if (!authUser) return;
+        if (!authUser || tab !== 'dashboard') return;
 
         const syncTradeMCInBackground = async () => {
             if (trademcAutoSyncInFlightRef.current) return;
@@ -8855,7 +9276,7 @@ export default function App() {
         }, BACKGROUND_REFRESH_MS);
 
         return () => window.clearInterval(timer);
-    }, [authUser]);
+    }, [authUser, tab]);
 
     const onLogin = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
@@ -9033,6 +9454,7 @@ export default function App() {
                                             {item.id === 'forecast' && <><polyline points="22 12 18 12 15 21 9 3 6 12 2 12" /></>}
                                             {item.id === 'trading_worksheet' && <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="14" y2="17" /></>}
                                             {item.id === 'trade_breakdown' && <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="14" y2="17" /></>}
+                                            {item.id === 'trade_groupings' && <><polygon points="12 2 2 7 12 12 22 7 12 2" /><polyline points="2 17 12 22 22 17" /><polyline points="2 12 12 17 22 12" /></>}
                                             {item.id === 'user_management' && <><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="8.5" cy="7" r="4" /><path d="M20 8v6" /><path d="M23 11h-6" /></>}
                                         </svg>
                                     </span>
@@ -9141,6 +9563,7 @@ export default function App() {
                         {tab === 'forecast' && <ForecastTab />}
                         {tab === 'pmx_ledger' && <PMXLedger />}
                         {tab === 'profit' && <ProfitTab />}
+                        {tab === 'trade_groupings' && <TradeGroupingsTab />}
                         {tab === 'forward_exposure' && <ForwardExposure />}
                         {tab === 'open_positions_reval' && <OpenPositionsReval />}
 

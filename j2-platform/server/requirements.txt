@@ -1,5 +1,6 @@
 flask
 flask-cors
+waitress
 pandas
 openpyxl
 requests
@@ -12,3 +13,4 @@ fpdf2
 Pillow
 pytesseract
 playwright
+MetaTrader5

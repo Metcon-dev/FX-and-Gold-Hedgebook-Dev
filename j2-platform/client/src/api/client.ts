@@ -272,11 +272,51 @@ export const api = {
     addTrade: (data: Record<string, unknown>) =>
         request<{ success: boolean }>('/trades', { method: 'POST', body: JSON.stringify(data) }),
 
-    updateTradeNumber: (id: number, tradeNumber: string) =>
-        request<{ ok: boolean }>(`/trades/${id}/trade-number`, {
+    updateTradeNumber: async (id: number, tradeNumber: string, options?: { overrideValidation?: boolean }) => {
+        const url = `${BASE}/trades/${id}/trade-number`;
+        const res = await fetch(url, {
             method: 'PUT',
-            body: JSON.stringify({ trade_number: tradeNumber }),
-        }),
+            cache: 'no-store',
+            credentials: 'include',
+            headers: {
+                'Content-Type': 'application/json',
+                'Cache-Control': 'no-cache',
+                Pragma: 'no-cache',
+            },
+            body: JSON.stringify({
+                trade_number: tradeNumber,
+                override_validation: Boolean(options?.overrideValidation),
+            }),
+        });
+
+        const raw = await res.text();
+        let parsed: unknown = null;
+        if (raw) {
+            try { parsed = JSON.parse(raw); } catch { parsed = null; }
+        }
+
+        // 409 = soft validation warning. The server did NOT commit the
+        // assignment; the caller decides whether to retry with
+        // overrideValidation=true based on user confirmation.
+        if (res.status === 409 && parsed && typeof parsed === 'object' && (parsed as { requires_confirmation?: boolean }).requires_confirmation) {
+            const payload = parsed as { requires_confirmation: boolean; warning?: string };
+            return { ok: false, requiresConfirmation: true, warning: String(payload.warning || 'Trade number validation warning.') };
+        }
+
+        if (!res.ok) {
+            const errMsg = (
+                parsed && typeof parsed === 'object' && parsed !== null &&
+                'error' in parsed &&
+                typeof (parsed as { error?: unknown }).error === 'string'
+            ) ? String((parsed as { error: string }).error) : (raw || `HTTP ${res.status}`);
+            const err = new Error(errMsg) as Error & { status?: number; payload?: unknown };
+            err.status = res.status;
+            err.payload = parsed;
+            throw err;
+        }
+
+        return { ok: true, requiresConfirmation: false, ...(parsed as Record<string, unknown>) };
+    },
 
     updatePmxTradeNumber: async (id: number, tradeNumber: string, options?: { overrideValidation?: boolean }) => {
         const url = `${BASE}/pmx/trades/${id}/trade-number`;
@@ -304,6 +344,14 @@ export const api = {
                 parsed = null;
             }
         }
+
+        // 409 = TradeMC soft-warning. Do NOT throw — let the caller prompt
+        // the user and re-invoke with overrideValidation=true on accept.
+        if (res.status === 409 && parsed && typeof parsed === 'object' && (parsed as { requires_confirmation?: boolean }).requires_confirmation) {
+            const payload = parsed as { requires_confirmation: boolean; warning?: string };
+            return { ok: false, requiresConfirmation: true, warning: String(payload.warning || 'Trade number validation warning.') };
+        }
+
         if (!res.ok) {
             const errMsg = (
                 parsed &&
@@ -320,8 +368,14 @@ export const api = {
             throw err;
         }
 
-        return (parsed as { ok: boolean }) || { ok: true };
+        return { ok: true, requiresConfirmation: false, ...(parsed as Record<string, unknown>) };
     },
+
+    updatePmxGrouping: (id: number, grouping: string) =>
+        request<{ ok: boolean; trade_id: number; grouping: string }>(`/pmx/trades/${id}/grouping`, {
+            method: 'PUT',
+            body: JSON.stringify({ grouping }),
+        }),
 
     // TradeMC
     getTradeMCTrades: (params?: Record<string, string>) => {

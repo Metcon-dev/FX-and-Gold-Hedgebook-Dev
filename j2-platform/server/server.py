@@ -153,6 +153,9 @@ from services.purchases_ml_service import (
     get_ml_forecast as _purchases_get_forecast,
     get_model_status as _purchases_model_status,
 )
+from services.hedging_orchestrator_service import (
+    start_hedging_listener,
+)
 
 def _load_env_file(path: str = ".env"):
     try:
@@ -1786,7 +1789,8 @@ def initialize_pmx_database():
             trader_name TEXT,
             raw_payload TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            allocated_at TIMESTAMP
+            allocated_at TIMESTAMP,
+            order_id_source TEXT
         )
         """
     )
@@ -1794,11 +1798,26 @@ def initialize_pmx_database():
     existing_columns = {str(row[1]) for row in cur.fetchall()}
     if "allocated_at" not in existing_columns:
         cur.execute("ALTER TABLE trades ADD COLUMN allocated_at TIMESTAMP")
+    if "order_id_source" not in existing_columns:
+        cur.execute("ALTER TABLE trades ADD COLUMN order_id_source TEXT")
+    if "grouping" not in existing_columns:
+        cur.execute("ALTER TABLE trades ADD COLUMN grouping TEXT")
     cur.execute(
         """
         UPDATE trades
         SET allocated_at = COALESCE(allocated_at, created_at)
         WHERE COALESCE(TRIM(order_id), '') <> '' AND allocated_at IS NULL
+        """
+    )
+    # Pre-existing populated order_ids were all derived from PMX comments, so
+    # backfill them as 'comment'. Any *future* manual override will tag the row
+    # 'manual' and the sync UPSERT will respect that.
+    cur.execute(
+        """
+        UPDATE trades
+        SET order_id_source = 'comment'
+        WHERE COALESCE(TRIM(order_id), '') <> ''
+          AND (order_id_source IS NULL OR TRIM(order_id_source) = '')
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pmx_symbol ON trades(symbol)")
@@ -2152,6 +2171,9 @@ def _pmx_map_row_to_trade(row: Dict[str, Any], fallback_index: int) -> Optional[
             _extract_trade_num_from_remarks(row.get("remarks", "")),
         )
     )
+    # Everything we derive here is a PMX/comment-based auto-allocation.
+    # The UPSERT will NOT overwrite rows that already carry a 'manual' override.
+    order_id_source = "comment" if order_id else ""
     order_id_upper = str(order_id or "").upper()
     if order_id_upper.startswith("SWT/") or "/SWT/" in order_id_upper:
         return None
@@ -2192,6 +2214,7 @@ def _pmx_map_row_to_trade(row: Dict[str, Any], fallback_index: int) -> Optional[
         "doc_number": doc_number,
         "clord_id": clord_id,
         "order_id": order_id,
+        "order_id_source": order_id_source,
         "fnc_number": fnc_number,
         "debit_usd": 0.0,
         "credit_usd": 0.0,
@@ -2378,6 +2401,7 @@ def load_all_pmx_trades(filters: Optional[Dict[str, Any]] = None) -> pd.DataFram
                 balance_xau AS "Balance XAU",
                 source_system AS "Source System",
                 trader_name AS "Trader",
+                grouping AS "Grouping",
                 created_at AS "Created At"
             FROM trades
             WHERE {where_sql}
@@ -2435,6 +2459,7 @@ def load_pmx_trades_for_trade_number(trade_num_input: Any) -> pd.DataFrame:
                 balance_xau AS "Balance XAU",
                 source_system AS "Source System",
                 trader_name AS "Trader",
+                grouping AS "Grouping",
                 created_at AS "Created At"
             FROM trades
             WHERE {where_sql}
@@ -2476,24 +2501,68 @@ def update_pmx_trade_order_id(trade_id: int, order_id: str) -> bool:
     try:
         order_id_value = normalize_trade_number(order_id) if order_id and str(order_id).strip() else None
         if order_id_value:
+            # Tag the row as 'manual' so a subsequent PMX sync does NOT
+            # overwrite it with the comment-derived trade number.
             cursor.execute(
                 """
                 UPDATE trades
                 SET order_id = ?,
+                    order_id_source = 'manual',
                     allocated_at = COALESCE(allocated_at, CURRENT_TIMESTAMP)
                 WHERE id = ?
                 """,
                 (order_id_value, trade_id),
             )
         else:
+            # Clearing the override releases the row back to auto-allocation;
+            # the next PMX sync is free to repopulate it from comments.
             cursor.execute(
                 """
                 UPDATE trades
-                SET order_id = ?
+                SET order_id = ?,
+                    order_id_source = NULL
                 WHERE id = ?
                 """,
                 (order_id_value, trade_id),
             )
+        if cursor.rowcount == 0:
+            cursor.execute("SELECT 1 FROM trades WHERE id = ?", (trade_id,))
+            if cursor.fetchone() is None:
+                conn.rollback()
+                return False
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+PMX_TRADE_GROUPING_OPTIONS = {"MetCon Sales", "Hedge", "Prop", "Flow Management"}
+
+
+def _normalize_pmx_grouping(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    lookup = {opt.casefold(): opt for opt in PMX_TRADE_GROUPING_OPTIONS}
+    # Tolerate the "Flow management" spelling the UI displays alongside the canonical value.
+    lookup["flow management"] = "Flow Management"
+    match = lookup.get(raw.casefold())
+    if match is None:
+        raise ValueError(f"Invalid grouping: {raw}")
+    return match
+
+
+def update_pmx_trade_grouping(trade_id: int, grouping: Optional[str]) -> bool:
+    conn = get_pmx_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE trades SET grouping = ? WHERE id = ?",
+            (grouping, trade_id),
+        )
         if cursor.rowcount == 0:
             cursor.execute("SELECT 1 FROM trades WHERE id = ?", (trade_id,))
             if cursor.fetchone() is None:
@@ -2605,6 +2674,89 @@ def _validate_integer_trade_number_recent_trademc(
         )
 
     return True, ""
+
+
+def _pmx_trade_number_trademc_warning(
+    trade_number: str,
+    trade_symbol: str,
+    days: int = 7,
+) -> Tuple[bool, str]:
+    """Soft-warning check used by the PMX/FX trade-number assigning flow.
+
+    Returns (should_warn, warning_msg). When should_warn is True the
+    assignment endpoint returns HTTP 409 with requires_confirmation=True,
+    and the frontend pops a confirm dialog. If the user accepts, the
+    client retries with override_validation=True and this check is skipped.
+
+    Gate rules (match the existing hard-block validator so we don't warn
+    on refs that never get a TradeMC booking):
+      - Empty refs: no warning.
+      - Non-integer refs (e.g. "KA2604", "ADJ-001"): no warning — these
+        are client-initial trades that legitimately don't live in TradeMC.
+      - Excluded symbols (XAGUSD, XPTUSD, XPDUSD): no warning.
+      - Otherwise: require a TradeMC row whose `date_created` is within
+        the last `days` days. If none, warn.
+    """
+    normalized_trade = normalize_trade_number(trade_number)
+    if not normalized_trade:
+        return False, ""
+
+    if not re.fullmatch(r"\d+", normalized_trade):
+        return False, ""
+
+    symbol_key = _normalize_symbol_for_validation(trade_symbol)
+    if symbol_key in {"XAGUSD", "XPTUSD", "XPDUSD"}:
+        return False, ""
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        rows = pd.read_sql_query(
+            """
+            SELECT ref_number, date_created
+            FROM trademc_trades
+            WHERE UPPER(REPLACE(REPLACE(REPLACE(TRIM(COALESCE(ref_number, '')), ' ', ''), '-', ''), '/', '')) = ?
+            """,
+            conn,
+            params=[normalized_trade],
+        )
+    except Exception as exc:
+        # Fail open: if we can't reach TradeMC, don't block the user with
+        # a spurious warning. The underlying error surfaces elsewhere.
+        print(f"[WARN] TradeMC warning-check failed for {normalized_trade}: {exc}")
+        return False, ""
+    finally:
+        if conn is not None:
+            conn.close()
+
+    cutoff_utc = pd.Timestamp.utcnow() - pd.Timedelta(days=max(1, int(days)))
+    latest_created: Optional[pd.Timestamp] = None
+    for _, row in rows.iterrows():
+        raw_val = row.get("date_created")
+        if raw_val is None or str(raw_val).strip() == "":
+            continue
+        parsed = pd.to_datetime(raw_val, errors="coerce", utc=True)
+        if pd.isna(parsed):
+            continue
+        if latest_created is None or parsed > latest_created:
+            latest_created = parsed
+
+    if latest_created is None or latest_created < cutoff_utc:
+        if latest_created is None:
+            tail = "no matching booking has ever been created in TradeMC."
+        else:
+            tail = (
+                f"the most recent booking was created on "
+                f"{latest_created.strftime('%Y-%m-%d')}."
+            )
+        return (
+            True,
+            f"Trade number '{normalized_trade}' has not been created in "
+            f"TradeMC in the past {int(days)} days — {tail} "
+            f"Assign it anyway?",
+        )
+
+    return False, ""
 
 
 def sync_pmx_trades_to_db(data: Dict[str, Any], req_headers: Any) -> Dict[str, Any]:
@@ -2847,6 +2999,7 @@ def sync_pmx_trades_to_db(data: Dict[str, Any], req_headers: Any) -> Dict[str, A
         "doc_number",
         "clord_id",
         "order_id",
+        "order_id_source",
         "fnc_number",
         "debit_usd",
         "credit_usd",
@@ -2886,9 +3039,19 @@ def sync_pmx_trades_to_db(data: Dict[str, Any], req_headers: Any) -> Dict[str, A
             settle_currency = excluded.settle_currency,
             settle_amount = excluded.settle_amount,
             clord_id = excluded.clord_id,
+            -- Manual overrides (order_id_source = 'manual') are sacred: the PMX
+            -- payload's comment-derived trade number must NOT overwrite them.
+            -- Otherwise, fall back to the existing comment-based value if the
+            -- incoming value is blank.
             order_id = CASE
+                WHEN COALESCE(trades.order_id_source, '') = 'manual' THEN trades.order_id
                 WHEN excluded.order_id IS NOT NULL AND TRIM(excluded.order_id) != '' THEN excluded.order_id
                 ELSE trades.order_id
+            END,
+            order_id_source = CASE
+                WHEN COALESCE(trades.order_id_source, '') = 'manual' THEN 'manual'
+                WHEN excluded.order_id IS NOT NULL AND TRIM(excluded.order_id) != '' THEN 'comment'
+                ELSE trades.order_id_source
             END,
             fnc_number = CASE
                 WHEN excluded.fnc_number IS NOT NULL AND TRIM(excluded.fnc_number) != '' THEN excluded.fnc_number
@@ -3270,6 +3433,7 @@ def build_ledger_view(source_df):
     sides = _safe_str("Side").str.upper()
     narrations = _safe_str("Narration")
     traders = _safe_str("Trader")
+    groupings = _safe_str("Grouping")
     qty_raw = pd.to_numeric(df.get("Quantity"), errors="coerce").fillna(0.0)
     price_raw = pd.to_numeric(df.get("Price"), errors="coerce").fillna(0.0)
 
@@ -3366,6 +3530,7 @@ def build_ledger_view(source_df):
         "Credit ZAR": credit_zar.values,
         "Balance ZAR": bal_zar.values,
         "Trader": traders.values,
+        "Grouping": groupings.values,
     })
 
     # Status
@@ -4613,6 +4778,96 @@ def _daily_trading_report_pct(value: Any, decimals: int = 2) -> str:
         return "--"
 
 
+def _daily_trading_report_build_transaction_summaries(run_date_iso: str) -> Dict[str, Any]:
+    run_date = str(run_date_iso or "").strip()
+    pmx_summary = {
+        "total_grams_booked_g": 0.0,
+        "total_dollar_flow_usd": 0.0,
+        "total_exposure_usd": 0.0,
+        "total_zar_flow": 0.0,
+    }
+    trademc_summary = {
+        "total_trade_volume_g": 0.0,
+        "total_dollar_flow_usd": 0.0,
+        "total_exposure_usd": 0.0,
+        "total_zar_flow": 0.0,
+    }
+
+    # PMX summary (day-only, gold + linked USDZAR via same trade number).
+    try:
+        pmx_df = load_all_pmx_trades({"start_date": run_date, "end_date": run_date})
+        if isinstance(pmx_df, pd.DataFrame) and not pmx_df.empty:
+            work = pmx_df.copy()
+            work["trade_num"] = work.get("OrderID", "").apply(normalize_trade_number) if "OrderID" in work.columns else ""
+            work["symbol"] = (
+                work.get("Symbol", "")
+                .astype(str)
+                .str.upper()
+                .str.replace("/", "", regex=False)
+                .str.replace("-", "", regex=False)
+                .str.strip()
+            )
+            work["qty_abs"] = pd.to_numeric(work.get("Quantity"), errors="coerce").fillna(0.0).abs()
+            work["price"] = pd.to_numeric(work.get("Price"), errors="coerce").fillna(0.0)
+            xau_all = work[work["symbol"] == "XAUUSD"]
+            fx_all = work[work["symbol"] == "USDZAR"]
+            grams = float((xau_all["qty_abs"] * GRAMS_PER_TROY_OUNCE).sum()) if not xau_all.empty else 0.0
+            xau_usd = float((xau_all["qty_abs"] * xau_all["price"]).sum()) if not xau_all.empty else 0.0
+            fx_usd_notional = float(fx_all["qty_abs"].sum()) if not fx_all.empty else 0.0
+            fx_zar_notional = float((fx_all["qty_abs"] * fx_all["price"]).sum()) if not fx_all.empty else 0.0
+            # Derive today's weighted USD/ZAR rate from PMX hedges; fall back to latest known rate.
+            fx_rate = (fx_zar_notional / fx_usd_notional) if fx_usd_notional > 1e-9 else 0.0
+            if fx_rate <= 0:
+                try:
+                    latest_fx = pmx_df[pmx_df.get("Symbol", "").astype(str).str.upper().str.replace("/", "", regex=False).str.replace("-", "", regex=False).str.strip() == "USDZAR"]
+                    if not latest_fx.empty:
+                        latest_price = pd.to_numeric(latest_fx.iloc[-1].get("Price"), errors="coerce")
+                        if pd.notna(latest_price) and float(latest_price) > 0:
+                            fx_rate = float(latest_price)
+                except Exception:
+                    fx_rate = 0.0
+            pmx_summary["total_grams_booked_g"] = grams
+            # Dollar flow reflects full XAU turnover so it does not collapse to the hedge leg.
+            pmx_summary["total_dollar_flow_usd"] = xau_usd
+            pmx_summary["total_exposure_usd"] = xau_usd
+            pmx_summary["total_zar_flow"] = xau_usd * fx_rate if fx_rate > 0 else fx_zar_notional
+    except Exception:
+        pass
+
+    # TradeMC summary (confirmed, day-only, absolute totals).
+    try:
+        tm_df = load_trademc_trades_with_companies(status="confirmed")
+        if isinstance(tm_df, pd.DataFrame) and not tm_df.empty:
+            work = tm_df.copy()
+            ts = pd.to_datetime(work.get("trade_timestamp"), errors="coerce")
+            day_mask = ts.dt.strftime("%Y-%m-%d").fillna("") == run_date
+            work = work[day_mask].copy()
+            if not work.empty:
+                weight_g = pd.to_numeric(work.get("weight"), errors="coerce").fillna(0.0)
+                weight_oz = weight_g / GRAMS_PER_TROY_OUNCE
+                fx_rate_col = "zar_to_usd_confirmed" if "zar_to_usd_confirmed" in work.columns else "zar_to_usd"
+                usd_rate_col = "usd_per_troy_ounce_confirmed" if "usd_per_troy_ounce_confirmed" in work.columns else ""
+                zar_rate_col = "zar_per_troy_ounce_confirmed" if "zar_per_troy_ounce_confirmed" in work.columns else "zar_per_troy_ounce"
+                fx_rate = pd.to_numeric(work.get(fx_rate_col), errors="coerce") if fx_rate_col else pd.Series([pd.NA] * len(work))
+                usd_rate = pd.to_numeric(work.get(usd_rate_col), errors="coerce") if usd_rate_col in work.columns else pd.Series([pd.NA] * len(work))
+                if usd_rate.isna().all() and zar_rate_col in work.columns and fx_rate_col:
+                    zar_rate = pd.to_numeric(work.get(zar_rate_col), errors="coerce")
+                    usd_rate = zar_rate / fx_rate
+                usd_value = (weight_oz * usd_rate).abs()
+                zar_value = (usd_value * fx_rate).abs()
+                trademc_summary["total_trade_volume_g"] = float(weight_g.abs().sum())
+                trademc_summary["total_dollar_flow_usd"] = float(usd_value.fillna(0.0).sum())
+                trademc_summary["total_exposure_usd"] = trademc_summary["total_dollar_flow_usd"]
+                trademc_summary["total_zar_flow"] = float(zar_value.fillna(0.0).sum())
+    except Exception:
+        pass
+
+    return {
+        "pmx": pmx_summary,
+        "trademc": trademc_summary,
+    }
+
+
 def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict[str, Any]:
     run_date = str(run_date_iso or datetime.now().strftime("%Y-%m-%d")).strip()
     dashboard_profit_min_date = "2026-03-01"
@@ -4866,10 +5121,260 @@ def _build_dashboard_summary_payload(run_date_iso: Optional[str] = None) -> Dict
     }
 
 
+_DAILY_TRADING_AI_AUDIT_PROMPT_PATH = os.path.join(_SERVER_DIR, "prompts", "daily_trading_ai_audit_prompt.md")
+_DAILY_TRADING_AI_AUDIT_MODEL = str(
+    os.getenv("DAILY_TRADING_AI_AUDIT_MODEL", "claude-sonnet-4-5-20250929") or "claude-sonnet-4-5-20250929"
+).strip() or "claude-sonnet-4-5-20250929"
+try:
+    _DAILY_TRADING_AI_AUDIT_MAX_TOKENS = max(
+        512, int(os.getenv("DAILY_TRADING_AI_AUDIT_MAX_TOKENS", "2000") or 2000)
+    )
+except Exception:
+    _DAILY_TRADING_AI_AUDIT_MAX_TOKENS = 2000
+try:
+    _DAILY_TRADING_AI_AUDIT_TIMEOUT = max(
+        15, int(os.getenv("DAILY_TRADING_AI_AUDIT_TIMEOUT_SECONDS", "60") or 60)
+    )
+except Exception:
+    _DAILY_TRADING_AI_AUDIT_TIMEOUT = 60
+_DAILY_TRADING_AI_AUDIT_ENABLED = str(
+    os.getenv("DAILY_TRADING_AI_AUDIT_ENABLED", "true") or "true"
+).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _daily_trading_ai_audit_context(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact, AI-friendly view of the daily report payload.
+
+    Keeps every number Anthropic needs to comment on desk activity, hedging,
+    exposure, PMX vs TradeMC reconciliation and anomalies, while dropping
+    fields that are only useful for the HTML renderer (plot rows, etc).
+    """
+    pmx_tx = dict(payload.get("pmx_transaction_summary") or {})
+    tm_tx = dict(payload.get("trademc_transaction_summary") or {})
+
+    def _f(value: Any) -> float:
+        try:
+            out = float(value)
+            return out if math.isfinite(out) else 0.0
+        except Exception:
+            return 0.0
+
+    def _pct_diff(a: float, b: float) -> Optional[float]:
+        denom = max(abs(a), abs(b))
+        if denom <= 1e-9:
+            return None
+        return round(((a - b) / denom) * 100.0, 2)
+
+    pmx_grams = _f(pmx_tx.get("total_grams_booked_g"))
+    tm_grams = _f(tm_tx.get("total_trade_volume_g"))
+    pmx_usd = _f(pmx_tx.get("total_dollar_flow_usd"))
+    tm_usd = _f(tm_tx.get("total_dollar_flow_usd"))
+    pmx_zar = _f(pmx_tx.get("total_zar_flow"))
+    tm_zar = _f(tm_tx.get("total_zar_flow"))
+
+    reconciliation = {
+        "grams_pmx_minus_tm_g": round(pmx_grams - tm_grams, 3),
+        "grams_pct_diff": _pct_diff(pmx_grams, tm_grams),
+        "usd_pmx_minus_tm": round(pmx_usd - tm_usd, 2),
+        "usd_pct_diff": _pct_diff(pmx_usd, tm_usd),
+        "zar_pmx_minus_tm": round(pmx_zar - tm_zar, 2),
+        "zar_pct_diff": _pct_diff(pmx_zar, tm_zar),
+    }
+
+    total_g_for_coverage = _f(payload.get("covered_g")) + _f(payload.get("total_grams_to_hedge"))
+    coverage_pct: Optional[float] = None
+    if total_g_for_coverage > 1e-9:
+        coverage_pct = round((_f(payload.get("covered_g")) / total_g_for_coverage) * 100.0, 2)
+
+    open_rows_raw = list(payload.get("open_positions_rows") or [])
+    open_rows = open_rows_raw[:25]
+    pending_rows_raw = list(payload.get("pending_limit_orders") or [])
+    pending_rows = pending_rows_raw[:25]
+
+    return {
+        "date": str(payload.get("date") or ""),
+        "daily_profit_zar": _f(payload.get("daily_profit")),
+        "daily_trades": int(payload.get("daily_trades") or 0),
+        "daily_profit_per_g_zar": _f(payload.get("daily_profit_per_g")),
+        "daily_profit_pct": _f(payload.get("daily_profit_pct")),
+        "month_to_date_profit_zar": _f(payload.get("month_to_date_profit")),
+        "month_to_date_trades": int(payload.get("month_to_date_trades") or 0),
+        "month_to_date_profit_per_g_zar": _f(payload.get("month_to_date_profit_per_g")),
+        "total_profit_all_zar": _f(payload.get("total_profit_all")),
+        "total_trades_all": int(payload.get("total_trades_all") or 0),
+        "overall_profit_pct": _f(payload.get("overall_profit_pct")),
+        "hedging": {
+            "hedged_rows": int(payload.get("hedged_rows") or 0),
+            "unhedged_rows": int(payload.get("unhedged_rows") or 0),
+            "covered_g": _f(payload.get("covered_g")),
+            "total_grams_to_hedge_g": _f(payload.get("total_grams_to_hedge")),
+            "coverage_pct": coverage_pct,
+        },
+        "open_positions": {
+            "unallocated_pnl_zar": _f(payload.get("open_positions_pnl")),
+            "unallocated_trades": int(payload.get("open_positions_trades") or 0),
+            "materially_open_rows_count": int(payload.get("open_positions_rows_count") or 0),
+            "materially_open_total_g": _f(payload.get("open_positions_total_g")),
+            "materially_open_total_usd": _f(payload.get("open_positions_total_usd")),
+            "rows_truncated": len(open_rows_raw) > len(open_rows),
+            "rows": open_rows,
+        },
+        "pmx_transaction_summary": {
+            "total_grams_booked_g": pmx_grams,
+            "total_dollar_flow_usd": pmx_usd,
+            "total_exposure_usd": _f(pmx_tx.get("total_exposure_usd")),
+            "total_zar_flow": pmx_zar,
+        },
+        "trademc_transaction_summary": {
+            "total_trade_volume_g": tm_grams,
+            "total_dollar_flow_usd": tm_usd,
+            "total_exposure_usd": _f(tm_tx.get("total_exposure_usd")),
+            "total_zar_flow": tm_zar,
+        },
+        "pmx_vs_trademc": reconciliation,
+        "pending_limit_orders": {
+            "count": len(pending_rows_raw),
+            "ok": bool(payload.get("pending_limit_orders_ok")),
+            "error": str(payload.get("pending_limit_orders_error") or ""),
+            "rows_truncated": len(pending_rows_raw) > len(pending_rows),
+            "rows": pending_rows,
+        },
+    }
+
+
+def _daily_trading_ai_audit_load_prompt() -> str:
+    try:
+        with open(_DAILY_TRADING_AI_AUDIT_PROMPT_PATH, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except Exception:
+        return (
+            "You are the daily auditor for a bullion and FX trading desk. "
+            "Produce a concise HTML fragment (no <html>/<head>/<body>/<style> tags, "
+            "inline CSS only) with six sections: Desk Activity, Hedging, Exposure, "
+            "PMX vs TradeMC, Risks, Overall Assessment. "
+            "Use only facts in the JSON.\n\n"
+            "Run date: {{RUN_DATE}}\nReport data JSON:\n{{REPORT_JSON}}"
+        )
+
+
+def _daily_trading_ai_audit_fallback_html(reason: str) -> str:
+    note = _daily_trading_report_html_escape(reason or "AI audit unavailable")
+    return (
+        "<div style=\"border:1px solid #d6d0c0;border-radius:10px;background:#fbf7ec;"
+        "padding:10px 12px;margin-top:10px;font-family:Segoe UI,Arial,sans-serif;"
+        "color:#5a4a1a;font-size:13px;line-height:1.5;\">"
+        "<div style=\"font-weight:800;font-size:14px;margin-bottom:2px;color:#5a4a1a;\">Daily AI Audit</div>"
+        f"<div style=\"font-size:12px;color:#6f5a1f;\">Not generated for this run: {note}. "
+        "Hard numbers elsewhere in this email remain authoritative.</div>"
+        "</div>"
+    )
+
+
+_AI_AUDIT_STRIP_FENCE_RE = re.compile(r"^\s*```(?:html)?\s*|\s*```\s*$", re.IGNORECASE)
+
+
+def _daily_trading_ai_audit_clean_html(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    # Strip accidental markdown code fences the model may wrap around the HTML.
+    raw = _AI_AUDIT_STRIP_FENCE_RE.sub("", raw).strip()
+    # Remove a stray DOCTYPE / html / head / body / style wrappers if the model
+    # ignored the fragment-only rule. Keep the inner content.
+    for pat in (
+        r"<!doctype[^>]*>",
+        r"</?html[^>]*>",
+        r"</?head[^>]*>",
+        r"</?body[^>]*>",
+        r"<style[\s\S]*?</style>",
+        r"<script[\s\S]*?</script>",
+    ):
+        raw = re.sub(pat, "", raw, flags=re.IGNORECASE).strip()
+    return raw
+
+
+def _daily_trading_ai_audit_call_anthropic(
+    prompt: str, run_date: str, context_json: str
+) -> Tuple[bool, str, str]:
+    api_key = str(os.getenv("ANTHROPIC_API_KEY", "") or "").strip()
+    if not api_key:
+        return False, "", "ANTHROPIC_API_KEY not configured"
+
+    filled = prompt.replace("{{RUN_DATE}}", run_date).replace("{{REPORT_JSON}}", context_json)
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": _DAILY_TRADING_AI_AUDIT_MODEL,
+        "max_tokens": _DAILY_TRADING_AI_AUDIT_MAX_TOKENS,
+        "messages": [{"role": "user", "content": filled}],
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=_DAILY_TRADING_AI_AUDIT_TIMEOUT)
+    except Exception as exc:
+        return False, "", f"Anthropic request failed: {exc}"
+    if resp.status_code != 200:
+        snippet = (resp.text or "")[:300].replace("\n", " ")
+        return False, "", f"Anthropic HTTP {resp.status_code}: {snippet}"
+    try:
+        data = resp.json()
+    except Exception as exc:
+        return False, "", f"Anthropic response not JSON: {exc}"
+    content = data.get("content") or []
+    text_parts: List[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text_parts.append(str(block.get("text") or ""))
+    text = "".join(text_parts).strip()
+    if not text:
+        return False, "", "Anthropic returned empty content"
+    cleaned = _daily_trading_ai_audit_clean_html(text)
+    if "<" not in cleaned or ">" not in cleaned:
+        return False, "", "Anthropic output was not HTML"
+    return True, cleaned, ""
+
+
+def _daily_trading_report_generate_ai_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate the AI audit section. Returns {ok, html, error, context}."""
+    run_date = str(payload.get("date") or datetime.now().strftime("%Y-%m-%d")).strip()
+    if not _DAILY_TRADING_AI_AUDIT_ENABLED:
+        return {
+            "ok": False,
+            "html": _daily_trading_ai_audit_fallback_html("Disabled via DAILY_TRADING_AI_AUDIT_ENABLED"),
+            "error": "AI audit disabled by config",
+        }
+    try:
+        context = _daily_trading_ai_audit_context(payload)
+        context_json = json.dumps(context, ensure_ascii=False, indent=2, default=str)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "html": _daily_trading_ai_audit_fallback_html(f"Context build failed: {exc}"),
+            "error": f"Context build failed: {exc}",
+        }
+    prompt = _daily_trading_ai_audit_load_prompt()
+    ok, html_fragment, err = _daily_trading_ai_audit_call_anthropic(prompt, run_date, context_json)
+    if not ok:
+        print(f"[AI-AUDIT] Failed for {run_date}: {err}")
+        return {
+            "ok": False,
+            "html": _daily_trading_ai_audit_fallback_html(err or "AI audit failed"),
+            "error": err,
+        }
+    return {"ok": True, "html": html_fragment, "error": "", "model": _DAILY_TRADING_AI_AUDIT_MODEL}
+
+
 def _daily_trading_report_build_payload(run_date_iso: Optional[str] = None) -> Dict[str, Any]:
     dash = _build_dashboard_summary_payload(run_date_iso)
     run_date = str(dash.get("run_date") or (run_date_iso or datetime.now().strftime("%Y-%m-%d"))).strip()
     pending_orders = _daily_trading_report_fetch_pending_limit_orders(run_date)
+    tx_summary = _daily_trading_report_build_transaction_summaries(run_date)
+    hedging_rows = build_hedging_comparison(source="pmx") or []
+    if not isinstance(hedging_rows, list):
+        hedging_rows = []
 
     reval = build_open_positions_reval({}, None) or {}
     reval_summary = reval.get("summary", {}) if isinstance(reval, dict) else {}
@@ -4877,6 +5382,46 @@ def _daily_trading_report_build_payload(run_date_iso: Optional[str] = None) -> D
         reval_summary = {}
     open_trades = int(reval_summary.get("open_trades") or 0)
     open_positions_pnl = float(reval_summary.get("total_pnl_zar") or 0.0)
+
+    open_positions_rows: List[Dict[str, Any]] = []
+    for row in hedging_rows:
+        if not isinstance(row, dict):
+            continue
+        trade_num = normalize_trade_number(row.get("trade_num"))
+        if not trade_num:
+            continue
+        try:
+            hedge_need_g = float(row.get("hedge_need_g") or 0.0)
+        except Exception:
+            hedge_need_g = 0.0
+        try:
+            pmx_net_usd = float(row.get("pmx_net_usd") or 0.0)
+        except Exception:
+            pmx_net_usd = 0.0
+        metal_open_g = abs(hedge_need_g)
+        usd_open = abs(pmx_net_usd)
+        # Report only materially open allocated positions.
+        # Keep rows when either the metal leg or the USD leg is materially open.
+        if metal_open_g <= 32.0 and usd_open <= 1.0:
+            continue
+        metal_leg = ""
+        if metal_open_g > 0.005:
+            metal_leg = f"Metal to {'BUY' if hedge_need_g > 0 else 'SELL'}"
+        usd_leg = ""
+        if usd_open > 1.0:
+            usd_leg = f"USD to {'SELL' if pmx_net_usd > 0 else 'BUY'}"
+        open_positions_rows.append(
+            {
+                "trade_num": trade_num,
+                "metal_open_g": round(metal_open_g, 2),
+                "usd_open": round(usd_open, 2),
+                "metal_leg": metal_leg,
+                "usd_leg": usd_leg,
+            }
+        )
+    open_positions_rows = sorted(open_positions_rows, key=lambda r: str(r.get("trade_num") or ""))
+    open_positions_total_g = round(sum(float(r.get("metal_open_g") or 0.0) for r in open_positions_rows), 2)
+    open_positions_total_usd = round(sum(float(r.get("usd_open") or 0.0) for r in open_positions_rows), 2)
 
     return {
         "date": run_date,
@@ -4903,6 +5448,12 @@ def _daily_trading_report_build_payload(run_date_iso: Optional[str] = None) -> D
         "pending_limit_orders": list(pending_orders.get("rows") or []),
         "pending_limit_orders_ok": bool(pending_orders.get("ok")),
         "pending_limit_orders_error": str(pending_orders.get("error") or ""),
+        "pmx_transaction_summary": dict(tx_summary.get("pmx") or {}),
+        "trademc_transaction_summary": dict(tx_summary.get("trademc") or {}),
+        "open_positions_rows": open_positions_rows,
+        "open_positions_rows_count": len(open_positions_rows),
+        "open_positions_total_g": open_positions_total_g,
+        "open_positions_total_usd": open_positions_total_usd,
     }
 
 
@@ -5090,6 +5641,11 @@ def _daily_trading_report_payload_debug_summary(payload: Dict[str, Any]) -> Dict
         "pending_limit_orders_count": len(list(payload.get("pending_limit_orders") or [])),
         "pending_limit_orders_ok": bool(payload.get("pending_limit_orders_ok")),
         "pending_limit_orders_error": str(payload.get("pending_limit_orders_error") or ""),
+        "pmx_transaction_summary": dict(payload.get("pmx_transaction_summary") or {}),
+        "trademc_transaction_summary": dict(payload.get("trademc_transaction_summary") or {}),
+        "open_positions_rows_count": int(payload.get("open_positions_rows_count") or 0),
+        "open_positions_total_g": float(payload.get("open_positions_total_g") or 0.0),
+        "open_positions_total_usd": float(payload.get("open_positions_total_usd") or 0.0),
     }
 
 
@@ -5145,6 +5701,33 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
             )
         return "".join(out)
 
+    def _open_positions_rows(rows: List[Dict[str, Any]]) -> str:
+        if not rows:
+            return (
+                "<tr>"
+                "<td colspan='5' style='padding:10px 8px;color:#738095;font-size:13px;'>"
+                "No open positions."
+                "</td>"
+                "</tr>"
+            )
+        out = []
+        for row in rows:
+            trade_num = _daily_trading_report_html_escape(row.get("trade_num", ""))
+            metal_open_g = _daily_trading_report_num(row.get("metal_open_g"), 2)
+            usd_open = _daily_trading_report_num(row.get("usd_open"), 2)
+            metal_leg = _daily_trading_report_html_escape(row.get("metal_leg", ""))
+            usd_leg = _daily_trading_report_html_escape(row.get("usd_leg", ""))
+            out.append(
+                "<tr>"
+                f"<td style='padding:8px;border-top:1px solid #e1e7f0;color:#1f2a3d;font-size:12px;font-weight:700;vertical-align:top;white-space:nowrap;'>{trade_num}</td>"
+                f"<td style='padding:8px;border-top:1px solid #e1e7f0;color:#1f2b3c;font-size:12px;vertical-align:top;text-align:right;'>{metal_open_g} g</td>"
+                f"<td style='padding:8px;border-top:1px solid #e1e7f0;color:#1f2b3c;font-size:12px;vertical-align:top;text-align:right;'>{usd_open}</td>"
+                f"<td style='padding:8px;border-top:1px solid #e1e7f0;color:#34445d;font-size:12px;vertical-align:top;'>{metal_leg}</td>"
+                f"<td style='padding:8px;border-top:1px solid #e1e7f0;color:#34445d;font-size:12px;vertical-align:top;'>{usd_leg}</td>"
+                "</tr>"
+            )
+        return "".join(out)
+
     date_txt = _daily_trading_report_html_escape(payload.get("date", ""))
     subtitle = _daily_trading_report_html_escape(payload.get("subtitle", ""))
     source = _daily_trading_report_html_escape(payload.get("source", ""))
@@ -5165,6 +5748,9 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
         "g",
     )
     pending_orders_rows_html = _pending_orders_rows(list(payload.get("pending_limit_orders") or []))
+    open_positions_rows_html = _open_positions_rows(list(payload.get("open_positions_rows") or []))
+    pmx_tx = dict(payload.get("pmx_transaction_summary") or {})
+    tm_tx = dict(payload.get("trademc_transaction_summary") or {})
     pending_orders_error = str(payload.get("pending_limit_orders_error") or "").strip()
     pending_orders_count = len(list(payload.get("pending_limit_orders") or []))
 
@@ -5208,14 +5794,20 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
         </div></td>
       </tr><tr>
         <td width="50%" style="padding:4px;"><div style="border:1px solid #9db2e5;background:#edf2fc;border-radius:10px;padding:10px;">
-          <div class="kpi-title" style="font-size:20px;color:#2753bc;font-weight:700;">Open Positions Reval</div>
+          <div class="kpi-title" style="font-size:20px;color:#2753bc;font-weight:700;">Unallocated Trades Revaluation</div>
           <div class="kpi-value" style="font-size:50px;line-height:1.05;color:#2753bc;font-weight:800;">{_daily_trading_report_money(payload.get("open_positions_pnl"), "R", 2)}</div>
-          <div class="kpi-sub" style="font-size:22px;color:#2753bc;">Open trades: {int(payload.get("open_positions_trades") or 0)} | Overall Profit %: {_daily_trading_report_pct(payload.get("overall_profit_pct"), 2)}</div>
+          <div class="kpi-sub" style="font-size:22px;color:#2753bc;">Unallocated trades: {int(payload.get("open_positions_trades") or 0)} | Overall Profit %: {_daily_trading_report_pct(payload.get("overall_profit_pct"), 2)}</div>
         </div></td>
         <td width="50%" style="padding:4px;"><div style="border:1px solid #e7bea6;background:#fcf3eb;border-radius:10px;padding:10px;">
           <div class="kpi-title" style="font-size:20px;color:#a74917;font-weight:700;">Total Grams To Hedge</div>
           <div class="kpi-value" style="font-size:50px;line-height:1.05;color:#c01e1e;font-weight:800;">{_daily_trading_report_num(payload.get("total_grams_to_hedge"), 2)}g</div>
           <div class="kpi-sub" style="font-size:22px;color:#a74917;">Hedged rows: {int(payload.get("hedged_rows") or 0)} | Unhedged rows: {int(payload.get("unhedged_rows") or 0)}</div>
+        </div></td>
+      </tr><tr>
+        <td colspan="2" style="padding:4px;"><div style="border:1px solid #9cc9d8;background:#eaf7fb;border-radius:10px;padding:10px;">
+          <div class="kpi-title" style="font-size:20px;color:#1a566b;font-weight:700;">Open Positions Totals</div>
+          <div class="kpi-value" style="font-size:44px;line-height:1.05;color:#1a566b;font-weight:800;">{_daily_trading_report_num(payload.get("open_positions_total_g"), 2)}g <span style="color:#3d7a8e;">|</span> USD {_daily_trading_report_num(payload.get("open_positions_total_usd"), 2)}</div>
+          <div class="kpi-sub" style="font-size:20px;color:#1a566b;">Open lines: {int(payload.get("open_positions_rows_count") or 0)}</div>
         </div></td>
       </tr></table>
 
@@ -5225,6 +5817,8 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
         <li>Total cumulative profit stands at {_daily_trading_report_money(payload.get("total_profit_all"), "R", 2)} across {int(payload.get("total_trades_all") or 0)} trades.</li>
         <li>Hedge coverage tracks {int(payload.get("hedged_rows") or 0)} hedged rows with {_daily_trading_report_num(payload.get("total_grams_to_hedge"), 2)}g remaining to hedge.</li>
       </ul>
+
+      {str(payload.get("ai_audit_html") or "")}
 
       <div style="margin-top:10px;border-left:4px solid #8a5a16;background:#fdf4e8;padding:8px 10px;font-size:15px;font-weight:700;color:#7a4a10;">Pending Limit Orders (PMX Activity Log)</div>
       <div style="padding:8px 2px 4px;color:#1f2b3c;font-size:14px;">ONG orders found for {date_txt}: <strong>{pending_orders_count}</strong></div>
@@ -5238,7 +5832,41 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
         {pending_orders_rows_html}
       </table>
 
-      <div style="margin-top:8px;border-left:4px solid #5f8f28;background:#eef6df;padding:8px 10px;font-size:15px;font-weight:700;color:#4a6b1f;">Monthly Profit Plot (ZAR)</div>
+      <div style="margin-top:10px;border-left:4px solid #1f6f8b;background:#eaf7fb;padding:8px 10px;font-size:15px;font-weight:700;color:#1a566b;">Open Positions</div>
+      <div style="padding:8px 2px 4px;color:#1f2b3c;font-size:14px;">Open lines: <strong>{int(payload.get("open_positions_rows_count") or 0)}</strong> | Open grams: <strong>{_daily_trading_report_num(payload.get("open_positions_total_g"), 2)} g</strong> | Open USD: <strong>{_daily_trading_report_num(payload.get("open_positions_total_usd"), 2)}</strong></div>
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:4px;border:1px solid #e1e7f0;border-radius:8px;overflow:hidden;">
+        <tr style="background:#f7f9fc;">
+          <td style="padding:8px;color:#51627c;font-size:12px;font-weight:700;">Trade #</td>
+          <td style="padding:8px;color:#51627c;font-size:12px;font-weight:700;text-align:right;">Open Grams</td>
+          <td style="padding:8px;color:#51627c;font-size:12px;font-weight:700;text-align:right;">Open USD</td>
+          <td style="padding:8px;color:#51627c;font-size:12px;font-weight:700;">Metal Leg</td>
+          <td style="padding:8px;color:#51627c;font-size:12px;font-weight:700;">USD Leg</td>
+        </tr>
+        {open_positions_rows_html}
+      </table>
+
+      <div style="margin-top:10px;border-left:4px solid #5b6d8f;background:#eef2f7;padding:8px 10px;font-size:15px;font-weight:700;color:#314766;">PMX Transaction Summary</div>
+      <div style="padding:2px 2px 8px;color:#4b5d77;font-size:12px;">Absolute day totals from the All Deals dataset for {date_txt}.</div>
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#fff;border:1px solid #d7dee8;margin-top:2px;">
+        <tr><td style="padding:9px 10px;border-top:1px solid #e1e7f0;color:#334760;font-size:13px;font-weight:700;">Total Grams Booked (PMX)</td><td style="padding:9px 10px;border-top:1px solid #e1e7f0;text-align:right;color:#1f2a3d;font-size:14px;font-weight:800;">{_daily_trading_report_num(pmx_tx.get("total_grams_booked_g"), 2)}g</td></tr>
+        <tr><td style="padding:9px 10px;border-top:1px solid #e1e7f0;color:#334760;font-size:13px;font-weight:700;">Total Dollar Flow (USD)</td><td style="padding:9px 10px;border-top:1px solid #e1e7f0;text-align:right;color:#1f2a3d;font-size:14px;font-weight:800;">USD {_daily_trading_report_num(pmx_tx.get("total_dollar_flow_usd"), 2)}</td></tr>
+        <tr><td style="padding:9px 10px;border-top:1px solid #e1e7f0;color:#334760;font-size:13px;font-weight:700;">Total Exposure Taken Today</td><td style="padding:9px 10px;border-top:1px solid #e1e7f0;text-align:right;color:#1f2a3d;font-size:14px;font-weight:800;">USD {_daily_trading_report_num(pmx_tx.get("total_exposure_usd"), 2)}</td></tr>
+        <tr><td style="padding:9px 10px;border-top:1px solid #e1e7f0;color:#334760;font-size:13px;font-weight:700;">Total ZAR Flow</td><td style="padding:9px 10px;border-top:1px solid #e1e7f0;text-align:right;color:#1f2a3d;font-size:14px;font-weight:800;">R{_daily_trading_report_num(pmx_tx.get("total_zar_flow"), 2)}</td></tr>
+      </table>
+
+      <div style="margin-top:10px;border-left:4px solid #2d6a4f;background:#eef7f0;padding:8px 10px;font-size:15px;font-weight:700;color:#24543f;">TradeMC Transaction Summary</div>
+      <div style="padding:2px 2px 8px;color:#4b5d77;font-size:12px;">Confirmed trades for {date_txt}, aggregated as absolute totals only.</div>
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#fff;border:1px solid #d7dee8;margin-top:2px;">
+        <tr><td style="padding:9px 10px;border-top:1px solid #e1e7f0;color:#334760;font-size:13px;font-weight:700;">Total Trade Volume</td><td style="padding:9px 10px;border-top:1px solid #e1e7f0;text-align:right;color:#1f2a3d;font-size:14px;font-weight:800;">{_daily_trading_report_num(tm_tx.get("total_trade_volume_g"), 2)}g</td></tr>
+        <tr><td style="padding:9px 10px;border-top:1px solid #e1e7f0;color:#334760;font-size:13px;font-weight:700;">Total Dollar Flow (USD)</td><td style="padding:9px 10px;border-top:1px solid #e1e7f0;text-align:right;color:#1f2a3d;font-size:14px;font-weight:800;">USD {_daily_trading_report_num(tm_tx.get("total_dollar_flow_usd"), 2)}</td></tr>
+        <tr><td style="padding:9px 10px;border-top:1px solid #e1e7f0;color:#334760;font-size:13px;font-weight:700;">Total Exposure</td><td style="padding:9px 10px;border-top:1px solid #e1e7f0;text-align:right;color:#1f2a3d;font-size:14px;font-weight:800;">USD {_daily_trading_report_num(tm_tx.get("total_exposure_usd"), 2)}</td></tr>
+        <tr><td style="padding:9px 10px;border-top:1px solid #e1e7f0;color:#334760;font-size:13px;font-weight:700;">Total ZAR Flow</td><td style="padding:9px 10px;border-top:1px solid #e1e7f0;text-align:right;color:#1f2a3d;font-size:14px;font-weight:800;">R{_daily_trading_report_num(tm_tx.get("total_zar_flow"), 2)}</td></tr>
+      </table>
+
+      <div style="margin-top:10px;border-left:4px solid #cc4f86;background:#fdeff6;padding:8px 10px;font-size:15px;font-weight:700;color:#a42f64;">Unallocated Trades Revaluation Detail</div>
+      <div style="padding:8px 2px;color:#1f2b3c;font-size:14px;">Unallocated Trades: {int(payload.get("open_positions_trades") or 0)} | Total P&amp;L: <strong>{_daily_trading_report_money(payload.get("open_positions_pnl"), "R", 2)}</strong></div>
+
+      <div style="margin-top:10px;border-left:4px solid #5f8f28;background:#eef6df;padding:8px 10px;font-size:15px;font-weight:700;color:#4a6b1f;">Monthly Profit Plot (ZAR)</div>
       <table class="plot-table" role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:6px;table-layout:fixed;">{month_rows_html}</table>
 
       <div style="margin-top:10px;border-left:4px solid #2f68b2;background:#e8f2ff;padding:8px 10px;font-size:15px;font-weight:700;color:#21508d;">Daily Profit Plot (ZAR)</div>
@@ -5248,9 +5876,7 @@ def _daily_trading_report_render_html(payload: Dict[str, Any]) -> str:
       <table class="plot-table" role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:6px;table-layout:fixed;">{hedge_rows_html}</table>
       <div style="color:#364860;font-size:12px;margin-top:6px;">Rows: Hedged {int(payload.get("hedged_rows") or 0)} | Unhedged {int(payload.get("unhedged_rows") or 0)} | To hedge {_daily_trading_report_num(payload.get("total_grams_to_hedge"), 2)}g</div>
 
-      <div style="margin-top:10px;border-left:4px solid #cc4f86;background:#fdeff6;padding:8px 10px;font-size:15px;font-weight:700;color:#a42f64;">Open Positions Revaluation Detail</div>
-      <div style="padding:8px 2px;color:#1f2b3c;font-size:14px;">Open Trades: {int(payload.get("open_positions_trades") or 0)} | Total P&amp;L: <strong>{_daily_trading_report_money(payload.get("open_positions_pnl"), "R", 2)}</strong></div>
-      <div style="padding-top:8px;border-top:1px solid #d4dce8;color:#6d7d95;font-size:11px;">Auto-generated for mobile and desktop viewing.</div>
+      <div style="padding-top:8px;border-top:1px solid #d4dce8;color:#6d7d95;font-size:11px;margin-top:10px;">Auto-generated for mobile and desktop viewing.</div>
     </td></tr>
   </table>
 </td></tr></table></body></html>"""
@@ -5326,6 +5952,22 @@ def _daily_trading_report_run_once_for_date(
     run_date_iso: str,
     recipients_override: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    # Pull the latest PMX trades for the report date so grams/exposure reflect
+    # trades executed after the last auto-sync.
+    pmx_sync_note = ""
+    try:
+        sync_result = sync_pmx_trades_to_db(
+            {"start_date": run_date_iso, "end_date": run_date_iso},
+            {},
+        )
+        inserted = int(sync_result.get("inserted", 0) or 0)
+        updated = int(sync_result.get("updated", 0) or 0)
+        pmx_sync_note = f"PMX sync ok (inserted={inserted}, updated={updated})"
+        print(f"[SCHED] Daily Trading Report pre-send PMX sync for {run_date_iso}: {pmx_sync_note}")
+    except Exception as exc:
+        pmx_sync_note = f"PMX sync failed: {exc}"
+        print(f"[SCHED] Daily Trading Report pre-send PMX sync error for {run_date_iso}: {exc}")
+
     try:
         # Use current dashboard-ready data/cache; avoid forced TradeMC sync here.
         try:
@@ -5333,11 +5975,22 @@ def _daily_trading_report_run_once_for_date(
         except Exception:
             pass
         payload = _daily_trading_report_build_payload(run_date_iso)
+        ai_audit = _daily_trading_report_generate_ai_audit(payload)
+        payload["ai_audit_html"] = str(ai_audit.get("html") or "")
+        payload["ai_audit_ok"] = bool(ai_audit.get("ok"))
+        payload["ai_audit_error"] = str(ai_audit.get("error") or "")
+        payload["ai_audit_model"] = str(ai_audit.get("model") or "")
         html_body = _daily_trading_report_render_html(payload)
     except Exception as exc:
-        return {"ok": False, "error": f"Failed to build report payload: {exc}"}
+        return {"ok": False, "error": f"Failed to build report payload: {exc}", "pmx_sync": pmx_sync_note}
     result = _daily_trading_report_send_html(run_date_iso, html_body, recipients_override=recipients_override)
     result["payload_debug"] = _daily_trading_report_payload_debug_summary(payload)
+    result["pmx_sync"] = pmx_sync_note
+    result["ai_audit"] = {
+        "ok": bool(ai_audit.get("ok")),
+        "error": str(ai_audit.get("error") or ""),
+        "model": str(ai_audit.get("model") or ""),
+    }
     return result
 
 
@@ -9799,15 +10452,21 @@ def backup_trades_endpoint():
 def update_trade_number(trade_id):
     data = request.json or {}
     new_trade_num = normalize_trade_number(data.get("trade_number", ""))
+    override_validation = bool(data.get("override_validation") or data.get("force"))
     try:
         trade_symbol = _fetch_trade_symbol_for_validation(trade_id, use_pmx=False) or ""
-        is_valid, validation_msg = _validate_integer_trade_number_recent_trademc(
-            new_trade_num,
-            trade_symbol,
-            days=7,
-        )
-        if not is_valid:
-            return jsonify({"ok": False, "error": validation_msg}), 400
+        if new_trade_num and not override_validation:
+            should_warn, warning_msg = _pmx_trade_number_trademc_warning(
+                new_trade_num, trade_symbol, days=7,
+            )
+            if should_warn:
+                return jsonify({
+                    "ok": False,
+                    "requires_confirmation": True,
+                    "warning": warning_msg,
+                    "trade_id": trade_id,
+                    "trade_number": new_trade_num,
+                }), 409
         updated = update_trade_order_id(trade_id, new_trade_num)
         if not updated:
             return jsonify({"ok": False, "error": f"Trade ID {trade_id} not found"}), 404
@@ -9857,9 +10516,23 @@ def _apply_ledger_filters(ledger: pd.DataFrame, args) -> pd.DataFrame:
 
 @app.route("/api/pmx/sync-ledger", methods=["POST"])
 def sync_pmx_ledger():
+    global _pmx_last_sync_epoch
     data = request.json or {}
+    force_sync = _pmx_bool(data.get("force"), default=False)
+    if not force_sync:
+        now_epoch = time.time()
+        elapsed = max(0.0, now_epoch - float(_pmx_last_sync_epoch or 0.0))
+        if elapsed < float(PMX_SYNC_MIN_INTERVAL_SECONDS):
+            remaining = int(max(1, round(float(PMX_SYNC_MIN_INTERVAL_SECONDS) - elapsed)))
+            return jsonify({
+                "ok": True,
+                "status": "throttled",
+                "message": f"PMX sync throttled. Retry in ~{remaining}s.",
+                "retry_in_seconds": remaining,
+            }), 202
     result = sync_pmx_trades_to_db(data, request.headers)
     if bool(result.get("ok")):
+        _pmx_last_sync_epoch = time.time()
         _clear_heavy_route_cache(["hedging:", "pmx_open_positions_reval", "pmx_forward_exposure", "profit_monthly"])
         result["clean_pipeline"] = _trigger_clean_pipeline("pmx_sync", wait=False)
     status_code = 200 if result.get("ok") else 400
@@ -9870,19 +10543,44 @@ def sync_pmx_ledger():
 def update_pmx_trade_number(trade_id):
     data = request.json or {}
     new_trade_num = normalize_trade_number(data.get("trade_number", ""))
+    override_validation = bool(data.get("override_validation") or data.get("force"))
     try:
         trade_symbol = _fetch_trade_symbol_for_validation(trade_id, use_pmx=True) or ""
-        is_valid, validation_msg = _validate_integer_trade_number_recent_trademc(
-            new_trade_num,
-            trade_symbol,
-            days=7,
-        )
-        if not is_valid:
-            return jsonify({"ok": False, "error": validation_msg}), 400
+        # Soft warning: the trade number has no recently-created TradeMC
+        # booking. Surface it as HTTP 409 so the client can prompt the user.
+        # Skipped entirely when override_validation=true (user already accepted).
+        if new_trade_num and not override_validation:
+            should_warn, warning_msg = _pmx_trade_number_trademc_warning(
+                new_trade_num, trade_symbol, days=7,
+            )
+            if should_warn:
+                return jsonify({
+                    "ok": False,
+                    "requires_confirmation": True,
+                    "warning": warning_msg,
+                    "trade_id": trade_id,
+                    "trade_number": new_trade_num,
+                }), 409
         updated = update_pmx_trade_order_id(trade_id, new_trade_num)
         if not updated:
             return jsonify({"ok": False, "error": f"PMX trade ID {trade_id} not found"}), 404
         return jsonify({"ok": True, "trade_id": trade_id, "trade_number": new_trade_num})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/pmx/trades/<int:trade_id>/grouping", methods=["PUT"])
+def update_pmx_trade_grouping_route(trade_id):
+    data = request.json or {}
+    try:
+        grouping_value = _normalize_pmx_grouping(data.get("grouping"))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    try:
+        updated = update_pmx_trade_grouping(trade_id, grouping_value)
+        if not updated:
+            return jsonify({"ok": False, "error": f"PMX trade ID {trade_id} not found"}), 404
+        return jsonify({"ok": True, "trade_id": trade_id, "grouping": grouping_value or ""})
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -10566,7 +11264,13 @@ def get_pmx_ledger_full_csv():
 def get_pmx_reconciliation():
     """Return PMX statement reconciliation data as JSON for the XAU Reconciliation tab."""
     try:
-        return _get_pmx_reconciliation_inner()
+        args_dict = request.args.to_dict() if request.args is not None else {}
+        cache_key = _build_cache_key("pmx_reconciliation", args_dict)
+        return _get_cached_heavy_result(
+            cache_key,
+            _get_pmx_reconciliation_inner,
+            ttl_seconds=30,
+        )
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -12283,6 +12987,16 @@ def get_trademc_trades():
 
 _trademc_sync_lock = threading.Lock()
 _trademc_sync_status: Dict[str, Any] = {"running": False, "result": None}
+_trademc_last_sync_epoch: float = 0.0
+_pmx_last_sync_epoch: float = 0.0
+try:
+    TRADEMC_SYNC_MIN_INTERVAL_SECONDS = max(30, int(os.getenv("TRADEMC_SYNC_MIN_INTERVAL_SECONDS", "600") or 600))
+except Exception:
+    TRADEMC_SYNC_MIN_INTERVAL_SECONDS = 600
+try:
+    PMX_SYNC_MIN_INTERVAL_SECONDS = max(15, int(os.getenv("PMX_SYNC_MIN_INTERVAL_SECONDS", "180") or 180))
+except Exception:
+    PMX_SYNC_MIN_INTERVAL_SECONDS = 180
 
 
 def _run_trademc_sync_bg(include_weight: bool = False, incremental: bool = True, replace: bool = False):
@@ -12330,7 +13044,7 @@ def _run_trademc_sync_bg(include_weight: bool = False, incremental: bool = True,
 
 @app.route("/api/trademc/sync", methods=["POST"])
 def sync_trademc():
-    global _trademc_sync_status
+    global _trademc_sync_status, _trademc_last_sync_epoch
     data = request.json or {}
     include_weight = _pmx_bool(data.get("include_weight"), default=False)
     full = _pmx_bool(data.get("full"), default=False)
@@ -12339,6 +13053,7 @@ def sync_trademc():
         incremental = False
     replace = _pmx_bool(data.get("replace"), default=False) and (not incremental)
     wait = _pmx_bool(data.get("wait"), default=True)  # default: wait for result
+    force_sync = _pmx_bool(data.get("force"), default=False)
 
     with _trademc_sync_lock:
         already_running = _trademc_sync_status.get("running", False)
@@ -12346,12 +13061,26 @@ def sync_trademc():
     if already_running:
         return jsonify({"status": "already_running", "message": "Sync is already in progress"}), 202
 
+    # Protect API workers from aggressive background sync loops.
+    if (not force_sync) and (not wait) and incremental and (not replace):
+        now_epoch = time.time()
+        elapsed = max(0.0, now_epoch - float(_trademc_last_sync_epoch or 0.0))
+        if elapsed < float(TRADEMC_SYNC_MIN_INTERVAL_SECONDS):
+            remaining = int(max(1, round(float(TRADEMC_SYNC_MIN_INTERVAL_SECONDS) - elapsed)))
+            return jsonify({
+                "status": "throttled",
+                "mode": "incremental",
+                "message": f"TradeMC sync throttled. Retry in ~{remaining}s.",
+                "retry_in_seconds": remaining,
+            }), 202
+
     # Mark as running
     with _trademc_sync_lock:
         _trademc_sync_status = {"running": True, "result": None}
 
     if not wait:
         # Fire-and-forget: return immediately, sync runs in background
+        _trademc_last_sync_epoch = time.time()
         t = threading.Thread(target=_run_trademc_sync_bg, args=(include_weight, incremental, replace), daemon=True)
         t.start()
         mode = "incremental" if incremental else ("full_replace" if replace else "full")
@@ -12395,6 +13124,7 @@ def sync_trademc():
                 "fx_trades": int(fiscal_purge.get("fx_trades", 0)),
             }
         response["clean_pipeline"] = _trigger_clean_pipeline("trademc_sync", wait=False)
+        _trademc_last_sync_epoch = time.time()
         with _trademc_sync_lock:
             _trademc_sync_status = {"running": False, "result": response}
         return jsonify(_json_safe(response))
@@ -13299,4 +14029,5 @@ if __name__ == "__main__":
     print(f"J2 API Server starting on http://localhost:{server_port}")
     _start_daily_balance_email_scheduler()
     _start_daily_trading_report_email_scheduler()
+    start_hedging_listener()
     app.run(host="0.0.0.0", port=server_port, debug=True, use_reloader=False)
